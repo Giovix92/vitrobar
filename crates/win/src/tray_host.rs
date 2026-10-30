@@ -41,16 +41,18 @@ use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, ChangeWindowMessageFilterEx, CopyIcon, CreateWindowExW,
     DefWindowProcW, DestroyIcon, DestroyWindow, DispatchMessageW, EnumWindows, GetMessageW,
-    GetWindow, GetWindowThreadProcessId, InSendMessageEx, IsWindow, PostMessageW, PostQuitMessage,
-    RegisterClassW, RegisterWindowMessageW, SendMessageTimeoutW, SetWindowPos, TranslateMessage,
-    GW_OWNER, HICON, HWND_BOTTOM, HWND_TOPMOST, MSG, MSGFLT_ALLOW, SMTO_ABORTIFHUNG, SMTO_NORMAL,
-    SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WM_APP, WM_COMMAND, WM_CONTEXTMENU,
-    WM_COPYDATA, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_USER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    GetWindow, GetWindowThreadProcessId, InSendMessageEx, IsWindow, KillTimer, PostMessageW,
+    PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SendMessageTimeoutW, SetTimer,
+    SetWindowPos, TranslateMessage, GW_OWNER, HICON, HWND_BOTTOM, HWND_TOPMOST, MSG, MSGFLT_ALLOW,
+    SMTO_ABORTIFHUNG, SMTO_NORMAL, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    WM_APP, WM_COMMAND, WM_CONTEXTMENU, WM_COPYDATA, WM_DESTROY, WM_DISPLAYCHANGE,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    WM_SETTINGCHANGE, WM_TIMER, WM_USER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::stock_taskbar::{explorer_tray_window, taskbar_created_msg};
 use crate::window_props::exe_of_window;
+use crate::window_tracker::shell_hook_message_id;
 
 /// Posted to the notify window with a `Box<TrayMessage>` in `lParam` (see
 /// [`take_tray_message`]) after each tray message that the model accepted.
@@ -63,6 +65,13 @@ pub const NIN_SELECT: u32 = WM_USER;
 const FORWARD_TIMEOUT_MS: u32 = 2000;
 /// How long the shutdown waits for the host thread to destroy its window.
 const SHUTDOWN_TIMEOUT_MS: u32 = 2000;
+/// Explorer re-raises its own (hidden) taskbar a little after work-area, settings and display
+/// changes, often after our immediate reassert: one more raise this long after each trigger.
+const RAISE_AGAIN_MS: u32 = 500;
+/// One-shot timer on the host window for that second raise.
+const TIMER_RAISE_AGAIN: usize = 1;
+/// Posted to the host window (`wParam` = [`quit_cookie`]): raise now and once more later.
+const WM_TRAY_RAISE: u32 = WM_APP + 0x41;
 
 /// The class name every `Shell_NotifyIcon` caller looks for.
 const TRAY_CLASS: PCWSTR = w!("Shell_TrayWnd");
@@ -320,6 +329,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let ours = handle_tray(data);
                 // SAFETY: the message as we received it.
                 unsafe { forward(hwnd, msg, wparam, lparam) };
+                // Our answer wins over Explorer's: the sender's next calls (Modify, Delete,
+                // SetVersion) are judged by our model, so the answer must match it. Explorer
+                // can disagree only about duplicates (after our announce, apps re-add icons
+                // Explorer already has: it says FALSE, we say TRUE), and an app told FALSE may
+                // give up on an icon that is perfectly alive in the bar.
                 LRESULT(ours as isize)
             } else {
                 // Appbar calls (0), icon-rect queries (3) and anything newer: Explorer answers.
@@ -342,6 +356,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(1)
         }
+        WM_TRAY_RAISE if wparam.0 == quit_cookie() => {
+            raise_now_and_later(hwnd);
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == TIMER_RAISE_AGAIN => {
+            // SAFETY: our own timer on our own window.
+            unsafe {
+                let _ = KillTimer(Some(hwnd), TIMER_RAISE_AGAIN);
+            }
+            raise(hwnd);
+            LRESULT(0)
+        }
+        WM_DISPLAYCHANGE => {
+            raise_now_and_later(hwnd);
+            // SAFETY: default handling with our own arguments.
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
         m if m == taskbar_created_msg() => {
             // Our own broadcasts never reach this process, so this comes from Explorer (or
             // another shell). Only a new Explorer taskbar window means a restart: then go
@@ -351,19 +382,49 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 raise(hwnd);
                 broadcast_taskbar_created();
             }
+            raise_now_and_later(hwnd);
             LRESULT(0)
         }
-        // Messages meant for the taskbar itself. System messages (window lifetime, painting,
-        // broadcasts such as WM_SETTINGCHANGE) are never forwarded: Explorer gets broadcasts
-        // directly, and a second copy of registered (>= 0xC000) messages, nearly all
-        // broadcasts, could make it act twice.
+        // What else goes on to Explorer (ruling R10): messages meant for the taskbar itself.
+        // - WM_COMMAND, and everything in WM_USER..WM_APP range (0x0400..=0xBFFF).
+        // - Registered messages (>= 0xC000) except TaskbarCreated (handled above) and
+        //   SHELLHOOK: those two arrive as broadcasts, which Explorer already receives itself.
+        // - WM_SETTINGCHANGE only for "TraySettings" (sent to the taskbar to reload its
+        //   notification-area settings); a broadcast cannot be told from a direct send.
+        // Other system messages (< 0x0400: window lifetime, painting, broadcasts) are never
+        // forwarded: they concern our own window, and e.g. a forwarded WM_DESTROY or a second
+        // copy of a broadcast could make Explorer act on something that is not its own.
         WM_COMMAND | 0x0400..=0xBFFF => {
+            // SAFETY: the message as we received it.
+            unsafe { forward(hwnd, msg, wparam, lparam) }
+        }
+        WM_SETTINGCHANGE => {
+            if setting_is(lparam, "TraySettings") {
+                // SAFETY: the message as we received it (lParam is a string we only read).
+                unsafe { forward(hwnd, msg, wparam, lparam) };
+            }
+            // Explorer may re-raise its taskbar while it handles the change.
+            raise_now_and_later(hwnd);
+            // SAFETY: default handling with our own arguments.
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        m if m >= 0xC000 && m != shell_hook_message_id() && m != quit_msg() => {
             // SAFETY: the message as we received it.
             unsafe { forward(hwnd, msg, wparam, lparam) }
         }
         // SAFETY: default handling with our own arguments.
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
+}
+
+/// `lparam` of a WM_SETTINGCHANGE names the setting area `area`.
+fn setting_is(lparam: LPARAM, area: &str) -> bool {
+    if lparam.0 == 0 {
+        return false;
+    }
+    // SAFETY: for WM_SETTINGCHANGE a non-null lParam is a NUL-terminated wide string, valid
+    // while the message is handled.
+    unsafe { PCWSTR(lparam.0 as *const u16).to_string() }.is_ok_and(|s| s == area)
 }
 
 fn register_class() -> Result<()> {
@@ -400,6 +461,14 @@ fn raise(hwnd: HWND) {
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
         );
     }
+}
+
+/// Raises our window now and arms the one-shot second raise (host thread only).
+fn raise_now_and_later(hwnd: HWND) {
+    raise(hwnd);
+    // SAFETY: a one-shot timer on our own window, on its thread (killed when it fires);
+    // re-arming restarts it.
+    unsafe { SetTimer(Some(hwnd), TIMER_RAISE_AGAIN, RAISE_AGAIN_MS, None) };
 }
 
 unsafe extern "system" fn post_taskbar_created(hwnd: HWND, data: LPARAM) -> BOOL {
@@ -531,7 +600,7 @@ impl TrayHost {
                     explorer_tray_window().map_or(0, |h| h.0 as isize),
                     Ordering::SeqCst,
                 );
-                raise(hwnd);
+                raise_now_and_later(hwnd);
                 TRAY_HWND.store(hwnd.0 as isize, Ordering::SeqCst);
                 let _ = tx.send(Ok(hwnd.0 as isize));
                 let mut msg = MSG::default();
@@ -566,9 +635,19 @@ impl TrayHost {
     }
 
     /// Goes back to the top of the topmost band, so `FindWindow` keeps finding us before
-    /// Explorer's window. Never waits.
+    /// Explorer's window, now and once more shortly after (Explorer tends to re-raise its own
+    /// taskbar a moment after the events that call this). Never waits.
     pub fn reassert_topmost(&self) {
         raise(self.hwnd);
+        // SAFETY: posting plain values to our own host window.
+        unsafe {
+            let _ = PostMessageW(
+                Some(self.hwnd),
+                WM_TRAY_RAISE,
+                WPARAM(quit_cookie()),
+                LPARAM(0),
+            );
+        }
     }
 
     /// The icons, in the order they were added.

@@ -189,7 +189,7 @@ fn notify_icon_calls_reach_the_host_and_explorer_keeps_its_own() {
     assert_eq!(added.tip.as_deref(), Some("vitro-test"));
     assert_eq!(added.id.uid, 7);
     let e = host.entries();
-    assert_eq!(e.len().min(1), 1);
+    assert!(!e.is_empty());
     let entry = e
         .iter()
         .find(|e| e.icon.tip == "vitro-test")

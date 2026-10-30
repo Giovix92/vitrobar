@@ -45,7 +45,7 @@ use vitro_win::time_format::clock_now;
 use vitro_win::tray_host::{tray_identity_key, TrayClick, TrayEntry, TrayHost};
 use vitro_win::window_tracker::{WindowEvent, WindowTracker};
 use windows::core::{Error, Result, BOOL};
-use windows::Win32::Foundation::{E_FAIL, HWND, LPARAM, POINT, WAIT_FAILED, WAIT_OBJECT_0, WPARAM};
+use windows::Win32::Foundation::{E_FAIL, HWND, LPARAM, WAIT_FAILED, WAIT_OBJECT_0, WPARAM};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::Console::{
     SetConsoleCtrlHandler, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
@@ -53,7 +53,7 @@ use windows::Win32::System::Console::{
 use windows::Win32::System::Threading::{GetCurrentThreadId, INFINITE};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetDoubleClickTime, VK_ESCAPE};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetCursorPos, GetForegroundWindow, KillTimer, MsgWaitForMultipleObjectsEx,
+    DispatchMessageW, GetForegroundWindow, GetMessagePos, KillTimer, MsgWaitForMultipleObjectsEx,
     PeekMessageW, PostThreadMessageW, SetTimer, TranslateMessage, MSG, MWMO_INPUTAVAILABLE,
     PM_REMOVE, QS_ALLINPUT, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_QUIT,
     WM_RBUTTONDOWN, WM_RBUTTONUP,
@@ -105,11 +105,15 @@ fn tray_id(i: &TrayIcon) -> TrayId {
     (i.id.hwnd, i.id.uid, i.id.guid)
 }
 
-fn cursor_px() -> (i32, i32) {
-    let mut p = POINT::default();
-    // SAFETY: out-pointer to a local.
-    let _ = unsafe { GetCursorPos(&mut p) };
-    (p.x, p.y)
+/// Screen px of the cursor when the message just retrieved was posted (not where the
+/// cursor is by the time it is handled).
+fn message_pos() -> (i32, i32) {
+    // SAFETY: plain query about the last message this thread retrieved.
+    let v = unsafe { GetMessagePos() };
+    (
+        i32::from((v & 0xFFFF) as u16 as i16),
+        i32::from((v >> 16) as u16 as i16),
+    )
 }
 
 static UI_THREAD: AtomicU32 = AtomicU32::new(0);
@@ -310,6 +314,8 @@ struct App {
     tip_target: Option<TipTarget>,
     /// Bar item under a right-button press.
     rpressed: Option<Hit>,
+    /// Screen px of the mouse message being handled (forwarded with clicks and hovers).
+    msg_pt: (i32, i32),
     /// Last left click on a tray icon, to tell a double click.
     last_left: Option<(TrayId, Instant)>,
     last_dump: String,
@@ -401,6 +407,7 @@ impl App {
             tray_over: Vec::new(),
             tip_target: None,
             rpressed: None,
+            msg_pt: (0, 0),
             last_left: None,
             last_dump: String::new(),
         };
@@ -1001,6 +1008,11 @@ impl App {
                 dirty.regroup |= self.foreground != fg;
                 self.foreground = fg;
                 dirty.fullscreen = true;
+                // A foreground change is when the shell reorders the topmost band: keep our
+                // Shell_TrayWnd above Explorer's (async, never waits).
+                if let Some(t) = &self.tray {
+                    t.reassert_topmost();
+                }
             }
             WindowEvent::Flash(h) => {
                 // Carry 7: read_window_info never reports flashing; the event does.
@@ -1079,6 +1091,7 @@ impl App {
 
     /// Mouse input on a bar window or a flyout; returns true if the message was handled.
     fn on_mouse(&mut self, msg: &MSG, dirty: &mut Dirty) -> bool {
+        self.msg_pt = message_pos();
         if self
             .strip
             .as_ref()
@@ -1220,7 +1233,7 @@ impl App {
         self.tip_target = target;
         let Some(t) = target else { return };
         if let Some(e) = self.tray_entry(t.id) {
-            TrayHost::forward_click(&e.icon, TrayClick::Hover, cursor_px());
+            TrayHost::forward_click(&e.icon, TrayClick::Hover, self.msg_pt);
         }
         // SAFETY: one-shot timer on our own window (killed when it fires); re-setting the id
         // restarts it.
@@ -1306,7 +1319,7 @@ impl App {
                 icon.id.hwnd, icon.id.uid
             );
         }
-        TrayHost::forward_click(&icon, kind, cursor_px());
+        TrayHost::forward_click(&icon, kind, self.msg_pt);
     }
 
     /// Screen px of the chevron's slot, spanning the bar's height.

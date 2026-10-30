@@ -34,7 +34,28 @@ impl TrayModel {
     pub fn apply(&mut self, m: TrayMessage) -> bool {
         let pos = self.position(&m.id);
         match (m.op, pos) {
-            (TrayOp::Add, Some(_)) => false,
+            (TrayOp::Add, Some(i)) => {
+                let old = &self.icons[i];
+                let reregistered = m.id.guid.is_some()
+                    && old.id.guid == m.id.guid
+                    && (old.id.hwnd, old.id.uid) != (m.id.hwnd, m.id.uid);
+                if !reregistered {
+                    // A plain duplicate Add (same owner): rejected, as Explorer does.
+                    return false;
+                }
+                // Same GUID from another window: the app restarted (or crashed) without
+                // NIM_DELETE. Replace the stale record, so the dead owner's sweep cannot
+                // take the live icon away.
+                self.icons[i] = TrayIcon {
+                    id: m.id,
+                    callback_msg: m.callback_msg.unwrap_or(0),
+                    hicon: m.hicon.unwrap_or(0),
+                    tip: m.tip.unwrap_or_default(),
+                    hidden: m.hidden.unwrap_or(false),
+                    version: 0,
+                };
+                true
+            }
             (TrayOp::Add, None) => {
                 self.icons.push(TrayIcon {
                     id: m.id,
@@ -305,6 +326,41 @@ mod tests {
         assert_eq!(m.icons().len(), 1);
         assert_eq!(m.remove_owner(2), 1);
         assert!(m.icons().is_empty());
+    }
+
+    #[test]
+    fn guid_add_from_a_new_window_replaces_the_stale_record() {
+        let g = Some([5u8; 16]);
+        let gid = |hwnd| TrayIconId {
+            hwnd,
+            uid: 1,
+            guid: g,
+        };
+        let mut m = TrayModel::new();
+        assert!(m.apply(add(gid(1), "old")));
+        let mut sv = msg(TrayOp::SetVersion, gid(1));
+        sv.version = Some(4);
+        m.apply(sv);
+        assert!(m.apply(add(gid(2), "new")));
+        assert_eq!(m.icons().len(), 1);
+        assert_eq!(m.icons()[0].tip, "new");
+        assert_eq!(m.icons()[0].version, 0, "version resets with the new owner");
+        assert_eq!(m.remove_owner(1), 0);
+        assert_eq!(m.remove_owner(2), 1);
+    }
+
+    #[test]
+    fn guid_add_from_the_same_window_twice_is_rejected() {
+        let g = Some([5u8; 16]);
+        let gid = TrayIconId {
+            hwnd: 1,
+            uid: 1,
+            guid: g,
+        };
+        let mut m = TrayModel::new();
+        assert!(m.apply(add(gid, "a")));
+        assert!(!m.apply(add(gid, "b")));
+        assert_eq!(m.icons()[0].tip, "a");
     }
 
     #[test]
