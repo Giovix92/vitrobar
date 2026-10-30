@@ -3,6 +3,7 @@
 pub mod appbar;
 pub mod autostart;
 pub mod desktops;
+pub mod event_queue;
 pub mod icons;
 pub mod launch;
 pub mod monitors;

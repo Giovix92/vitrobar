@@ -5,14 +5,17 @@
 //! WinEvent callbacks are delivered on the thread that called [`WindowTracker::start`], which
 //! must therefore be the thread that owns the notify window and pumps its messages.
 //!
-//! Events from the WinEvent hooks are posted to `notify` as `WM_VITRO_WINDOW_EVENT` with a
-//! `Box<WindowEvent>` raw pointer in `lParam`; the receiver reclaims it with [`take_window_event`].
+//! Events from the WinEvent hooks go into a process-owned queue; `notify` gets a payload-free
+//! `WM_VITRO_WINDOW_EVENT` wake-up and its procedure calls [`drain_window_events`]. The
+//! message's parameters are ignored, so another process posting it can do no harm.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 
 use vitro_core::windows_model::Hwnd;
+
+use crate::event_queue::WakeQueue;
 use windows::core::{w, Error, Result, BOOL};
 use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, E_FAIL, HWND, LPARAM, WPARAM};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
@@ -25,7 +28,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WINEVENT_OUTOFCONTEXT, WM_APP,
 };
 
-/// `lParam` is a raw `Box<WindowEvent>`; see [`take_window_event`].
+/// Wake-up only (`wParam` / `lParam` ignored): window events are waiting in
+/// [`drain_window_events`].
 pub const WM_VITRO_WINDOW_EVENT: u32 = WM_APP + 1;
 
 /// One-shot timer (on `notify`) driving LOCATIONCHANGE coalescing.
@@ -55,6 +59,9 @@ pub enum WindowEvent {
 /// The notify window of the running tracker (0 = none). Doubles as the "one per process" guard.
 static NOTIFY: AtomicIsize = AtomicIsize::new(0);
 
+/// Events waiting for the UI thread.
+static EVENTS: WakeQueue<WindowEvent> = WakeQueue::new();
+
 /// Per-window LOCATIONCHANGE cooldown: `true` = more events arrived while cooling down.
 static COOLING: LazyLock<Mutex<HashMap<isize, bool>>> = LazyLock::new(Default::default);
 
@@ -66,31 +73,29 @@ fn notify_hwnd() -> Option<HWND> {
 }
 
 fn post(ev: WindowEvent) {
-    let Some(notify) = notify_hwnd() else { return };
-    let raw = Box::into_raw(Box::new(ev));
-    // SAFETY: on success ownership of `raw` passes to the receiver; on failure we reclaim it.
-    unsafe {
-        if PostMessageW(
-            Some(notify),
-            WM_VITRO_WINDOW_EVENT,
-            WPARAM(0),
-            LPARAM(raw as isize),
-        )
-        .is_err()
+    if let Some(notify) = notify_hwnd() {
+        queue_window_event(notify, ev);
+    }
+}
+
+/// Queues `ev` as the tracker does and wakes `notify` with a payload-free
+/// `WM_VITRO_WINDOW_EVENT` (one per burst). In-process only: the data never travels in the
+/// message. Public for tests that need a real event without real windows.
+pub fn queue_window_event(notify: HWND, ev: WindowEvent) {
+    if EVENTS.push(ev) {
+        // SAFETY: a payload-free post.
+        if unsafe { PostMessageW(Some(notify), WM_VITRO_WINDOW_EVENT, WPARAM(0), LPARAM(0)) }
+            .is_err()
         {
-            drop(Box::from_raw(raw));
+            EVENTS.wake_failed();
         }
     }
 }
 
-/// Reclaims the event posted as `WM_VITRO_WINDOW_EVENT`.
-///
-/// # Safety
-/// `lparam` must be the `lParam` of a `WM_VITRO_WINDOW_EVENT` message posted by this module,
-/// and each such message must be passed here exactly once.
-pub unsafe fn take_window_event(lparam: LPARAM) -> WindowEvent {
-    // SAFETY: guaranteed by the caller; the pointer came from `Box::into_raw` in `post`.
-    *unsafe { Box::from_raw(lparam.0 as *mut WindowEvent) }
+/// Takes the window events queued by the tracker, in order. Call when
+/// `WM_VITRO_WINDOW_EVENT` arrives, whoever sent it: its parameters carry nothing.
+pub fn drain_window_events() -> Vec<WindowEvent> {
+    EVENTS.drain()
 }
 
 /// The registered message id of `"SHELLHOOK"`.
@@ -210,6 +215,7 @@ impl WindowTracker {
         {
             return Err(Error::from(ERROR_ALREADY_EXISTS.to_hresult()));
         }
+        EVENTS.clear();
         let _ = shell_hook_message_id();
         let mut tracker = Self {
             notify,
@@ -289,5 +295,6 @@ impl Drop for WindowTracker {
         kill_timer(TIMER_DESKTOP);
         COOLING.lock().unwrap_or_else(|e| e.into_inner()).clear();
         NOTIFY.store(0, Ordering::Release);
+        EVENTS.clear();
     }
 }

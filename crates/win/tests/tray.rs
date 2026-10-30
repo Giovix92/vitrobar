@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use vitro_core::tray_wire::{TrayMessage, TrayOp};
 use vitro_win::stock_taskbar::{autohide_now, explorer_tray_window};
 use vitro_win::tray_host::{
-    take_tray_message, tray_identity_key, TrayClick, TrayHost, NIN_SELECT, WM_VITRO_TRAY,
+    drain_tray_messages, tray_identity_key, TrayClick, TrayHost, NIN_SELECT, WM_VITRO_TRAY,
 };
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
@@ -109,12 +109,12 @@ fn wait_tray(to: HWND, want: impl Fn(&TrayMessage) -> bool) -> Option<TrayMessag
     let end = Instant::now() + Duration::from_secs(1);
     let mut msg = MSG::default();
     while Instant::now() < end {
-        // SAFETY: standard pump of our own thread; tray messages are reclaimed once.
+        // SAFETY: standard pump of our own thread.
         unsafe {
             while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
                 if msg.message == WM_VITRO_TRAY && msg.hwnd == to {
-                    let m = take_tray_message(msg.lParam);
-                    if want(&m) {
+                    // A payload-free wake-up: the messages are in the host's queue.
+                    if let Some(m) = drain_tray_messages().into_iter().find(|m| want(m)) {
                         return Some(m);
                     }
                 } else {
@@ -131,11 +131,11 @@ fn pump_for(ms: u64) {
     let end = Instant::now() + Duration::from_millis(ms);
     let mut msg = MSG::default();
     while Instant::now() < end {
-        // SAFETY: standard pump; any stray tray message is reclaimed.
+        // SAFETY: standard pump; any stray tray message is drained.
         unsafe {
             while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
                 if msg.message == WM_VITRO_TRAY {
-                    let _ = take_tray_message(msg.lParam);
+                    let _ = drain_tray_messages();
                 } else {
                     DispatchMessageW(&msg);
                 }

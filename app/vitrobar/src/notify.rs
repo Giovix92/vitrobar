@@ -5,7 +5,12 @@
 //!
 //! The window procedure is authoritative: whatever reaches it, from the app's own loop or
 //! from a nested modal loop (COM, shell, menus), is recorded in a per-thread [`Inbox`] that
-//! the app drains with [`take_inbox`]. Nothing is dropped and no boxed event leaks.
+//! the app drains with [`take_inbox`]. Nothing is dropped.
+//!
+//! Window events and tray messages travel in the producers' own queues
+//! ([`drain_window_events`], [`drain_tray_messages`]); `WM_VITRO_WINDOW_EVENT` and
+//! `WM_VITRO_TRAY` are payload-free wake-ups whose parameters are ignored, so another process
+//! posting them (any same-integrity process can) only makes us drain our own queues.
 
 use std::cell::RefCell;
 use std::sync::OnceLock;
@@ -13,9 +18,9 @@ use std::sync::OnceLock;
 use vitro_core::tray_wire::TrayMessage;
 use vitro_win::appbar::WM_VITRO_APPBAR;
 use vitro_win::stock_taskbar::taskbar_created_msg;
-use vitro_win::tray_host::{take_tray_message, WM_VITRO_TRAY};
+use vitro_win::tray_host::{drain_tray_messages, WM_VITRO_TRAY};
 use vitro_win::window_tracker::{
-    shell_hook_message_id, take_window_event, translate_shell_hook, WindowEvent,
+    drain_window_events, shell_hook_message_id, translate_shell_hook, WindowEvent,
     WM_VITRO_WINDOW_EVENT,
 };
 use windows::core::{w, Error, Result, PCWSTR};
@@ -26,11 +31,11 @@ use windows::Win32::System::RemoteDesktop::{
 };
 use windows::Win32::UI::Shell::{ABN_FULLSCREENAPP, ABN_POSCHANGED};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, PeekMessageW, PostQuitMessage,
-    RegisterClassExW, MSG, PM_REMOVE, SPI_SETCLIENTAREAANIMATION, SPI_SETWORKAREA, WM_APP,
-    WM_CLOSE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_DWMCOLORIZATIONCOLORCHANGED, WM_ENDSESSION,
-    WM_SETTINGCHANGE, WM_THEMECHANGED, WM_TIMECHANGE, WM_TIMER, WM_WTSSESSION_CHANGE, WNDCLASSEXW,
-    WS_EX_TOOLWINDOW, WS_POPUP, WTS_CONSOLE_CONNECT, WTS_REMOTE_CONNECT, WTS_SESSION_UNLOCK,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, PostQuitMessage, RegisterClassExW,
+    SPI_SETCLIENTAREAANIMATION, SPI_SETWORKAREA, WM_APP, WM_CLOSE, WM_DISPLAYCHANGE, WM_DPICHANGED,
+    WM_DWMCOLORIZATIONCOLORCHANGED, WM_ENDSESSION, WM_SETTINGCHANGE, WM_THEMECHANGED,
+    WM_TIMECHANGE, WM_TIMER, WM_WTSSESSION_CHANGE, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
+    WTS_CONSOLE_CONNECT, WTS_REMOTE_CONNECT, WTS_SESSION_UNLOCK,
 };
 
 /// An icon finished loading on the icon thread (posted by the worker).
@@ -141,17 +146,15 @@ fn setting_area(lparam: LPARAM) -> Option<String> {
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_VITRO_WINDOW_EVENT => {
-            // SAFETY: only the tracker posts this message to the notify window; each message is
-            // delivered to this procedure exactly once, so the box is reclaimed exactly once.
-            let ev = unsafe { take_window_event(lparam) };
-            with_inbox(|i| i.events.push(ev));
+            // A wake-up: wParam / lParam are ignored (anyone may post this id).
+            let evs = drain_window_events();
+            with_inbox(|i| i.events.extend(evs));
             return LRESULT(0);
         }
         WM_VITRO_TRAY => {
-            // SAFETY: only the tray host posts this message to the notify window; each
-            // message is delivered here exactly once, so the box is reclaimed exactly once.
-            let m = unsafe { take_tray_message(lparam) };
-            with_inbox(|i| i.tray.push(m));
+            // A wake-up: wParam / lParam are ignored (anyone may post this id).
+            let msgs = drain_tray_messages();
+            with_inbox(|i| i.tray.extend(msgs));
             return LRESULT(0);
         }
         WM_TIMER => {
@@ -286,35 +289,10 @@ impl NotifyWindow {
 
 impl Drop for NotifyWindow {
     fn drop(&mut self) {
-        // Reclaim boxed window events and tray messages still queued (the tracker and the
-        // tray host must already be dropped), then destroy the window.
-        let mut msg = MSG::default();
-        // SAFETY: every WM_VITRO_WINDOW_EVENT on this window was posted by the tracker; the
-        // ones still queued were never dispatched and are reclaimed here exactly once.
-        // PeekMessage returns WM_QUIT whatever the filter (the bar windows post one when they
-        // are destroyed), so only real window events are reclaimed. The same holds for the
-        // tray host's WM_VITRO_TRAY (the next id up).
-        const _: () = assert!(WM_VITRO_TRAY == WM_VITRO_WINDOW_EVENT + 1);
+        // Nothing queued for this window owns memory: its pending wake-ups simply die with it.
+        // SAFETY: balances the registration in `create` while the window still exists, then
+        // destroys our own window.
         unsafe {
-            while PeekMessageW(
-                &mut msg,
-                Some(self.hwnd),
-                WM_VITRO_WINDOW_EVENT,
-                WM_VITRO_TRAY,
-                PM_REMOVE,
-            )
-            .as_bool()
-            {
-                if msg.hwnd != self.hwnd {
-                    continue;
-                }
-                if msg.message == WM_VITRO_WINDOW_EVENT {
-                    let _ = take_window_event(msg.lParam);
-                } else if msg.message == WM_VITRO_TRAY {
-                    let _ = take_tray_message(msg.lParam);
-                }
-            }
-            // Balances the registration in `create`, while the window still exists.
             if self.session_registered {
                 let _ = WTSUnRegisterSessionNotification(self.hwnd);
             }
@@ -327,9 +305,21 @@ impl Drop for NotifyWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+    use vitro_win::tray_host::queue_tray_message;
+    use vitro_win::window_tracker::queue_window_event;
     use windows::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, PostMessageW, SendMessageW, SetTimer, HSHELL_WINDOWDESTROYED,
+        DispatchMessageW, PeekMessageW, PostMessageW, SendMessageW, SetTimer,
+        HSHELL_WINDOWDESTROYED, MSG, PM_REMOVE,
     };
+
+    /// The window-event and tray queues are per process: the tests that wake a notify window
+    /// run one at a time, so none drains another's events.
+    static QUEUES: Mutex<()> = Mutex::new(());
+
+    fn queues() -> std::sync::MutexGuard<'static, ()> {
+        QUEUES.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     fn pump(hwnd: HWND) {
         let mut msg = MSG::default();
@@ -364,44 +354,52 @@ mod tests {
     }
 
     #[test]
-    fn drop_with_a_pending_quit_reclaims_only_window_events() {
+    fn forged_wakeups_with_garbage_lparams_are_harmless() {
+        let _q = queues();
         let n = NotifyWindow::create().unwrap();
-        let ev = Box::into_raw(Box::new(WindowEvent::Flash(1)));
-        // SAFETY: the box is handed over to the message; the drop reclaims it.
+        let _ = take_inbox();
+        // As another process (or a stray WM_APP+1 / WM_APP+2 broadcast) could: pointers that
+        // were never ours. Before the fix the procedure freed them.
+        for lp in [1isize, 0x4141_4141, -1, 0xdead_beef] {
+            // SAFETY: plain values posted to our own window; nothing is dereferenced.
+            unsafe {
+                PostMessageW(Some(n.hwnd), WM_VITRO_WINDOW_EVENT, WPARAM(7), LPARAM(lp)).unwrap();
+                PostMessageW(Some(n.hwnd), WM_VITRO_TRAY, WPARAM(7), LPARAM(lp)).unwrap();
+                SendMessageW(
+                    n.hwnd,
+                    WM_VITRO_WINDOW_EVENT,
+                    Some(WPARAM(1)),
+                    Some(LPARAM(lp)),
+                );
+                SendMessageW(n.hwnd, WM_VITRO_TRAY, Some(WPARAM(1)), Some(LPARAM(lp)));
+            }
+        }
+        pump(n.hwnd);
+        let inbox = take_inbox();
+        assert!(
+            inbox.events.is_empty() && inbox.tray.is_empty(),
+            "{inbox:?}"
+        );
+        // Dropping with forged wake-ups still queued frees nothing either.
+        // SAFETY: as above.
         unsafe {
-            PostMessageW(
-                Some(n.hwnd),
-                WM_VITRO_WINDOW_EVENT,
-                WPARAM(0),
-                LPARAM(ev as isize),
-            )
-            .unwrap();
-            // As a destroyed bar window does.
-            PostQuitMessage(0);
+            PostMessageW(Some(n.hwnd), WM_VITRO_WINDOW_EVENT, WPARAM(0), LPARAM(0x10)).unwrap();
+            PostMessageW(Some(n.hwnd), WM_VITRO_TRAY, WPARAM(0), LPARAM(0x10)).unwrap();
         }
         drop(n);
-        // The quit is consumed (or still pending); clear it so it cannot leak into other tests.
-        let mut msg = MSG::default();
-        // SAFETY: draining this test thread's own queue.
-        unsafe { while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {} }
     }
 
     #[test]
     fn dispatched_messages_land_in_the_inbox() {
+        let _q = queues();
         let n = NotifyWindow::create().unwrap();
         let _ = take_inbox();
-        let ev = Box::into_raw(Box::new(WindowEvent::Flash(42)));
-        // SAFETY: the box is handed over to the message; the wndproc reclaims it.
-        unsafe {
-            PostMessageW(
-                Some(n.hwnd),
-                WM_VITRO_WINDOW_EVENT,
-                WPARAM(0),
-                LPARAM(ev as isize),
-            )
-            .unwrap();
-            PostMessageW(Some(n.hwnd), WM_APP_ICON, WPARAM(0), LPARAM(0)).unwrap();
-            let tray = Box::into_raw(Box::new(TrayMessage {
+        // Real events and tray messages, through the producers' queues and payload-free
+        // wake-ups.
+        queue_window_event(n.hwnd, WindowEvent::Flash(42));
+        queue_tray_message(
+            n.hwnd,
+            TrayMessage {
                 op: vitro_core::tray_wire::TrayOp::Delete,
                 id: vitro_core::tray_wire::TrayIconId {
                     hwnd: 1,
@@ -413,14 +411,14 @@ mod tests {
                 tip: None,
                 hidden: None,
                 version: None,
-            }));
-            PostMessageW(
-                Some(n.hwnd),
-                WM_VITRO_TRAY,
-                WPARAM(0),
-                LPARAM(tray as isize),
-            )
-            .unwrap();
+            },
+        );
+        // SAFETY: plain messages to our own window.
+        unsafe {
+            PostMessageW(Some(n.hwnd), WM_APP_ICON, WPARAM(0), LPARAM(0)).unwrap();
+            // Forged wake-ups with garbage parameters between real ones change nothing.
+            PostMessageW(Some(n.hwnd), WM_VITRO_TRAY, WPARAM(9), LPARAM(0x55)).unwrap();
+            PostMessageW(Some(n.hwnd), WM_VITRO_WINDOW_EVENT, WPARAM(9), LPARAM(0x55)).unwrap();
             // As a nested modal loop would: DispatchMessage, not the app's own peek path.
             pump(n.hwnd);
             SendMessageW(

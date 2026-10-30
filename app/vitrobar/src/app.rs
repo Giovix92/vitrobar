@@ -2822,7 +2822,7 @@ pub fn run(opts: Options) -> Result<()> {
         }
         // Cheap: starts an adopting watchdog only once one is due.
         parent.tick();
-        // SAFETY: standard message pump; boxed window events are reclaimed exactly once.
+        // SAFETY: standard message pump of this thread.
         while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
             // Everything for the notify window goes through its window procedure, which records
             // it in the inbox (the same path a nested modal loop would take).

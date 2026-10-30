@@ -17,9 +17,11 @@
 //!   posted to every top-level window, so every app registers its icons again with whatever
 //!   `Shell_TrayWnd` is left: Explorer's.
 //!
-//! The window lives on its own thread. That thread never waits on the UI thread: it posts
-//! [`WM_VITRO_TRAY`] (a boxed [`TrayMessage`]) and shares the model behind a mutex that is
-//! never held across a call out of the process.
+//! The window lives on its own thread. That thread never waits on the UI thread: it queues
+//! each accepted [`TrayMessage`] in a process-owned queue, posts a payload-free
+//! [`WM_VITRO_TRAY`] wake-up (the receiver calls [`drain_tray_messages`] and ignores the
+//! message's parameters, so a forged one is harmless), and shares the model behind a mutex
+//! that is never held across a call out of the process.
 //!
 //! Icon handles in the payload belong to the sender, which may destroy them as soon as
 //! `Shell_NotifyIcon` returns, so each one is copied (`CopyIcon`) while the sender waits; the
@@ -56,13 +58,17 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_SETTINGCHANGE, WM_TIMER, WM_USER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
+use crate::event_queue::WakeQueue;
 use crate::stock_taskbar::{explorer_tray_window, taskbar_created_msg};
 use crate::window_props::exe_of_window;
 use crate::window_tracker::shell_hook_message_id;
 
-/// Posted to the notify window with a `Box<TrayMessage>` in `lParam` (see
-/// [`take_tray_message`]) after each tray message that the model accepted.
+/// Posted to the notify window, without payload (`wParam` / `lParam` ignored), when tray
+/// messages the model accepted are waiting in [`drain_tray_messages`].
 pub const WM_VITRO_TRAY: u32 = WM_APP + 2;
+
+/// Accepted tray messages waiting for the UI thread.
+static TRAY_QUEUE: WakeQueue<TrayMessage> = WakeQueue::new();
 
 /// `NIN_SELECT` (`WM_USER + 0`): a version-4 icon was selected with the mouse.
 pub const NIN_SELECT: u32 = WM_USER;
@@ -367,34 +373,29 @@ fn handle_tray(data: &[u8]) -> bool {
         s.prune();
         changed
     };
-    // A null window would make PostMessage post to this thread's own queue (and leak the box).
+    // A null window would make PostMessage post to this thread's own queue.
     if changed && notify != 0 {
-        let raw = Box::into_raw(Box::new(m));
-        // SAFETY: the box is handed over to the message; if posting fails it is reclaimed
-        // here, otherwise the receiver reclaims it with `take_tray_message` exactly once.
-        unsafe {
-            if PostMessageW(
-                Some(HWND(notify as *mut c_void)),
-                WM_VITRO_TRAY,
-                WPARAM(0),
-                LPARAM(raw as isize),
-            )
-            .is_err()
-            {
-                drop(Box::from_raw(raw));
-            }
-        }
+        queue_tray_message(HWND(notify as *mut c_void), m);
     }
     changed
 }
 
-/// Reclaims the [`TrayMessage`] of a [`WM_VITRO_TRAY`].
-///
-/// # Safety
-/// `lparam` must come from a `WM_VITRO_TRAY` posted by the host, each reclaimed once.
-pub unsafe fn take_tray_message(lparam: LPARAM) -> TrayMessage {
-    // SAFETY: per the contract, a Box<TrayMessage> leaked by `handle_tray`.
-    *unsafe { Box::from_raw(lparam.0 as *mut TrayMessage) }
+/// Queues `m` as the host does and wakes `notify` with a payload-free [`WM_VITRO_TRAY`] (one
+/// per burst). In-process only: the data never travels in the message. Public for tests that
+/// need a tray message without a running host.
+pub fn queue_tray_message(notify: HWND, m: TrayMessage) {
+    if TRAY_QUEUE.push(m) {
+        // SAFETY: a payload-free post.
+        if unsafe { PostMessageW(Some(notify), WM_VITRO_TRAY, WPARAM(0), LPARAM(0)) }.is_err() {
+            TRAY_QUEUE.wake_failed();
+        }
+    }
+}
+
+/// Takes the tray messages the host accepted, in order. Call when [`WM_VITRO_TRAY`] arrives,
+/// whoever sent it: its parameters carry nothing.
+pub fn drain_tray_messages() -> Vec<TrayMessage> {
+    TRAY_QUEUE.drain()
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -636,9 +637,10 @@ pub struct TrayHost {
 
 impl TrayHost {
     /// Creates our `Shell_TrayWnd` on its own thread. Each tray message the model accepts is
-    /// posted to `notify` as [`WM_VITRO_TRAY`]. Call [`TrayHost::announce`] next to collect
+    /// queued for [`drain_tray_messages`] and `notify` is woken with [`WM_VITRO_TRAY`]. Call [`TrayHost::announce`] next to collect
     /// the icons that already exist.
     pub fn start(notify: HWND) -> Result<Self> {
+        TRAY_QUEUE.clear();
         let shared = Arc::new(Mutex::new(Shared::default()));
         let (tx, rx) = channel::<Result<isize>>();
         let notify = notify.0 as isize;
@@ -820,6 +822,7 @@ impl Drop for TrayHost {
                 let _ = t.join();
             }
         }
+        TRAY_QUEUE.clear();
     }
 }
 

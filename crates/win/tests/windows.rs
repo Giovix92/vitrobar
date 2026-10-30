@@ -7,7 +7,7 @@ use vitro_core::windows_model::is_taskbar_window;
 use vitro_win::desktops::Desktops;
 use vitro_win::window_props::read_window_info;
 use vitro_win::window_tracker::{
-    shell_hook_message_id, take_window_event, translate_shell_hook, WindowEvent, WindowTracker,
+    drain_window_events, shell_hook_message_id, translate_shell_hook, WindowEvent, WindowTracker,
     WM_VITRO_WINDOW_EVENT,
 };
 use windows::core::w;
@@ -146,7 +146,7 @@ fn tracker_reports_create_and_destroy() {
                         events.push(ev);
                     }
                 } else if msg.message == WM_VITRO_WINDOW_EVENT {
-                    events.push(take_window_event(msg.lParam));
+                    events.extend(drain_window_events());
                 } else if msg.message == WM_TIMER {
                     tracker.on_timer(msg.wParam.0);
                 } else {
