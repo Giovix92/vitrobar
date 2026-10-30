@@ -16,3 +16,25 @@ jobs:
       - run: cargo test --workspace
       - run: cargo build --release --target x86_64-pc-windows-msvc
       - run: cargo build --release --target aarch64-pc-windows-msvc
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vitrobar-x64
+          path: target/x86_64-pc-windows-msvc/release/vitrobar.exe
+
+  perf:
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: vitrobar-x64
+          path: bin
+      # Enforces the exe-size and idle-CPU budgets. Memory is reported, not enforced: the
+      # runner has no GPU, so D3D runs on WARP (the software rasterizer), whose allocations
+      # are nothing like a real driver's (the GPU driver is most of the bar's private bytes
+      # on real hardware). The 40 MB budget is enforced by local runs of the same script on
+      # a real machine (docs/release-checklist.md, "Performance"). GPU use is checked by hand.
+      - name: Performance budget check
+        shell: pwsh
+        run: ./scripts/perf-check.ps1 -Exe bin/vitrobar.exe -MemoryReportOnly

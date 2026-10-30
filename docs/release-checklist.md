@@ -246,3 +246,31 @@ show no console window; add `--console` to see diagnostics in the console that s
    running; killing the bar then still brings the stock taskbar back and the bar again.
 7. With Vitrobar running, run `vitrobar.exe --restore` → it does nothing (the taskbar stays
    Vitrobar's; Vitrobar's own exit later restores it).
+
+## Performance (manual, hybrid-GPU laptop)
+
+Introduced by stage 1, Task 16. Run on a laptop with an integrated and a discrete GPU, on
+battery and on mains, with a release build. `scripts/perf-check.ps1` opens its own test
+windows (Character Map ×3, Paint ×3, File Explorer ×2 on a temp folder, Calculator, one
+plain test window), uses a throw-away settings file and closes only what it opened; quit
+any running Vitrobar first (the script refuses to start next to one).
+
+1. `pwsh scripts/perf-check.ps1 -Exe target\release\vitrobar.exe -MeasureStartup` → one
+   line of JSON with `"pass": true`:
+   - `memory_mb` < 40: the largest sum of private bytes (`PrivateMemorySize64`, the
+     commit charge) of all Vitrobar processes (watchdog + bar) over 30 s, bar idle, panels
+     closed, 10 apps open (plus whatever else is open on the desktop);
+   - `cpu_ms` ≤ 50: CPU time of all Vitrobar processes over those 30 s;
+   - `exe_mb` < 5;
+   - `startup_ms` < 300: launch of `vitrobar.exe` (the watchdog) until a visible
+     `VitrobarBar` window exists (polled every ~2 ms through `EnumWindows`);
+   - `shell_ok` true: afterwards Explorer's `Shell_TrayWnd` is the only one and visible.
+   `failures` names every budget missed. Run it 3 times; all 3 must pass.
+2. GPU idle: with the bar idle and no panel open, Task Manager › Details › "GPU" column shows
+   0 for `vitrobar.exe` for 60 s. Repeat for each material (`material = "frosted"`,
+   `"liquid"`, `"smoked"`, `"solid-black"`, `"solid-white"` in `settings.toml`, restart the
+   bar after each change).
+3. Discrete GPU: it stays in low power / off while Vitrobar runs (NVIDIA or AMD control
+   panel, or `Get-Counter '\GPU Engine(*)\Utilization Percentage'` lists no engine with the
+   discrete GPU's LUID for the `vitrobar.exe` process id). The Performance tab of Task
+   Manager shows "GPU 1" (discrete) at 0 % with only Vitrobar running.
