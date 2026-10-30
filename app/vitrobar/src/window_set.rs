@@ -99,6 +99,7 @@ impl WindowSet {
 
     /// After a virtual desktop switch: re-checks desktop membership of every window.
     pub fn refresh_desktops(&mut self, desktops: &Desktops) -> bool {
+        desktops.invalidate();
         let mut changed = false;
         for (h, info) in self.infos.iter_mut() {
             let on = desktops.is_on_current(to_hwnd(*h));

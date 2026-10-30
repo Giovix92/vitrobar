@@ -166,3 +166,23 @@ fn tracker_reports_create_and_destroy() {
     drop(tracker);
     unsafe { DestroyWindow(notify).unwrap() };
 }
+
+/// Regression: the shell assigns a new window to a virtual desktop asynchronously
+/// (30-60 ms), and during that gap `IsWindowOnCurrentVirtualDesktop` says `false`. Reading
+/// a window right after creation must still say "current desktop".
+#[test]
+fn fresh_window_counts_as_on_current_desktop() {
+    let d = Desktops::new().unwrap();
+    // Like the app, learn the current desktop from an already settled window first.
+    let settled = make_window(WS_OVERLAPPEDWINDOW | WS_VISIBLE, WINDOW_EX_STYLE(0), None);
+    let t = Instant::now();
+    while !d.is_on_current(settled) && t.elapsed() < Duration::from_secs(2) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    for _ in 0..40 {
+        let h = make_window(WS_OVERLAPPEDWINDOW | WS_VISIBLE, WINDOW_EX_STYLE(0), None);
+        assert!(d.is_on_current(h));
+        unsafe { DestroyWindow(h).unwrap() };
+    }
+    unsafe { DestroyWindow(settled).unwrap() };
+}

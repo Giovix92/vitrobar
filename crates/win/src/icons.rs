@@ -102,12 +102,7 @@ fn load_shell_item(parsing_name: &str, size_px: u32) -> Option<BgraImage> {
         cy: size_px as i32,
     };
     // SAFETY: plain COM call; the returned HBITMAP is ours to delete.
-    // Observed once: the very first GetImage after a fresh build failed and a
-    // rerun succeeded. The cause is unknown; we retry once, only if the first
-    // call failed.
-    let hbmp = unsafe { factory.GetImage(size, SIIGBF_ICONONLY) }
-        .or_else(|_| unsafe { factory.GetImage(size, SIIGBF_ICONONLY) })
-        .ok()?;
+    let hbmp = unsafe { factory.GetImage(size, SIIGBF_ICONONLY) }.ok()?;
     // SAFETY: hbmp is a valid bitmap we own; it is deleted inside.
     unsafe { hbitmap_to_bgra(hbmp, size_px) }
 }
