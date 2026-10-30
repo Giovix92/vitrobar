@@ -22,24 +22,38 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SW_SHOWNORMAL, WM_CLOSE,
 };
 
-/// Starts a pinned app: packaged apps by AUMID, everything else through the shell.
-/// Blocking; needs COM initialised on the calling thread.
+/// Starts a pinned app: through the shortcut it was imported from while that still exists
+/// (it keeps arguments such as a web app's id), else packaged apps by AUMID, else the
+/// executable through the shell. An AUMID that does not activate (a desktop app's explicit
+/// AUMID) falls back to the executable. Blocking; needs COM initialised on the calling thread.
 pub fn launch_pin(p: &Pin) -> Result<()> {
-    if let Some(aumid) = p.aumid.as_deref().filter(|a| !a.is_empty()) {
-        // SAFETY: plain COM activation on the calling (STA) thread.
-        unsafe {
-            let mgr: IApplicationActivationManager =
-                CoCreateInstance(&ApplicationActivationManager, None, CLSCTX_LOCAL_SERVER)?;
-            mgr.ActivateApplication(&HSTRING::from(aumid), PCWSTR::null(), AO_NONE)?;
-        }
-        return Ok(());
-    }
-    let path = p
-        .path
+    if let Some(link) = p
+        .link
         .as_deref()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| Error::new(E_INVALIDARG, "pin has neither AUMID nor path"))?;
+        .filter(|l| std::path::Path::new(l).is_file())
+    {
+        return shell_open(&HSTRING::from(link));
+    }
+    let path = p.path.as_deref().filter(|s| !s.is_empty());
+    if let Some(aumid) = p.aumid.as_deref().filter(|a| !a.is_empty()) {
+        match activate_aumid(aumid) {
+            Ok(()) => return Ok(()),
+            Err(e) if path.is_none() => return Err(e),
+            Err(_) => {}
+        }
+    }
+    let path = path.ok_or_else(|| Error::new(E_INVALIDARG, "pin has neither AUMID nor path"))?;
     shell_open(&HSTRING::from(path))
+}
+
+fn activate_aumid(aumid: &str) -> Result<()> {
+    // SAFETY: plain COM activation on the calling (STA) thread.
+    unsafe {
+        let mgr: IApplicationActivationManager =
+            CoCreateInstance(&ApplicationActivationManager, None, CLSCTX_LOCAL_SERVER)?;
+        mgr.ActivateApplication(&HSTRING::from(aumid), PCWSTR::null(), AO_NONE)?;
+    }
+    Ok(())
 }
 
 fn shell_open(file: &HSTRING) -> Result<()> {

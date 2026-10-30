@@ -2,6 +2,7 @@
 
 use vitro_core::style::Theme;
 use windows::core::{w, BOOL, PCWSTR};
+use windows::Win32::Globalization::{GetUserDefaultUILanguage, LCIDToLocaleName};
 use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 use windows::Win32::UI::WindowsAndMessaging::{
     SystemParametersInfoW, SPI_GETCLIENTAREAANIMATION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
@@ -70,4 +71,13 @@ pub fn read_system_theme() -> SystemTheme {
         transparency: personalize_dword(w!("EnableTransparency")).unwrap_or(1) != 0,
         animations: animations(),
     }
+}
+
+/// The Windows display language as a locale tag ("it-IT"), `None` if it cannot be read.
+pub fn user_ui_language_tag() -> Option<String> {
+    let mut buf = [0u16; 85]; // LOCALE_NAME_MAX_LENGTH
+                              // SAFETY: plain query; the buffer and its length are passed together.
+    let n = unsafe { LCIDToLocaleName(u32::from(GetUserDefaultUILanguage()), Some(&mut buf), 0) };
+    let n = usize::try_from(n).ok()?.checked_sub(1)?; // without the terminating NUL
+    (n > 0).then(|| String::from_utf16_lossy(&buf[..n.min(buf.len())]))
 }

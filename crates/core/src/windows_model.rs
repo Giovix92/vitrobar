@@ -72,13 +72,16 @@ fn pin_key(p: &Pin) -> GroupKey {
     }
 }
 
+/// When both sides have an AUMID it alone decides (a web app pinned from Chrome shares
+/// chrome.exe with Chrome itself but not its AUMID); otherwise the executable does.
 fn pin_matches(p: &Pin, w: &WindowInfo) -> bool {
-    let by_aumid = matches!((&p.aumid, &w.aumid), (Some(a), Some(b)) if a == b);
-    let by_path = matches!(
-        (&p.path, &w.exe_path),
-        (Some(a), Some(b)) if a.to_lowercase() == b.to_lowercase()
-    );
-    by_aumid || by_path
+    match (&p.aumid, &w.aumid) {
+        (Some(a), Some(b)) => a == b,
+        _ => matches!(
+            (&p.path, &w.exe_path),
+            (Some(a), Some(b)) if a.to_lowercase() == b.to_lowercase()
+        ),
+    }
 }
 
 fn new_group(key: GroupKey, pin: Option<usize>) -> AppGroup {
@@ -229,6 +232,7 @@ mod tests {
             aumid: None,
             path: Some(path.into()),
             name: name.into(),
+            link: None,
         }
     }
 
@@ -337,6 +341,7 @@ mod tests {
             aumid: Some("App.Id".into()),
             path: Some("C:\\A.exe".into()),
             name: "A".into(),
+            link: None,
         }];
         let gs = build_groups(&pins, &[], 1, None);
         assert_eq!(gs[0].key, GroupKey::Aumid("App.Id".into()));
@@ -350,6 +355,29 @@ mod tests {
         assert_eq!(gs.len(), 1);
         assert_eq!(gs[0].key, GroupKey::Path("c:\\a.exe".into()));
         assert_eq!(gs[0].windows, vec![1]);
+    }
+
+    #[test]
+    fn web_app_pin_does_not_take_its_browser_windows() {
+        let pin = |a: &str| Pin {
+            aumid: Some(a.into()),
+            path: Some(r"C:\chrome.exe".into()),
+            name: a.into(),
+            link: None,
+        };
+        let pins = [pin("Chrome._crx_gmail"), pin("Chrome")];
+        let ws = [
+            w().id(1, 1).path(r"C:\chrome.exe").aumid("Chrome"),
+            w().id(2, 2)
+                .path(r"C:\chrome.exe")
+                .aumid("Chrome._crx_gmail"),
+            // No AUMID on the window: the executable decides (first pin).
+            w().id(3, 3).path(r"C:\chrome.exe"),
+        ];
+        let gs = build_groups(&pins, &ws, 1, None);
+        assert_eq!(gs.len(), 2);
+        assert_eq!(gs[0].windows, vec![2, 3]);
+        assert_eq!(gs[1].windows, vec![1]);
     }
 
     #[test]

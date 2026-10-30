@@ -82,6 +82,7 @@ mod tests {
             aumid: None,
             path: Some(r"C:\does\not\exist\vitrobar-test.exe".into()),
             name: "missing".into(),
+            link: None,
         };
         let t = Instant::now();
         launcher.launch(Job::Pin(pin));

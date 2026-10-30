@@ -137,3 +137,35 @@ Automated where safe:
 - Steps 1, 2, 3 and 5 with a tray app of your own (a PowerShell `NotifyIcon` that logs its
   clicks) driven against `vitrobar.exe --debug-state` (the `tray`, `overflow` and `tooltip`
   fields). Only ever click the test app's own icon: clicks are forwarded to real apps.
+
+## Pins and menus
+
+Introduced by stage 1, Task 13. On the first run (`first-run-done` false) Vitrobar copies the
+stock taskbar's pinned apps (in its order) and its promoted tray icons into `settings.toml`;
+afterwards the right-click menus change settings and pins, saved at once and applied without a
+restart. `VITROBAR_SETTINGS=<file>` makes Vitrobar use another settings file: use it for trial
+runs so the real `%APPDATA%\Vitrobar\settings.toml` stays as it is.
+
+1. Delete `%APPDATA%\Vitrobar\settings.toml` and start Vitrobar: the bar shows the same pinned
+   apps as the stock taskbar, in the same order (shortcuts in `User Pinned\TaskBar`, shortcuts
+   pinned from the Start menu, and packaged apps such as Terminal or Teams). Tray icons shown
+   outside the stock overflow are in the bar; the rest are in the overflow.
+2. Right-click the bar outside the apps and tray icons: Shape, Material (Frosted, Smoked,
+   Black, White), Hover effect, Icon size and Position each show a radio check on the current
+   value. Pick each value in turn: the bar changes at once (Islands = three glass windows,
+   Top = the bar and the reserved strip move to the top edge), and the choice is still there
+   after Exit and a new start.
+3. Right-click an app: New window, Pin or Unpin (whichever applies), and Close all windows
+   when it has windows. Pin keeps it on the bar after its windows close; Unpin removes a pinned
+   app without windows; New window starts another instance; Close all closes that app's
+   windows and no others (try it with Character Map, not with an app holding unsaved work).
+4. Start with Windows toggles its check (the Run entry itself comes with the installer stage).
+5. Exit Vitrobar: the stock taskbar and its tray come back, as with any other clean exit.
+6. With the Windows display language set to Italian the menus are in Italian; `language = "en"`
+   in `settings.toml` overrides it.
+
+Automated where safe: `cargo test -p vitro-win --test pins_import -- --nocapture` prints what
+the import would read on this machine (read-only). The menus and their effects were driven
+with keyboard input to Vitrobar's own menu, against `vitrobar.exe --debug-state` with
+`VITROBAR_SETTINGS` pointing at a temporary file (`settings`, `pins`, `bars` and `appbar` in
+the `vitrobar-state` lines; `vitrobar-menu` lines name each choice).

@@ -20,9 +20,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use vitro_core::clock::ms_until_next_minute;
+use vitro_core::i18n::{lang_from_tag, Lang};
 use vitro_core::image::BgraImage;
 use vitro_core::layout::{compute_layout, metrics, BarLayout, LayoutInput, Rect};
-use vitro_core::settings::{self, Position, Settings, ThemeChoice};
+use vitro_core::settings::{self, Pin, Position, Settings, ThemeChoice};
 use vitro_core::style::{hover_style, material_style, HoverStyle, MaterialStyle, Rgba, Theme};
 use vitro_core::tray_model::{split_promoted, TrayIcon};
 use vitro_core::windows_model::{
@@ -38,9 +39,10 @@ use vitro_render::surfaces::{FontKind, Painter};
 use vitro_render::tray_flyout::{grid_layout, Tooltip, TrayGrid};
 use vitro_win::appbar::{is_fullscreen_on, reserved_rect, AppBar};
 use vitro_win::desktops::Desktops;
-use vitro_win::launch::{activate_window, minimize_window, open_stock_start};
+use vitro_win::launch::{activate_window, close_window, minimize_window, open_stock_start};
 use vitro_win::monitors::{list_monitors, MonitorInfo};
-use vitro_win::system_theme::{read_system_theme, SystemTheme};
+use vitro_win::pins_import::{import_promoted_tray, import_windows_pins};
+use vitro_win::system_theme::{read_system_theme, user_ui_language_tag, SystemTheme};
 use vitro_win::time_format::clock_now;
 use vitro_win::tray_host::{tray_identity_key, TrayClick, TrayEntry, TrayHost};
 use vitro_win::window_tracker::{WindowEvent, WindowTracker};
@@ -53,10 +55,10 @@ use windows::Win32::System::Console::{
 use windows::Win32::System::Threading::{GetCurrentThreadId, INFINITE};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetDoubleClickTime, VK_ESCAPE};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetForegroundWindow, GetMessagePos, KillTimer, MsgWaitForMultipleObjectsEx,
-    PeekMessageW, PostThreadMessageW, SetTimer, TranslateMessage, MSG, MWMO_INPUTAVAILABLE,
-    PM_REMOVE, QS_ALLINPUT, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_QUIT,
-    WM_RBUTTONDOWN, WM_RBUTTONUP,
+    DispatchMessageW, GetForegroundWindow, GetMessagePos, IsWindow, KillTimer,
+    MsgWaitForMultipleObjectsEx, PeekMessageW, PostQuitMessage, PostThreadMessageW, SetTimer,
+    TranslateMessage, MSG, MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT, WM_KEYDOWN, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
 };
 
 use crate::bar_window::{
@@ -64,6 +66,7 @@ use crate::bar_window::{
 };
 use crate::icon_loader::{IconLoader, IconSrc, Lookup, TrayImage, MAX_ICON_PX};
 use crate::launcher::{Job, Launcher};
+use crate::menus::{app_menu, bar_menu, MenuChoice};
 use crate::notify::{
     take_inbox, Inbox, NotifyWindow, TIMER_CLOCK, TIMER_GPU_RETRY, TIMER_HOVER_HIDE,
     TIMER_HOVER_SHOW, TIMER_MARGIN_COLLAPSE, TIMER_REASSERT, TIMER_TRAY_TIP,
@@ -130,8 +133,65 @@ unsafe extern "system" fn on_console_ctrl(ctrl_type: u32) -> BOOL {
     posted.into()
 }
 
+/// Overrides the settings file (tests and trial runs that must not touch the real one).
+const SETTINGS_ENV: &str = "VITROBAR_SETTINGS";
+
+/// `%APPDATA%\Vitrobar\settings.toml`, or the file named by `VITROBAR_SETTINGS`.
 fn settings_path() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os(SETTINGS_ENV).filter(|p| !p.is_empty()) {
+        return Some(PathBuf::from(p));
+    }
     std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("Vitrobar").join("settings.toml"))
+}
+
+/// First run: start from what the stock taskbar shows (lists already set are kept).
+fn first_run_import(s: &mut Settings) {
+    if s.pins.is_empty() {
+        s.pins = import_windows_pins();
+    }
+    if s.tray_promoted.is_empty() {
+        s.tray_promoted = import_promoted_tray();
+    }
+    s.first_run_done = true;
+}
+
+/// The settings' language, else the Windows display language.
+fn ui_lang(s: &Settings) -> Lang {
+    match s.language.as_deref().filter(|l| !l.is_empty()) {
+        Some(tag) => lang_from_tag(tag),
+        None => user_ui_language_tag().map_or(Lang::En, |t| lang_from_tag(&t)),
+    }
+}
+
+/// A pin for an app group that is not pinned (from its key and its first window).
+fn pin_for_group(g: &AppGroup, infos: &[vitro_core::windows_model::WindowInfo]) -> Option<Pin> {
+    let first = g
+        .windows
+        .first()
+        .and_then(|h| infos.iter().find(|w| w.hwnd == *h));
+    let aumid = match &g.key {
+        GroupKey::Aumid(a) => Some(a.clone()),
+        _ => first.and_then(|w| w.aumid.clone()),
+    };
+    let path = first.and_then(|w| w.exe_path.clone()).or(match &g.key {
+        GroupKey::Path(p) if !p.is_empty() => Some(p.clone()),
+        _ => None,
+    });
+    if aumid.is_none() && path.is_none() {
+        return None;
+    }
+    let name = path
+        .as_deref()
+        .and_then(|p| std::path::Path::new(p).file_stem())
+        .map(|n| n.to_string_lossy().into_owned())
+        .or_else(|| aumid.clone())
+        .unwrap_or_default();
+    Some(Pin {
+        aumid,
+        path,
+        name,
+        link: None,
+    })
 }
 
 fn style_for(settings: &Settings, sys: &SystemTheme) -> MaterialStyle {
@@ -271,6 +331,8 @@ struct App {
 
     opts: Options,
     settings: Settings,
+    /// Where settings changes are saved (`None`: nowhere, `APPDATA` is not set).
+    settings_path: Option<PathBuf>,
     monitor: MonitorInfo,
     scale: f32,
     sys: SystemTheme,
@@ -323,7 +385,12 @@ struct App {
 
 impl App {
     /// `stock` is dropped (and the shell restored) if creating the app fails.
-    fn new(opts: Options, settings: Settings, stock: StockGuard) -> Result<Self> {
+    fn new(
+        opts: Options,
+        settings: Settings,
+        settings_path: Option<PathBuf>,
+        stock: StockGuard,
+    ) -> Result<Self> {
         let comp = init_compositor()?;
         let gpu = create_gpu_device(&comp)?;
         let painter = Painter::new(&gpu)?;
@@ -366,6 +433,7 @@ impl App {
             style: style_for(&settings, &sys),
             hover_style: hover_style(settings.hover),
             settings,
+            settings_path,
             monitor,
             scale,
             sys,
@@ -742,7 +810,8 @@ impl App {
         let reserved = (self.layout.reserved * self.scale).round() as i32;
         let (edge, mon) = (self.settings.position, self.monitor.rect_px);
         match &mut self.appbar {
-            Some(ab) if ab.hwnd() == hwnd => ab.update(edge, mon, reserved),
+            // A new edge registers afresh, so the shell drops the old strip entirely.
+            Some(ab) if ab.hwnd() == hwnd && ab.edge() == edge => ab.update(edge, mon, reserved),
             _ => {
                 self.drop_appbar();
                 match AppBar::register(hwnd, edge, mon, reserved) {
@@ -958,8 +1027,16 @@ impl App {
             .tray
             .as_ref()
             .map_or("null".to_string(), |t| (t.hwnd().0 as usize).to_string());
+        let st = &self.settings;
+        let settings = format!(
+            "{{\"shape\":\"{:?}\",\"material\":\"{:?}\",\"hover\":\"{:?}\",\"icon_size\":\"{:?}\",\"position\":\"{:?}\",\"start_with_windows\":{}}}",
+            st.shape, st.material, st.hover, st.icon_size, st.position, st.start_with_windows
+        );
+        let pins: Vec<String> = st.pins.iter().map(|p| json_str(&p.name)).collect();
         let dump = format!(
-            "{{\"tray_host\":{},\"chevron\":{},\"tray\":[{}],\"overflow\":{},\"tooltip\":{},\"fullscreen\":{},\"stock_taken\":{},\"appbar\":{},\"hover\":{},\"strip\":{},\"live_thumbnails\":{},\"bars\":[{}],\"groups\":{},\"shown\":{},\"start\":{},\"quick\":{},\"clock\":{},\"clock_text\":{},\"more\":{},\"apps\":[{}]}}",
+            "{{\"settings\":{},\"pins\":[{}],\"tray_host\":{},\"chevron\":{},\"tray\":[{}],\"overflow\":{},\"tooltip\":{},\"fullscreen\":{},\"stock_taken\":{},\"appbar\":{},\"hover\":{},\"strip\":{},\"live_thumbnails\":{},\"bars\":[{}],\"groups\":{},\"shown\":{},\"start\":{},\"quick\":{},\"clock\":{},\"clock_text\":{},\"more\":{},\"apps\":[{}]}}",
+            settings,
+            pins.join(","),
             tray_host,
             json_rect(to_px(l.overflow_chevron, s)),
             tray.join(","),
@@ -1180,12 +1257,19 @@ impl App {
                 let pressed = self.rpressed.take();
                 dirty.visuals = true;
                 match hit {
-                    Some(Hit::Tray(k)) if pressed == hit => {
-                        self.close_overflow();
-                        self.tray_click(self.tray_bar.get(k).copied(), TrayClick::Right);
+                    Some(Hit::Tray(k)) => {
+                        if pressed == hit {
+                            self.close_overflow();
+                            self.tray_click(self.tray_bar.get(k).copied(), TrayClick::Right);
+                        }
                     }
-                    // Nothing else has a context menu yet.
-                    _ => {}
+                    Some(Hit::App(i)) => {
+                        if pressed == hit {
+                            self.context_menu(Some(i), dirty);
+                        }
+                    }
+                    // Anywhere else on the bar: the bar's own menu.
+                    _ => self.context_menu(None, dirty),
                 }
             }
             _ => return false,
@@ -1876,6 +1960,151 @@ impl App {
         }
     }
 
+    /// Ends every transient interaction (strip, overflow, tooltip, hover, presses, margin
+    /// expansion): before a modal menu and before the bar is laid out anew.
+    fn reset_interaction(&mut self) {
+        self.close_strip();
+        self.close_overflow();
+        self.set_tip_target(None);
+        self.cancel_show();
+        self.hover = None;
+        self.pressed = None;
+        self.rpressed = None;
+        // The modal menu loop swallows WM_MOUSELEAVE: start tracking afresh on the next move.
+        self.tracking = None;
+        self.show_suppressed = false;
+        self.kill_timer(TIMER_MARGIN_COLLAPSE);
+        self.collapse_pending = false;
+        for b in &mut self.bars {
+            b.window.set_expanded(false);
+        }
+    }
+
+    /// Right-click: the menu of app `app`, or the bar's own menu. Modal.
+    fn context_menu(&mut self, app: Option<usize>, dirty: &mut Dirty) {
+        self.reset_interaction();
+        dirty.visuals = true;
+        let lang = ui_lang(&self.settings);
+        let (owner, pt) = (self.notify.hwnd, self.msg_pt);
+        match app {
+            Some(i) => {
+                let Some(g) = self.groups.get(i).cloned() else {
+                    return;
+                };
+                let choice = app_menu(owner, pt, g.pin.is_some(), !g.windows.is_empty(), lang);
+                if self.opts.debug_state {
+                    eprintln!("vitrobar-menu app {i} {choice:?}");
+                }
+                if let Some(c) = choice {
+                    self.apply_app_choice(&g, c, dirty);
+                }
+            }
+            None => {
+                let choice = bar_menu(owner, pt, &self.settings, lang);
+                if self.opts.debug_state {
+                    eprintln!("vitrobar-menu bar {choice:?}");
+                }
+                if let Some(c) = choice {
+                    self.apply_bar_choice(c, dirty);
+                }
+            }
+        }
+    }
+
+    fn apply_app_choice(&mut self, g: &AppGroup, choice: MenuChoice, dirty: &mut Dirty) {
+        match choice {
+            MenuChoice::Pin => {
+                if g.pin.is_some() {
+                    return;
+                }
+                let Some(pin) = pin_for_group(g, &self.windows.infos()) else {
+                    eprintln!("vitrobar: this app cannot be pinned (no AUMID or executable)");
+                    return;
+                };
+                self.settings.pins.push(pin);
+                self.pins_changed(dirty);
+            }
+            MenuChoice::Unpin => {
+                let Some(p) = g.pin.filter(|&p| p < self.settings.pins.len()) else {
+                    return;
+                };
+                self.settings.pins.remove(p);
+                self.pins_changed(dirty);
+            }
+            MenuChoice::NewWindow => {
+                let pin = g
+                    .pin
+                    .and_then(|p| self.settings.pins.get(p).cloned())
+                    .or_else(|| pin_for_group(g, &self.windows.infos()));
+                if let Some(pin) = pin {
+                    self.launcher.launch(Job::Pin(pin));
+                }
+            }
+            MenuChoice::CloseAll => {
+                // Only this group's windows, and only those still alive.
+                for &h in &g.windows {
+                    let hwnd = hwnd_of(h);
+                    // SAFETY: plain query.
+                    if self.windows.contains(h) && unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+                        close_window(hwnd);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn pins_changed(&mut self, dirty: &mut Dirty) {
+        self.save_settings();
+        // Group indices (and so hover and press) refer to the old pins.
+        self.regroup();
+        dirty.visuals = true;
+    }
+
+    fn apply_bar_choice(&mut self, choice: MenuChoice, dirty: &mut Dirty) {
+        let s = &mut self.settings;
+        let changed = match choice {
+            MenuChoice::SetShape(v) => std::mem::replace(&mut s.shape, v) != v,
+            MenuChoice::SetMaterial(v) => std::mem::replace(&mut s.material, v) != v,
+            MenuChoice::SetHover(v) => std::mem::replace(&mut s.hover, v) != v,
+            MenuChoice::SetIconSize(v) => std::mem::replace(&mut s.icon_size, v) != v,
+            MenuChoice::SetPosition(v) => std::mem::replace(&mut s.position, v) != v,
+            MenuChoice::ToggleStartWithWindows => {
+                // The Run key itself is written by a later stage; the setting is kept now.
+                s.start_with_windows = !s.start_with_windows;
+                self.save_settings();
+                return;
+            }
+            MenuChoice::Exit => {
+                // The normal way out: the loop ends and the stock taskbar comes back.
+                // SAFETY: plain call.
+                unsafe { PostQuitMessage(0) };
+                return;
+            }
+            _ => false,
+        };
+        if changed {
+            self.save_settings();
+            self.relayout(dirty);
+        }
+    }
+
+    /// Settings that change how the bar looks took effect: new styles, then the next flush
+    /// lays out, resizes / creates / destroys the bar windows and moves the appbar.
+    fn relayout(&mut self, dirty: &mut Dirty) {
+        self.reset_interaction();
+        self.style = style_for(&self.settings, &self.sys);
+        self.hover_style = hover_style(self.settings.hover);
+        dirty.visuals = true;
+    }
+
+    fn save_settings(&self) {
+        let Some(p) = &self.settings_path else { return };
+        if let Err(e) = settings::save(p, &self.settings) {
+            eprintln!("vitrobar: could not save the settings: {e}");
+        }
+    }
+
     fn on_device_removed(&mut self, dirty: &mut Dirty) {
         // GPU device removed (TDR, driver update): recreate, then redraw everything.
         self.gpu_lost = true;
@@ -1985,13 +2214,27 @@ pub fn run(opts: Options) -> Result<()> {
         SetConsoleCtrlHandler(Some(on_console_ctrl), true)?;
     }
 
-    // Read only: defaults when missing; the settings file is not written yet.
-    let settings = settings_path()
-        .map(|p| settings::load(&p))
-        .unwrap_or_default();
+    let path = settings_path();
+    let mut settings = path.as_deref().map(settings::load).unwrap_or_default();
+    if !settings.first_run_done {
+        // Before the stock taskbar is taken over: the import only reads.
+        first_run_import(&mut settings);
+        if opts.debug_state {
+            eprintln!(
+                "vitrobar-import {} pins, {} promoted tray icons",
+                settings.pins.len(),
+                settings.tray_promoted.len()
+            );
+        }
+        if let Some(p) = &path {
+            if let Err(e) = settings::save(p, &settings) {
+                eprintln!("vitrobar: could not save the settings: {e}");
+            }
+        }
+    }
     // Before the bar shows; restored when `app` (or a failing `App::new`) drops it.
     let stock = StockGuard::take_over(settings.stock_taskbar);
-    let mut app = App::new(opts, settings, stock)?;
+    let mut app = App::new(opts, settings, path, stock)?;
     let mut msg = MSG::default();
     'event: loop {
         let removed = app.gpu.removed_event();

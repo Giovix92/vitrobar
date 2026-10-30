@@ -4,6 +4,7 @@ mod app;
 mod bar_window;
 mod icon_loader;
 mod launcher;
+mod menus;
 mod notify;
 mod shell;
 mod window_set;

@@ -5,6 +5,7 @@ pub mod desktops;
 pub mod icons;
 pub mod launch;
 pub mod monitors;
+pub mod pins_import;
 pub mod stock_taskbar;
 pub mod system_theme;
 pub mod time_format;

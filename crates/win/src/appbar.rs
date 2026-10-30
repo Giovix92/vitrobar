@@ -96,6 +96,11 @@ impl AppBar {
         self.hwnd
     }
 
+    /// The screen edge the strip is reserved on.
+    pub fn edge(&self) -> Position {
+        self.edge
+    }
+
     /// Follows a new edge, monitor rectangle or thickness (no-op when nothing changed).
     pub fn update(&mut self, edge: Position, monitor_rect_px: PxRect, reserved_px: i32) {
         if (edge, monitor_rect_px, reserved_px) == (self.edge, self.monitor, self.reserved) {

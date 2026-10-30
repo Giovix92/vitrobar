@@ -57,6 +57,9 @@ pub struct Pin {
     pub aumid: Option<String>,
     pub path: Option<String>,
     pub name: String,
+    /// The shortcut this pin was imported from. Launching opens it (keeping its arguments,
+    /// such as a web app's id); `aumid` and `path` still decide which windows it groups.
+    pub link: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -130,10 +133,13 @@ pub fn load(path: &Path) -> Settings {
     }
 }
 
-/// Atomically writes settings (`<path>.tmp` then rename).
+/// Atomically writes settings (`<path>.tmp` then rename), creating the folder if needed.
 pub fn save(path: &Path, s: &Settings) -> io::Result<()> {
     let text =
         toml::to_string_pretty(s).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
+    }
     let tmp = with_suffix(path, ".tmp");
     std::fs::write(&tmp, text)?;
     std::fs::rename(&tmp, path).inspect_err(|_| {
@@ -172,6 +178,7 @@ mod tests {
                 aumid: Some("Microsoft.Edge".into()),
                 path: None,
                 name: "Edge".into(),
+                link: Some(r"C:\x\Edge.lnk".into()),
             }],
             tray_promoted: vec!["vol".into()],
             ..Settings::default()
@@ -179,6 +186,18 @@ mod tests {
         save(&p, &original).unwrap();
         assert!(!d.path().join("settings.toml.tmp").exists());
         assert_eq!(load(&p), original);
+    }
+
+    #[test]
+    fn save_creates_the_parent_directory() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d
+            .path()
+            .join("Vitrobar")
+            .join("nested")
+            .join("settings.toml");
+        save(&p, &Settings::default()).unwrap();
+        assert_eq!(load(&p), Settings::default());
     }
 
     #[test]

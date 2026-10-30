@@ -8,6 +8,7 @@
 //! margin keeps drawing (so the shrink-back is not cut) but stops taking input: see
 //! [`MarginMode`].
 
+use std::cell::Cell;
 use std::sync::OnceLock;
 
 use vitro_core::layout::{BarLayout, Rect};
@@ -155,6 +156,12 @@ fn register_class() -> Result<()> {
         .clone()
 }
 
+thread_local! {
+    /// Set while [`BarWindow`]'s drop destroys its window: a bar the app removes itself
+    /// (fewer surfaces after a shape change) must not end the app.
+    static DROPPING: Cell<bool> = const { Cell::new(false) };
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     // Mouse input is handled by the app's message loop before dispatch; theme, time and
     // locale broadcasts go to the notify window.
@@ -182,8 +189,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_DESTROY => {
-            // SAFETY: plain call. A bar destroyed from outside (WM_CLOSE) ends the app.
-            unsafe { PostQuitMessage(0) };
+            if !DROPPING.get() {
+                // SAFETY: plain call. A bar destroyed from outside (WM_CLOSE) ends the app.
+                unsafe { PostQuitMessage(0) };
+            }
             LRESULT(0)
         }
         // SAFETY: default handling with the arguments we were given.
@@ -425,10 +434,13 @@ pub fn track_leave(hwnd: HWND) {
 
 impl Drop for BarWindow {
     fn drop(&mut self) {
-        // SAFETY: destroying our own window if it still exists.
+        // SAFETY: destroying our own window if it still exists (on its own thread: the
+        // drop runs on the UI thread, so WM_DESTROY is handled within the call).
         unsafe {
             if IsWindow(Some(self.hwnd)).as_bool() {
+                DROPPING.set(true);
                 let _ = DestroyWindow(self.hwnd);
+                DROPPING.set(false);
             }
         }
     }
