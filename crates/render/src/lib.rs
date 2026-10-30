@@ -6,6 +6,7 @@ pub mod device;
 pub mod flyout;
 pub mod material;
 pub mod panel;
+pub mod start_view;
 pub mod surfaces;
 pub mod tray_flyout;
 

@@ -9,7 +9,7 @@ pub enum Theme {
 }
 
 /// Straight (non-premultiplied) colour, alpha 0..=255.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Rgba(pub u8, pub u8, pub u8, pub u8);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -35,7 +35,7 @@ use windows_numerics::{Matrix3x2, Vector2};
 use crate::device::GpuDevice;
 
 /// Which font a piece of text uses.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FontKind {
     /// UI text (clock).
     Text,
