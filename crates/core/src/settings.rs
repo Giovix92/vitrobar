@@ -177,6 +177,16 @@ fn from_table(t: &toml::Table) -> Settings {
             .and_then(|v| v.try_into().ok())
             .unwrap_or(default)
     }
+    /// A list keeps the elements that deserialize and drops only the bad ones; a value that
+    /// is not an array gives an empty list.
+    fn get_list<T: serde::de::DeserializeOwned>(t: &toml::Table, key: &str) -> Vec<T> {
+        match t.get(key) {
+            Some(toml::Value::Array(a)) => {
+                a.iter().filter_map(|v| v.clone().try_into().ok()).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
     Settings {
         shape: get(t, "shape", d.shape),
         material: get(t, "material", d.material),
@@ -191,12 +201,12 @@ fn from_table(t: &toml::Table) -> Settings {
         live_refraction: get(t, "live-refraction", d.live_refraction),
         start_with_windows: get(t, "start-with-windows", d.start_with_windows),
         language: get(t, "language", d.language),
-        pins: get(t, "pins", d.pins),
-        tray_promoted: get(t, "tray-promoted", d.tray_promoted),
+        pins: get_list(t, "pins"),
+        tray_promoted: get_list(t, "tray-promoted"),
         first_run_done: get(t, "first-run-done", d.first_run_done),
         start_style: get(t, "start-style", d.start_style),
         win_key_opens_start: get(t, "win-key-opens-start", d.win_key_opens_start),
-        start_pins: get(t, "start-pins", d.start_pins),
+        start_pins: get_list(t, "start-pins"),
     }
 }
 
@@ -469,6 +479,52 @@ start-style = 3",
             })
             .count();
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn one_bad_list_element_keeps_the_others() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("settings.toml");
+        fs::write(
+            &p,
+            "tray-promoted = [\"a\", 5, \"b\"]
+start-pins = 7
+
+[[pins]]
+name = \"Good\"
+
+[[pins]]
+name = 3
+",
+        )
+        .unwrap();
+        let s = load(&p);
+        assert_eq!(s.pins.len(), 1);
+        assert_eq!(s.pins[0].name, "Good");
+        assert_eq!(s.tray_promoted, vec!["a".to_string(), "b".to_string()]);
+        assert!(s.start_pins.is_empty());
+    }
+
+    #[test]
+    fn different_corruption_writes_a_second_bad_copy() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("settings.toml");
+        fs::write(&p, "shape = [").unwrap();
+        let _ = load(&p);
+        fs::write(&p, "material = {").unwrap();
+        let _ = load(&p);
+        let _ = load(&p);
+        let n = fs::read_dir(d.path())
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("settings.toml.bad-")
+            })
+            .count();
+        assert_eq!(n, 2);
     }
 
     #[test]

@@ -424,6 +424,18 @@ mod tests {
         assert_eq!(ALL_KEYS.len(), 94);
     }
     #[test]
+    fn italian_differs_from_english() {
+        for k in [
+            Key::Pinned,
+            Key::AllApps,
+            Key::ShutDown,
+            Key::Recent,
+            Key::Lock,
+        ] {
+            assert_ne!(tr(Lang::En, k), tr(Lang::It, k), "{k:?}");
+        }
+    }
+    #[test]
     fn spot_checks() {
         assert_eq!(tr(Lang::En, Key::ExitVitrobar), "Exit Vitrobar");
         assert_eq!(tr(Lang::It, Key::MaterialSmoked), "Vetro fumé");

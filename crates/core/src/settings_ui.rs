@@ -120,6 +120,7 @@ fn index_of<T: PartialEq>(all: &[T], v: &T) -> usize {
     all.iter().position(|x| x == v).unwrap_or(0)
 }
 
+/// Any language other than en/it (hand-edited file) is shown as "Same as Windows".
 fn language_index(s: &Settings) -> usize {
     match s.language.as_deref() {
         Some("en") => 1,

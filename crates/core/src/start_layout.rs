@@ -55,7 +55,9 @@ fn rect(x: f32, y: f32, w: f32, h: f32) -> Rect {
 }
 
 /// Lays the Start panel out inside `panel` (the placed rectangle, DIPs). The offsets assume
-/// the full 640x720 size; a shrunk panel keeps the same rows and lets the renderer clip.
+/// the full 640x720 size; a shorter panel gets fewer pin rows (at least 1) and then fewer
+/// recent rows (none at all drops the Recent title, leaving `recent_title` empty), so that
+/// everything stays between the search box and the footer.
 pub fn panel_layout(panel: Rect) -> StartLayout {
     let x = panel.x + PAD;
     let w = panel.w - 2.0 * PAD;
@@ -64,7 +66,9 @@ pub fn panel_layout(panel: Rect) -> StartLayout {
     let all_apps_button = rect(x + w - 120.0, pins_title.y, 120.0, TITLE_H);
     let pins_top = pins_title.bottom() + 8.0;
     let cell_w = w / PIN_COLS as f32;
-    let pins = (0..PIN_COLS * PIN_ROWS)
+    let footer = rect(panel.x, panel.bottom() - FOOTER_H, panel.w, FOOTER_H);
+    let pin_rows = (((footer.y - pins_top) / PIN_CELL_H).floor().max(1.0) as usize).min(PIN_ROWS);
+    let pins = (0..PIN_COLS * pin_rows)
         .map(|i| {
             let (r, c) = (i / PIN_COLS, i % PIN_COLS);
             rect(
@@ -75,17 +79,18 @@ pub fn panel_layout(panel: Rect) -> StartLayout {
             )
         })
         .collect();
-    let recent_title = rect(
-        x,
-        pins_top + PIN_ROWS as f32 * PIN_CELL_H + SECTION_GAP,
-        w,
-        TITLE_H,
-    );
+    let pins_bottom = pins_top + pin_rows as f32 * PIN_CELL_H;
+    let after = footer.y - (pins_bottom + SECTION_GAP + TITLE_H + 4.0);
+    let recent_rows = ((after / RECENT_ROW_H).floor().max(0.0) as usize).min(RECENT_ROWS);
+    let recent_title = if recent_rows == 0 {
+        rect(x, pins_bottom, 0.0, 0.0)
+    } else {
+        rect(x, pins_bottom + SECTION_GAP, w, TITLE_H)
+    };
     let recent_top = recent_title.bottom() + 4.0;
-    let recent = (0..RECENT_ROWS)
+    let recent = (0..recent_rows)
         .map(|i| rect(x, recent_top + i as f32 * RECENT_ROW_H, w, RECENT_ROW_H))
         .collect();
-    let footer = rect(panel.x, panel.bottom() - FOOTER_H, panel.w, FOOTER_H);
     let account = rect(x, footer.y + (FOOTER_H - 40.0) / 2.0, 240.0, 40.0);
     let power = rect(x + w - 40.0, footer.y + (FOOTER_H - 40.0) / 2.0, 40.0, 40.0);
     let list_top = search.bottom() + 8.0;
@@ -274,6 +279,60 @@ mod tests {
         assert_eq!(l.results[0].h, RESULT_ROW_H_DIP);
         assert!(l.results.iter().all(|r| r.bottom() <= l.footer.y));
         assert!(l.results.len() >= 8);
+    }
+
+    #[test]
+    fn panel_layout_adapts_to_short_panels() {
+        for (w, h, pins, recent) in [
+            (640.0, 720.0, 18, 4),
+            (640.0, 532.0, 18, 0),
+            (400.0, 480.0, 18, 0),
+        ] {
+            let p = rect(10.0, 20.0, w, h);
+            let l = panel_layout(p);
+            assert_eq!(l.pins.len(), pins, "{w}x{h}");
+            assert_eq!(l.recent.len(), recent, "{w}x{h}");
+            let mut all = vec![
+                l.search,
+                l.pins_title,
+                l.all_apps_button,
+                l.recent_title,
+                l.footer,
+                l.account,
+                l.power,
+                l.list_view,
+            ];
+            all.extend(&l.pins);
+            all.extend(&l.recent);
+            all.extend(&l.results);
+            for r in &all {
+                assert!(inside(&p, r), "{w}x{h}: {r:?}");
+            }
+            let mut stack = vec![l.search, l.pins_title];
+            stack.extend(&l.pins);
+            if recent > 0 {
+                stack.push(l.recent_title);
+                stack.extend(&l.recent);
+            }
+            stack.push(l.footer);
+            for r in &stack[..stack.len() - 1] {
+                assert!(r.bottom() <= l.footer.y + 0.01, "{w}x{h}: {r:?}");
+            }
+            assert_no_overlap(&l.pins);
+            assert_no_overlap(&l.recent);
+            assert!(!overlap(&l.pins_title, &l.pins[0]));
+            for r in l.pins.iter().chain(&l.recent) {
+                assert!(!overlap(r, &l.footer));
+            }
+        }
+    }
+
+    #[test]
+    fn panel_layout_drops_pin_rows_when_very_short() {
+        let l = panel_layout(rect(0.0, 0.0, 400.0, 400.0));
+        assert!(l.pins.len() < 18 && l.pins.len() >= PIN_COLS);
+        assert!(l.recent.is_empty());
+        assert!(l.pins.iter().all(|r| r.bottom() <= l.footer.y));
     }
 
     #[test]
