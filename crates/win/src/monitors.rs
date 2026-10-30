@@ -62,6 +62,11 @@ unsafe extern "system" fn collect(hmon: HMONITOR, _: HDC, _: *mut RECT, data: LP
     true.into()
 }
 
+/// The [`MonitorInfo::id`] of a monitor handle (what `WindowInfo::monitor` holds).
+pub fn monitor_id(hmon: HMONITOR) -> Option<u64> {
+    info(hmon).map(|m| m.id)
+}
+
 /// All attached monitors, primary first.
 pub fn list_monitors() -> Vec<MonitorInfo> {
     let mut handles: Vec<HMONITOR> = Vec::new();
