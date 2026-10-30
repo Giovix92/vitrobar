@@ -18,12 +18,13 @@ use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, E_FAIL, HW
 use windows::Win32::System::Registry::{
     RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ,
 };
+use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::Shell::{
     SHAppBarMessage, ABM_GETSTATE, ABM_SETSTATE, ABS_AUTOHIDE, APPBARDATA,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, FindWindowW, IsWindowVisible, RegisterWindowMessageW, ShowWindowAsync, SW_HIDE,
-    SW_SHOWNA,
+    EnumWindows, FindWindowExW, GetWindowThreadProcessId, IsWindowVisible, RegisterWindowMessageW,
+    ShowWindowAsync, SW_HIDE, SW_SHOWNA,
 };
 
 use crate::window_props::class_name;
@@ -125,12 +126,33 @@ fn set_autohide(on: bool) -> Result<()> {
     Ok(())
 }
 
-/// Explorer's main taskbar window, if Explorer is running.
+/// Explorer's main taskbar window, if Explorer is running. Vitrobar's own tray host also
+/// has a window of class `Shell_TrayWnd` (see [`crate::tray_host`]): windows of this
+/// process are skipped.
+pub fn explorer_tray_window() -> Option<HWND> {
+    // SAFETY: plain query.
+    let own = unsafe { GetCurrentProcessId() };
+    let mut after: Option<HWND> = None;
+    // Bounded: there are only ever a handful of windows of this class.
+    for _ in 0..64 {
+        // SAFETY: plain query with static strings; `after` is a window returned by the
+        // previous call (or none).
+        let h = unsafe { FindWindowExW(None, after, w!("Shell_TrayWnd"), PCWSTR::null()) }
+            .ok()
+            .filter(|h| !h.0.is_null())?;
+        let mut pid = 0u32;
+        // SAFETY: out-pointer to a local; the call does not message the window.
+        unsafe { GetWindowThreadProcessId(h, Some(&mut pid)) };
+        if pid != own {
+            return Some(h);
+        }
+        after = Some(h);
+    }
+    None
+}
+
 fn primary_tray() -> Option<HWND> {
-    // SAFETY: plain query with static strings.
-    unsafe { FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()) }
-        .ok()
-        .filter(|h| !h.0.is_null())
+    explorer_tray_window()
 }
 
 unsafe extern "system" fn collect_secondary(hwnd: HWND, data: LPARAM) -> BOOL {

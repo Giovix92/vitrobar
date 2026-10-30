@@ -94,6 +94,11 @@ fn pid_of(hwnd: HWND) -> u32 {
     pid
 }
 
+/// Full path of the executable of the process that owns `hwnd`.
+pub(crate) fn exe_of_window(hwnd: HWND) -> Option<String> {
+    Process::open(pid_of(hwnd))?.exe_path()
+}
+
 pub(crate) fn class_name(hwnd: HWND) -> String {
     let mut buf = [0u16; 256];
     // SAFETY: the slice is the output buffer.

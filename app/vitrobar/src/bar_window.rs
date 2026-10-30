@@ -441,6 +441,10 @@ pub enum Hit {
     /// Index into `layout.apps` (= index into the app groups).
     App(usize),
     More,
+    /// The tray overflow chevron.
+    Chevron,
+    /// Index into `layout.tray` (the promoted tray icons).
+    Tray(usize),
     Quick,
     Clock,
     ShowDesktop,
@@ -463,6 +467,12 @@ pub fn hit_test(l: &BarLayout, x: f32, y: f32) -> Option<Hit> {
     }
     if l.more.as_ref().is_some_and(|r| inside(r, x, y)) {
         return Some(Hit::More);
+    }
+    if inside(&l.overflow_chevron, x, y) {
+        return Some(Hit::Chevron);
+    }
+    if let Some(i) = l.tray.iter().position(|r| inside(r, x, y)) {
+        return Some(Hit::Tray(i));
     }
     if inside(&l.quick, x, y) {
         return Some(Hit::Quick);
@@ -489,7 +499,11 @@ mod tests {
     use vitro_core::settings::{IconSize, Position, Shape};
 
     fn layout(n: usize) -> BarLayout {
-        compute_layout(&LayoutInput {
+        compute_layout(&input(n))
+    }
+
+    fn input(n: usize) -> LayoutInput {
+        LayoutInput {
             monitor: Rect {
                 x: 0.0,
                 y: 0.0,
@@ -503,7 +517,7 @@ mod tests {
             tray_count: 0,
             clock_w: 70.0,
             reserve_floating: true,
-        })
+        }
     }
 
     fn centre(r: &Rect) -> (f32, f32) {
@@ -521,10 +535,26 @@ mod tests {
         }
         let (x, y) = centre(&l.quick);
         assert_eq!(hit_test(&l, x, y), Some(Hit::Quick));
+        let (x, y) = centre(&l.overflow_chevron);
+        assert_eq!(hit_test(&l, x, y), Some(Hit::Chevron));
         let (x, y) = centre(&l.clock);
         assert_eq!(hit_test(&l, x, y), Some(Hit::Clock));
         let (x, y) = centre(&l.show_desktop);
         assert_eq!(hit_test(&l, x, y), Some(Hit::ShowDesktop));
+    }
+
+    #[test]
+    fn tray_icons_hit_their_slots() {
+        let l = compute_layout(&LayoutInput {
+            tray_count: 3,
+            ..input(2)
+        });
+        for (i, r) in l.tray.iter().enumerate() {
+            let (x, y) = centre(r);
+            assert_eq!(hit_test(&l, x, y), Some(Hit::Tray(i)));
+        }
+        let (x, y) = centre(&l.quick);
+        assert_eq!(hit_test(&l, x, y), Some(Hit::Quick));
     }
 
     #[test]

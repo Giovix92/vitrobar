@@ -6,5 +6,6 @@ pub mod device;
 pub mod flyout;
 pub mod material;
 pub mod surfaces;
+pub mod tray_flyout;
 
 pub use windows_numerics::{Vector2, Vector3};

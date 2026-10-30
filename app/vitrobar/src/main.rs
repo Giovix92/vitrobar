@@ -28,7 +28,13 @@ fn restore_mode() -> ExitCode {
             std::thread::sleep(Duration::from_millis(250));
         }
     }
-    match vitro_win::stock_taskbar::restore_stock_taskbar(&path) {
+    let restored = vitro_win::stock_taskbar::restore_stock_taskbar(&path);
+    if vitro_win::stock_taskbar::stock_taskbar_present() {
+        // A Vitrobar that ended without cleaning up may have held the tray icons: ask every
+        // app to register them with Explorer again.
+        vitro_win::tray_host::broadcast_taskbar_created();
+    }
+    match restored {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("vitrobar: could not restore the stock taskbar: {e}");

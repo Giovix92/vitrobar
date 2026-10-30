@@ -6,7 +6,9 @@ use vitro_core::image::BgraImage;
 use vitro_core::layout::{compute_layout, BarLayout, LayoutInput, Rect};
 use vitro_core::settings::{HoverEffect, IconSize, Material, Position, Shape};
 use vitro_core::style::{hover_style, material_style, Rgba, Theme};
-use vitro_render::bar_visual::{hover_timing, BarVisual, ItemState, VisualEnv};
+use vitro_render::bar_visual::{
+    hover_timing, BarVisual, ChevronState, ItemState, TrayItemState, VisualEnv,
+};
 use vitro_render::compositor::init_compositor;
 use vitro_render::device::create_gpu_device;
 use vitro_render::surfaces::{FontKind, Painter};
@@ -292,4 +294,70 @@ fn motion_never_exceeds_250_ms() {
         };
         assert_eq!((motion, fade, streak), expected, "{h:?}");
     }
+}
+
+#[test]
+fn tray_icons_and_chevron_draw_once() {
+    let comp = init_compositor().unwrap();
+    let gpu = create_gpu_device(&comp).unwrap();
+    let mut bar = BarVisual::new(&comp, &gpu, 0).unwrap();
+    bar.set_env(VisualEnv {
+        animations: false,
+        ..Default::default()
+    });
+    let style = material_style(Material::Frosted, Theme::Dark, true);
+    let hover = hover_style(HoverEffect::Plate);
+    let mut input = LayoutInput {
+        monitor: Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 1536.0,
+            h: 864.0,
+        },
+        shape: Shape::Pill,
+        position: Position::Bottom,
+        icon_size: IconSize::Medium,
+        app_count: 0,
+        tray_count: 2,
+        clock_w: 72.0,
+        reserve_floating: true,
+    };
+    let l = compute_layout(&input);
+    let img = Arc::new(icon(16));
+    let tray = vec![
+        TrayItemState {
+            icon: Some(Arc::clone(&img)),
+            ..Default::default()
+        },
+        TrayItemState::default(), // placeholder
+    ];
+    let chevron = ChevronState {
+        shown: true,
+        ..Default::default()
+    };
+    bar.set_tray(tray.clone(), chevron);
+    bar.update(&l, &[], "12:34", &style, &hover).unwrap();
+    assert_eq!(bar.tray_cells(), 2);
+    assert!(bar.chevron_shown());
+    // Start, quick, clock, chevron glyph and one tray icon.
+    assert_eq!(bar.surfaces_drawn(), 5);
+    let mut hovered = tray.clone();
+    hovered[0].hovered = true;
+    bar.set_tray(
+        hovered,
+        ChevronState {
+            open: true,
+            ..chevron
+        },
+    );
+    bar.update(&l, &[], "12:34", &style, &hover).unwrap();
+    assert_eq!(bar.surfaces_drawn(), 5, "hover plates are shapes");
+
+    // No overflow: no chevron; one icon fewer.
+    input.tray_count = 1;
+    let l = compute_layout(&input);
+    bar.set_tray(tray[..1].to_vec(), ChevronState::default());
+    bar.update(&l, &[], "12:34", &style, &hover).unwrap();
+    assert_eq!(bar.tray_cells(), 1);
+    assert!(!bar.chevron_shown());
 }

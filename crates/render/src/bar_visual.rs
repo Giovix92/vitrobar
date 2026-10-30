@@ -1,5 +1,5 @@
 //! The visual tree of one bar surface: backdrop, Start, app items (icon, plate, running
-//! dots), more, quick button and clock.
+//! dots), more, the tray (overflow chevron and promoted tray icons), quick button and clock.
 //!
 //! [`BarVisual::update`] diffs the requested state against what is on screen and touches
 //! only the visuals that changed; text and icons are drawn into surfaces once and reused.
@@ -41,6 +41,24 @@ pub struct ItemState {
     pub attention: bool,
     pub hovered: bool,
     pub pressed: bool,
+}
+
+/// A tray icon in the bar. The icon is shared with the icon store, like [`ItemState::icon`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrayItemState {
+    pub icon: Option<Arc<BgraImage>>,
+    pub hovered: bool,
+    pub pressed: bool,
+}
+
+/// The overflow chevron: shown only while some icons live in the overflow.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChevronState {
+    pub shown: bool,
+    pub hovered: bool,
+    pub pressed: bool,
+    /// The overflow is open.
+    pub open: bool,
 }
 
 /// Inputs that change rarely (monitor DPI, accent colour, the Animation effects setting,
@@ -226,6 +244,10 @@ fn animate(
 pub const GLYPH_START: char = '\u{E700}';
 pub const GLYPH_QUICK: char = '\u{E9E9}';
 pub const GLYPH_MORE: char = '\u{E712}';
+pub const GLYPH_CHEVRON_UP: char = '\u{E70E}';
+pub const GLYPH_CHEVRON_DOWN: char = '\u{E70D}';
+/// Tray icons are drawn at this size.
+pub const TRAY_ICON_DIP: f32 = crate::tray_flyout::TRAY_ICON_DIP;
 
 /// Font sizes and geometry in DIPs.
 const GLYPH_DIP: f32 = 16.0;
@@ -242,6 +264,8 @@ const PULSE_HALF_MS: u64 = 250;
 const DOT_ALPHA: u8 = 150;
 const PLATE_ACTIVE_ALPHA: u8 = 18;
 const PLATE_PRESSED_ALPHA: u8 = 42;
+/// Tray icons and the chevron under the cursor (or the chevron while the overflow is open).
+const PLATE_HOVER_ALPHA: u8 = 30;
 const PLATE_ATTENTION_ALPHA: u8 = 110;
 const PLACEHOLDER_ALPHA: u8 = 51; // 20 %
 
@@ -808,8 +832,12 @@ pub struct BarVisual {
     start: Option<Cell>,
     apps: Vec<Option<Cell>>,
     more: Option<Cell>,
+    chevron: Option<Cell>,
+    tray: Vec<Option<Cell>>,
     quick: Option<Cell>,
     clock: Option<Cell>,
+    tray_items: Vec<TrayItemState>,
+    chevron_state: ChevronState,
     surfaces_drawn: u64,
 }
 
@@ -841,8 +869,12 @@ impl BarVisual {
             start: None,
             apps: Vec::new(),
             more: None,
+            chevron: None,
+            tray: Vec::new(),
             quick: None,
             clock: None,
+            tray_items: Vec::new(),
+            chevron_state: ChevronState::default(),
             surfaces_drawn: 0,
         })
     }
@@ -892,6 +924,23 @@ impl BarVisual {
         self.env = env;
     }
 
+    /// The promoted tray icons (one per `layout.tray` slot) and the chevron; take effect on
+    /// the next [`BarVisual::update`].
+    pub fn set_tray(&mut self, items: Vec<TrayItemState>, chevron: ChevronState) {
+        self.tray_items = items;
+        self.chevron_state = chevron;
+    }
+
+    /// Number of tray icons currently in the tree (diagnostics and tests).
+    pub fn tray_cells(&self) -> usize {
+        self.tray.iter().flatten().count()
+    }
+
+    /// The chevron is in the tree (diagnostics and tests).
+    pub fn chevron_shown(&self) -> bool {
+        self.chevron.is_some()
+    }
+
     /// Forgets what is on screen so the next update redraws every surface (after the GPU
     /// device was recreated, surface contents are lost).
     pub fn invalidate(&mut self) {
@@ -899,11 +948,13 @@ impl BarVisual {
         for cell in [
             &mut self.start,
             &mut self.more,
+            &mut self.chevron,
             &mut self.quick,
             &mut self.clock,
         ]
         .into_iter()
         .chain(self.apps.iter_mut())
+        .chain(self.tray.iter_mut())
         .flatten()
         {
             cell.shown = None;
@@ -980,6 +1031,65 @@ impl BarVisual {
         let start = glyph(&layout.start, GLYPH_START);
         let more = layout.more.as_ref().and_then(|r| glyph(r, GLYPH_MORE));
         let quick = glyph(&layout.quick, GLYPH_QUICK);
+        let cs = self.chevron_state;
+        let chevron_glyph = match self.env.position {
+            Position::Bottom => GLYPH_CHEVRON_UP,
+            Position::Top => GLYPH_CHEVRON_DOWN,
+        };
+        let chevron = cs
+            .shown
+            .then(|| glyph(&layout.overflow_chevron, chevron_glyph))
+            .flatten()
+            .map(|mut spec| {
+                spec.plate = if cs.pressed {
+                    rgba_alpha(text, PLATE_PRESSED_ALPHA)
+                } else if cs.hovered || cs.open {
+                    rgba_alpha(text, PLATE_HOVER_ALPHA)
+                } else {
+                    Rgba(0, 0, 0, 0)
+                };
+                spec
+            });
+        let tray_px = px(TRAY_ICON_DIP).max(1);
+        let tray_specs: Vec<Option<CellSpec>> = layout
+            .tray
+            .iter()
+            .zip(&self.tray_items)
+            .map(|(r, it)| {
+                owns(&surface, r).then(|| {
+                    let rect = cell_rect(r);
+                    let content = match &it.icon {
+                        Some(img) if img.is_valid() && img.width > 0 => Content::Icon {
+                            image: IconRef(Arc::clone(img)),
+                            dy: 0,
+                        },
+                        _ => Content::Placeholder {
+                            size: tray_px,
+                            color: rgba_alpha(text, PLACEHOLDER_ALPHA),
+                            dy: 0,
+                            radius: tray_px / 4,
+                        },
+                    };
+                    let plate = if it.pressed {
+                        rgba_alpha(text, PLATE_PRESSED_ALPHA)
+                    } else if it.hovered {
+                        rgba_alpha(text, PLATE_HOVER_ALPHA)
+                    } else {
+                        Rgba(0, 0, 0, 0)
+                    };
+                    CellSpec {
+                        rect,
+                        content,
+                        plate,
+                        plate_inset,
+                        plate_radius,
+                        attention: false,
+                        dots: None,
+                        fx: None,
+                    }
+                })
+            })
+            .collect();
         let clock_spec = owns(&surface, &layout.clock).then(|| {
             let rect = cell_rect(&layout.clock);
             CellSpec {
@@ -1078,6 +1188,16 @@ impl BarVisual {
             drawn += sync(slot, spec, comp, painter, &parent, anim)?;
         }
         drawn += sync(&mut self.more, more, comp, painter, &parent, anim)?;
+        drawn += sync(&mut self.chevron, chevron, comp, painter, &parent, anim)?;
+        while self.tray.len() > tray_specs.len() {
+            if let Some(cell) = self.tray.pop().flatten() {
+                cell.remove(&parent);
+            }
+        }
+        self.tray.resize_with(tray_specs.len(), || None);
+        for (slot, spec) in self.tray.iter_mut().zip(tray_specs) {
+            drawn += sync(slot, spec, comp, painter, &parent, anim)?;
+        }
         drawn += sync(&mut self.quick, quick, comp, painter, &parent, anim)?;
         drawn += sync(&mut self.clock, clock_spec, comp, painter, &parent, anim)?;
         self.surfaces_drawn += u64::from(drawn);

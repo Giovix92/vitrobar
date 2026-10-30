@@ -1,59 +1,72 @@
 //! App state and the event-driven message loop (nothing redraws unless something happened).
 //!
 //! Timers: the minute clock tick, the tracker's coalescing timers, a one-shot GPU
-//! recreation retry, the one-shot hover timers of the thumbnail strip and a one-shot that
-//! hides the stock taskbar again after Explorer restarted. Everything else is driven by
-//! window, shell and input messages.
+//! recreation retry, the one-shot hover timers of the thumbnail strip, a one-shot that
+//! hides the stock taskbar again after Explorer restarted and the one-shot tray tooltip
+//! delay. Everything else is driven by window, shell, tray and input messages.
+//!
+//! The tray host ([`TrayHost`]) collects every app's notification-area icons. Icons listed
+//! in `Settings.tray_promoted` sit in the bar; the rest live in the overflow, a glass grid
+//! opened by the chevron. Clicks are handed to the icon's owner as the stock taskbar does.
 //!
 //! The stock taskbar is taken over before the bar appears and given back on every way out
 //! ([`StockGuard`]); the main bar window is an appbar that reserves the bar's strip; the bar
 //! hides while a full-screen app covers its monitor.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use vitro_core::clock::ms_until_next_minute;
+use vitro_core::image::BgraImage;
 use vitro_core::layout::{compute_layout, metrics, BarLayout, LayoutInput, Rect};
 use vitro_core::settings::{self, Position, Settings, ThemeChoice};
 use vitro_core::style::{hover_style, material_style, HoverStyle, MaterialStyle, Rgba, Theme};
+use vitro_core::tray_model::{split_promoted, TrayIcon};
 use vitro_core::windows_model::{
     build_groups, click_action, AppGroup, ClickAction, GroupKey, Hwnd,
 };
-use vitro_render::bar_visual::{hover_timing, BarVisual, ItemState, VisualEnv};
+use vitro_render::bar_visual::{
+    hover_timing, BarVisual, ChevronState, ItemState, TrayItemState, VisualEnv, TRAY_ICON_DIP,
+};
 use vitro_render::compositor::{init_compositor, Comp};
 use vitro_render::device::{create_gpu_device, GpuDevice};
-use vitro_render::flyout::{live_thumbnails, Flyout, ThumbnailStrip};
+use vitro_render::flyout::{live_thumbnails, take_deactivated, Flyout, ThumbnailStrip};
 use vitro_render::surfaces::{FontKind, Painter};
+use vitro_render::tray_flyout::{grid_layout, Tooltip, TrayGrid};
 use vitro_win::appbar::{is_fullscreen_on, reserved_rect, AppBar};
 use vitro_win::desktops::Desktops;
 use vitro_win::launch::{activate_window, minimize_window, open_stock_start};
 use vitro_win::monitors::{list_monitors, MonitorInfo};
 use vitro_win::system_theme::{read_system_theme, SystemTheme};
 use vitro_win::time_format::clock_now;
+use vitro_win::tray_host::{tray_identity_key, TrayClick, TrayEntry, TrayHost};
 use vitro_win::window_tracker::{WindowEvent, WindowTracker};
 use windows::core::{Error, Result, BOOL};
-use windows::Win32::Foundation::{E_FAIL, HWND, LPARAM, WAIT_FAILED, WAIT_OBJECT_0, WPARAM};
+use windows::Win32::Foundation::{E_FAIL, HWND, LPARAM, POINT, WAIT_FAILED, WAIT_OBJECT_0, WPARAM};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::Console::{
     SetConsoleCtrlHandler, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
 };
 use windows::Win32::System::Threading::{GetCurrentThreadId, INFINITE};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetDoubleClickTime, VK_ESCAPE};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetForegroundWindow, KillTimer, MsgWaitForMultipleObjectsEx, PeekMessageW,
-    PostThreadMessageW, SetTimer, TranslateMessage, MSG, MWMO_INPUTAVAILABLE, PM_REMOVE,
-    QS_ALLINPUT, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_QUIT,
+    DispatchMessageW, GetCursorPos, GetForegroundWindow, KillTimer, MsgWaitForMultipleObjectsEx,
+    PeekMessageW, PostThreadMessageW, SetTimer, TranslateMessage, MSG, MWMO_INPUTAVAILABLE,
+    PM_REMOVE, QS_ALLINPUT, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_QUIT,
+    WM_RBUTTONDOWN, WM_RBUTTONUP,
 };
 
 use crate::bar_window::{
     create_bar_window, hit_test, mouse_pos, track_leave, BarWindow, Hit, MarginMode, PxRect,
 };
-use crate::icon_loader::{IconLoader, IconSrc, Lookup, MAX_ICON_PX};
+use crate::icon_loader::{IconLoader, IconSrc, Lookup, TrayImage, MAX_ICON_PX};
 use crate::launcher::{Job, Launcher};
 use crate::notify::{
     take_inbox, Inbox, NotifyWindow, TIMER_CLOCK, TIMER_GPU_RETRY, TIMER_HOVER_HIDE,
-    TIMER_HOVER_SHOW, TIMER_MARGIN_COLLAPSE, TIMER_REASSERT,
+    TIMER_HOVER_SHOW, TIMER_MARGIN_COLLAPSE, TIMER_REASSERT, TIMER_TRAY_TIP,
 };
 use crate::shell::{self, StockGuard};
 use crate::window_set::WindowSet;
@@ -82,6 +95,22 @@ const SPRING_PEAK: f32 = 1.12;
 /// After `TaskbarCreated`, hide the stock taskbar once more this long later (Explorer can
 /// show it after its broadcast).
 const REASSERT_MS: u32 = 1000;
+/// Resting on a tray icon shows its tooltip after this long.
+const TRAY_TIP_MS: u32 = 500;
+
+/// A tray icon's identity in the model: (owner window, uid, guid).
+type TrayId = (u32, u32, Option<[u8; 16]>);
+
+fn tray_id(i: &TrayIcon) -> TrayId {
+    (i.id.hwnd, i.id.uid, i.id.guid)
+}
+
+fn cursor_px() -> (i32, i32) {
+    let mut p = POINT::default();
+    // SAFETY: out-pointer to a local.
+    let _ = unsafe { GetCursorPos(&mut p) };
+    (p.x, p.y)
+}
 
 static UI_THREAD: AtomicU32 = AtomicU32::new(0);
 
@@ -171,6 +200,27 @@ struct Strip {
     anchor: PxRect,
 }
 
+/// The open tray overflow.
+struct Overflow {
+    // Field order = drop order: the grid's visuals go before their window.
+    grid: TrayGrid,
+    flyout: Flyout,
+    /// The icon in each slot.
+    ids: Vec<TrayId>,
+    /// The cursor is over the flyout (tracked for WM_MOUSELEAVE).
+    over: bool,
+    /// Slot under a button press, and whether it is the right button.
+    pressed: Option<(usize, bool)>,
+}
+
+/// A tray icon under the cursor (bar or overflow): the tooltip's subject.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct TipTarget {
+    id: TrayId,
+    /// Screen px the tooltip sits next to.
+    anchor: PxRect,
+}
+
 /// One bar surface on screen.
 struct Bar {
     // Field order = drop order: the visual tree goes before its window.
@@ -193,11 +243,16 @@ struct Dirty {
 }
 
 struct App {
-    // Field order = drop order: the appbar (unregistered before its window goes), the strip,
-    // the bars, then the tracker (before its notify window), then the notify window (drains
-    // queued events), then the GPU objects, the compositor, and last the stock taskbar guard
-    // (the shell is restored after the appbar is gone).
+    // Field order = drop order: the tray host first (its Shell_TrayWnd goes and every app is
+    // asked to register its icons with Explorer again; later shell calls go straight to
+    // Explorer), the appbar (unregistered before its window goes), the flyouts, the bars,
+    // then the tracker (before its notify window), then the notify window (drains queued
+    // events), then the GPU objects, the compositor, and last the stock taskbar guard (the
+    // shell is restored after the appbar is gone).
+    tray: Option<TrayHost>,
     appbar: Option<AppBar>,
+    tooltip: Option<Tooltip>,
+    overflow: Option<Overflow>,
     strip: Option<Strip>,
     bars: Vec<Bar>,
     tracker: WindowTracker,
@@ -244,6 +299,19 @@ struct App {
     fullscreen: bool,
     /// The minute timer could not be armed; retried on the next flush.
     clock_unarmed: bool,
+    /// The tray icons as last read from the host (dead owners swept).
+    tray_entries: Vec<TrayEntry>,
+    /// Identity keys (`tray_identity_key`), cached per icon.
+    tray_keys: HashMap<TrayId, String>,
+    /// Indices into `tray_entries`: promoted (in the bar) and the overflow.
+    tray_bar: Vec<usize>,
+    tray_over: Vec<usize>,
+    /// The tray icon under the cursor; TIMER_TRAY_TIP is armed for it while no tooltip shows.
+    tip_target: Option<TipTarget>,
+    /// Bar item under a right-button press.
+    rpressed: Option<Hit>,
+    /// Last left click on a tray icon, to tell a double click.
+    last_left: Option<(TrayId, Instant)>,
     last_dump: String,
 }
 
@@ -268,8 +336,15 @@ impl App {
         let icons =
             IconLoader::start(notify.hwnd).map_err(|e| Error::new(E_FAIL, e.to_string()))?;
         let launcher = Launcher::start(None).map_err(|e| Error::new(E_FAIL, e.to_string()))?;
+        // The bar works without it (no tray icons).
+        let tray = TrayHost::start(notify.hwnd)
+            .inspect_err(|e| eprintln!("vitrobar: the tray host could not start: {e}"))
+            .ok();
         let mut app = Self {
+            tray,
             appbar: None,
+            tooltip: None,
+            overflow: None,
             strip: None,
             bars: Vec::new(),
             tracker,
@@ -320,6 +395,13 @@ impl App {
             gpu_lost: false,
             fullscreen: false,
             clock_unarmed: false,
+            tray_entries: Vec::new(),
+            tray_keys: HashMap::new(),
+            tray_bar: Vec::new(),
+            tray_over: Vec::new(),
+            tip_target: None,
+            rpressed: None,
+            last_left: None,
             last_dump: String::new(),
         };
         app.tick_clock();
@@ -330,6 +412,10 @@ impl App {
         app.regroup();
         app.set_fullscreen(is_fullscreen_on(app.monitor.id));
         app.refresh()?;
+        // Every app registers its tray icons again, now with us (and, forwarded, Explorer).
+        if let Some(t) = &app.tray {
+            t.announce();
+        }
         Ok(app)
     }
 
@@ -350,7 +436,7 @@ impl App {
             position: self.settings.position,
             icon_size: self.settings.icon_size,
             app_count: self.groups.len(),
-            tray_count: 0,
+            tray_count: self.tray_bar.len(),
             clock_w: self.clock_w,
             reserve_floating: self.settings.reserve_space_floating,
         })
@@ -470,6 +556,88 @@ impl App {
         items
     }
 
+    /// Tray icons are drawn at this many px.
+    fn tray_px(&self) -> u32 {
+        ((TRAY_ICON_DIP * self.scale).round() as u32).clamp(1, MAX_ICON_PX)
+    }
+
+    /// Re-reads the tray from the host, first dropping icons whose owner died (so this runs
+    /// whenever the tray is redrawn or the overflow opens), and splits it into the bar and
+    /// the overflow.
+    fn reload_tray(&mut self) {
+        let Some(host) = &self.tray else { return };
+        host.sweep();
+        let entries = host.entries();
+        let mut keys = Vec::with_capacity(entries.len());
+        for e in &entries {
+            let key = self
+                .tray_keys
+                .entry(tray_id(&e.icon))
+                .or_insert_with(|| tray_identity_key(&e.icon));
+            keys.push(key.clone());
+        }
+        self.tray_keys
+            .retain(|id, _| entries.iter().any(|e| tray_id(&e.icon) == *id));
+        let icons: Vec<TrayIcon> = entries.iter().map(|e| e.icon.clone()).collect();
+        let (bar, over) = split_promoted(&icons, &keys, &self.settings.tray_promoted);
+        // Images of icons that changed or went away are not needed any more.
+        let live: Vec<u32> = entries
+            .iter()
+            .filter_map(|e| e.image.as_ref().map(|i| i.handle()))
+            .collect();
+        self.icons
+            .forget(|src| matches!(src, IconSrc::Tray(t) if !live.contains(&t.0.handle())));
+        self.tray_entries = entries;
+        self.tray_bar = bar;
+        self.tray_over = over;
+        if matches!(self.hover, Some(Hit::Tray(i)) if i >= self.tray_bar.len()) {
+            self.hover = None;
+        }
+        if matches!(self.pressed, Some(Hit::Tray(_))) {
+            self.pressed = None;
+        }
+        if self.tray_over.is_empty() && matches!(self.hover, Some(Hit::Chevron)) {
+            self.hover = None;
+        }
+    }
+
+    /// The loaded image of tray entry `idx` (requests it if needed).
+    fn tray_image(&mut self, idx: usize) -> Option<Arc<BgraImage>> {
+        let px = self.tray_px();
+        let img = self.tray_entries.get(idx)?.image.clone()?;
+        match self.icons.get(&IconSrc::Tray(TrayImage(img)), px) {
+            Lookup::Ready(i) => Some(Arc::clone(i)),
+            _ => None,
+        }
+    }
+
+    fn tray_items(&mut self) -> Vec<TrayItemState> {
+        let bar = self.tray_bar.clone();
+        let items = bar
+            .iter()
+            .enumerate()
+            .map(|(i, &idx)| TrayItemState {
+                icon: self.tray_image(idx),
+                hovered: self.hover == Some(Hit::Tray(i)),
+                pressed: self.pressed == Some(Hit::Tray(i)) || self.rpressed == Some(Hit::Tray(i)),
+            })
+            .collect();
+        // Overflow icons load ahead, so the overflow opens with its images.
+        for idx in self.tray_over.clone() {
+            let _ = self.tray_image(idx);
+        }
+        items
+    }
+
+    fn chevron_state(&self) -> ChevronState {
+        ChevronState {
+            shown: !self.tray_over.is_empty(),
+            hovered: self.hover == Some(Hit::Chevron),
+            pressed: self.pressed == Some(Hit::Chevron),
+            open: self.overflow.is_some(),
+        }
+    }
+
     /// Lays out and redraws (only what changed). Windows are created/moved as needed.
     fn refresh(&mut self) -> Result<()> {
         self.refresh_once(true)
@@ -481,7 +649,9 @@ impl App {
             // Recovery is driven by the removal event and the one-shot retry timer only.
             return Ok(());
         }
+        self.reload_tray();
         let layout = self.compute_layout();
+        let moved = layout.surfaces != self.layout.surfaces;
         while self.bars.len() > layout.surfaces.len() {
             self.bars.pop();
         }
@@ -500,13 +670,17 @@ impl App {
             });
         }
         let items = self.items(layout.apps.len());
+        let tray_items = self.tray_items();
+        let chevron = self.chevron_state();
         let env = self.env();
         let margin = self.hover_margin();
         let mut draw_failed = None;
+        let mut raised = moved;
         for (i, bar) in self.bars.iter_mut().enumerate() {
             bar.window
                 .set_rect(to_px(layout.surfaces[i], self.scale), margin)?;
             bar.visual.set_env(env);
+            bar.visual.set_tray(tray_items.clone(), chevron);
             if let Err(e) = bar.visual.update(
                 &layout,
                 &items,
@@ -520,10 +694,20 @@ impl App {
             if !bar.shown && !self.fullscreen {
                 bar.window.show();
                 bar.shown = true;
+                raised = true;
             }
         }
         self.layout = layout;
+        if raised {
+            // The bar windows just went (back) to the top of the topmost band: keep our
+            // Shell_TrayWnd above Explorer's there.
+            if let Some(t) = &self.tray {
+                t.reassert_topmost();
+            }
+        }
         self.sync_appbar();
+        self.sync_overflow();
+        self.sync_tooltip();
         if let Some(e) = draw_failed {
             // Carry 2: a failed draw is usually a lost device; recover (or retry later).
             if self.gpu.is_lost() {
@@ -592,6 +776,8 @@ impl App {
         self.fullscreen = on;
         if on {
             self.close_strip();
+            self.close_overflow();
+            self.set_tip_target(None);
             self.cancel_show();
             self.hover = None;
             self.pressed = None;
@@ -707,8 +893,71 @@ impl App {
             )),
             None => "null".to_string(),
         };
+        let tray: Vec<String> = self
+            .tray_entries
+            .iter()
+            .enumerate()
+            .map(|(k, e)| {
+                let bar = self.tray_bar.iter().position(|&b| b == k);
+                format!(
+                    "{{\"key\":{},\"tip\":{},\"hwnd\":{},\"uid\":{},\"version\":{},\"hidden\":{},\"image\":{},\"rect\":{}}}",
+                    json_str(self.tray_keys.get(&tray_id(&e.icon)).map_or("", |k| k)),
+                    json_str(&e.icon.tip),
+                    e.icon.id.hwnd,
+                    e.icon.id.uid,
+                    e.icon.version,
+                    e.icon.hidden,
+                    e.image.is_some(),
+                    bar.and_then(|b| l.tray.get(b))
+                        .map_or("null".to_string(), |r| json_rect(to_px(*r, s))),
+                )
+            })
+            .collect();
+        let overflow = match &self.overflow {
+            None => "null".to_string(),
+            Some(o) => {
+                let (fl, ft, _, _) = o.flyout.rect_px();
+                let slots: Vec<String> = o
+                    .ids
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, id)| {
+                        let r = o.grid.slot_px(i)?;
+                        let tip = self.tray_entry(*id).map_or("", |e| e.icon.tip.as_str());
+                        Some(format!(
+                            "{{\"tip\":{},\"rect\":{}}}",
+                            json_str(tip),
+                            json_rect((fl + r.0, ft + r.1, fl + r.2, ft + r.3))
+                        ))
+                    })
+                    .collect();
+                format!(
+                    "{{\"hwnd\":{},\"rect\":{},\"slots\":[{}]}}",
+                    o.flyout.hwnd().0 as usize,
+                    json_rect(o.flyout.rect_px()),
+                    slots.join(",")
+                )
+            }
+        };
+        let tooltip = match &self.tooltip {
+            None => "null".to_string(),
+            Some(t) => format!(
+                "{{\"text\":{},\"rect\":{}}}",
+                json_str(t.tip()),
+                json_rect(t.rect_px())
+            ),
+        };
+        let tray_host = self
+            .tray
+            .as_ref()
+            .map_or("null".to_string(), |t| (t.hwnd().0 as usize).to_string());
         let dump = format!(
-            "{{\"fullscreen\":{},\"stock_taken\":{},\"appbar\":{},\"hover\":{},\"strip\":{},\"live_thumbnails\":{},\"bars\":[{}],\"groups\":{},\"shown\":{},\"start\":{},\"quick\":{},\"clock\":{},\"clock_text\":{},\"more\":{},\"apps\":[{}]}}",
+            "{{\"tray_host\":{},\"chevron\":{},\"tray\":[{}],\"overflow\":{},\"tooltip\":{},\"fullscreen\":{},\"stock_taken\":{},\"appbar\":{},\"hover\":{},\"strip\":{},\"live_thumbnails\":{},\"bars\":[{}],\"groups\":{},\"shown\":{},\"start\":{},\"quick\":{},\"clock\":{},\"clock_text\":{},\"more\":{},\"apps\":[{}]}}",
+            tray_host,
+            json_rect(to_px(l.overflow_chevron, s)),
+            tray.join(","),
+            overflow,
+            tooltip,
             self.fullscreen,
             self.stock.active(),
             appbar,
@@ -798,6 +1047,13 @@ impl App {
             TIMER_REASSERT => {
                 self.kill_timer(TIMER_REASSERT);
                 self.stock.reassert();
+                if let Some(t) = &self.tray {
+                    t.reassert_topmost();
+                }
+            }
+            TIMER_TRAY_TIP => {
+                self.kill_timer(TIMER_TRAY_TIP);
+                self.show_tooltip();
             }
             TIMER_MARGIN_COLLAPSE => {
                 self.kill_timer(TIMER_MARGIN_COLLAPSE);
@@ -821,7 +1077,7 @@ impl App {
         self.bars.iter().position(|b| b.window.hwnd == hwnd)
     }
 
-    /// Mouse input on a bar window or the flyout; returns true if the message was handled.
+    /// Mouse input on a bar window or a flyout; returns true if the message was handled.
     fn on_mouse(&mut self, msg: &MSG, dirty: &mut Dirty) -> bool {
         if self
             .strip
@@ -830,12 +1086,23 @@ impl App {
         {
             return self.on_flyout_mouse(msg);
         }
+        if self
+            .overflow
+            .as_ref()
+            .is_some_and(|o| o.flyout.hwnd() == msg.hwnd)
+        {
+            return self.on_overflow_mouse(msg);
+        }
         let Some(i) = self.bar_index(msg.hwnd) else {
             return false;
         };
         let (cx, cy) = mouse_pos(msg.lParam);
         let (x, y) = self.bars[i].window.client_to_dip(cx, cy, self.scale);
-        let hit = hit_test(&self.layout, x, y);
+        let mut hit = hit_test(&self.layout, x, y);
+        if hit == Some(Hit::Chevron) && self.tray_over.is_empty() {
+            // No overflow, no chevron.
+            hit = None;
+        }
         match msg.message {
             WM_MOUSEMOVE => {
                 if self.tracking != Some(msg.hwnd) {
@@ -846,6 +1113,11 @@ impl App {
                     self.hover = hit;
                     self.show_suppressed = false;
                     dirty.visuals = true;
+                    let target = match hit {
+                        Some(Hit::Tray(k)) => self.bar_tray_target(k),
+                        _ => None,
+                    };
+                    self.set_tip_target(target);
                 }
             }
             WM_MOUSELEAVE => {
@@ -853,10 +1125,14 @@ impl App {
                 // before the leave of the previous one: only the tracked window's leave counts.
                 if self.tracking == Some(msg.hwnd) {
                     self.tracking = None;
-                    if self.hover.is_some() || self.pressed.is_some() {
+                    if self.hover.is_some() || self.pressed.is_some() || self.rpressed.is_some() {
                         self.hover = None;
                         self.pressed = None;
+                        self.rpressed = None;
                         dirty.visuals = true;
+                    }
+                    if self.overflow.as_ref().is_none_or(|o| !o.over) {
+                        self.set_tip_target(None);
                     }
                 }
             }
@@ -865,6 +1141,12 @@ impl App {
                 // A click decides what happens; the hover timer does not open the strip later.
                 self.show_suppressed = true;
                 self.cancel_show();
+                self.hide_tooltip();
+                // The bar never takes the foreground, so a press on it does not deactivate
+                // the overflow: close it here (the chevron toggles it on release).
+                if hit != Some(Hit::Chevron) {
+                    self.close_overflow();
+                }
                 dirty.visuals = true;
             }
             WM_LBUTTONUP => {
@@ -876,10 +1158,370 @@ impl App {
                     }
                 }
             }
+            WM_RBUTTONDOWN => {
+                self.rpressed = hit;
+                self.hide_tooltip();
+                dirty.visuals = true;
+            }
+            WM_RBUTTONUP => {
+                let pressed = self.rpressed.take();
+                dirty.visuals = true;
+                match hit {
+                    Some(Hit::Tray(k)) if pressed == hit => {
+                        self.close_overflow();
+                        self.tray_click(self.tray_bar.get(k).copied(), TrayClick::Right);
+                    }
+                    // Nothing else has a context menu yet.
+                    _ => {}
+                }
+            }
             _ => return false,
         }
         self.sync_expanded();
         self.update_strip();
+        true
+    }
+
+    /// Screen px of promoted tray slot `k`, spanning the bar's height (a tooltip anchor).
+    fn bar_tray_target(&self, k: usize) -> Option<TipTarget> {
+        let idx = *self.tray_bar.get(k)?;
+        let r = self.layout.tray.get(k)?;
+        let s = self
+            .layout
+            .surfaces
+            .iter()
+            .find(|s| r.x + r.w / 2.0 >= s.x && r.x + r.w / 2.0 < s.right())?;
+        Some(TipTarget {
+            id: tray_id(&self.tray_entries.get(idx)?.icon),
+            anchor: to_px(
+                Rect {
+                    x: r.x,
+                    y: s.y,
+                    w: r.w,
+                    h: s.h,
+                },
+                self.scale,
+            ),
+        })
+    }
+
+    fn tray_entry(&self, id: TrayId) -> Option<&TrayEntry> {
+        self.tray_entries.iter().find(|e| tray_id(&e.icon) == id)
+    }
+
+    /// The cursor moved onto another tray icon (or off the tray): the tooltip follows after
+    /// the delay, and the icon's owner hears the hover (as with the stock taskbar).
+    fn set_tip_target(&mut self, target: Option<TipTarget>) {
+        if target.map(|t| t.id) == self.tip_target.map(|t| t.id) {
+            self.tip_target = target;
+            return;
+        }
+        self.hide_tooltip();
+        self.tip_target = target;
+        let Some(t) = target else { return };
+        if let Some(e) = self.tray_entry(t.id) {
+            TrayHost::forward_click(&e.icon, TrayClick::Hover, cursor_px());
+        }
+        // SAFETY: one-shot timer on our own window (killed when it fires); re-setting the id
+        // restarts it.
+        unsafe {
+            SetTimer(Some(self.notify.hwnd), TIMER_TRAY_TIP, TRAY_TIP_MS, None);
+        }
+    }
+
+    fn hide_tooltip(&mut self) {
+        self.kill_timer(TIMER_TRAY_TIP);
+        if self.tooltip.take().is_some() && self.opts.debug_state {
+            self.dump_state();
+        }
+    }
+
+    fn show_tooltip(&mut self) {
+        let Some(t) = self.tip_target else { return };
+        let Some(tip) = self.tray_entry(t.id).map(|e| e.icon.tip.clone()) else {
+            return;
+        };
+        self.tooltip = None;
+        if tip.trim().is_empty() {
+            return;
+        }
+        match Tooltip::show(
+            &self.comp,
+            &self.painter,
+            t.anchor,
+            self.settings.position,
+            self.monitor.dpi,
+            &self.style,
+            &tip,
+        ) {
+            Ok(tt) => self.tooltip = Some(tt),
+            Err(e) => eprintln!("vitrobar: tray tooltip failed: {e}"),
+        }
+        if self.opts.debug_state {
+            self.dump_state();
+        }
+    }
+
+    /// The shown tooltip follows its icon's tip text, and goes with the icon.
+    fn sync_tooltip(&mut self) {
+        let Some(t) = self.tip_target else { return };
+        match self.tray_entry(t.id).map(|e| e.icon.tip.clone()) {
+            None => self.set_tip_target(None),
+            Some(tip) => {
+                if self.tooltip.as_ref().is_some_and(|tt| tt.tip() != tip) {
+                    self.show_tooltip();
+                }
+            }
+        }
+    }
+
+    /// Hands a click on tray entry `idx` to its owner.
+    fn tray_click(&mut self, idx: Option<usize>, kind: TrayClick) {
+        let Some(e) = idx.and_then(|i| self.tray_entries.get(i)) else {
+            return;
+        };
+        let icon = e.icon.clone();
+        let kind = if kind == TrayClick::Left {
+            // The second click of a double click (our windows get no WM_LBUTTONDBLCLK).
+            let id = tray_id(&icon);
+            // SAFETY: plain query.
+            let dbl = Duration::from_millis(u64::from(unsafe { GetDoubleClickTime() }));
+            match self.last_left {
+                Some((prev, at)) if prev == id && at.elapsed() <= dbl => {
+                    self.last_left = None;
+                    TrayClick::Double
+                }
+                _ => {
+                    self.last_left = Some((id, Instant::now()));
+                    TrayClick::Left
+                }
+            }
+        } else {
+            kind
+        };
+        self.hide_tooltip();
+        if self.opts.debug_state {
+            eprintln!(
+                "vitrobar-tray-click {} {} {kind:?}",
+                icon.id.hwnd, icon.id.uid
+            );
+        }
+        TrayHost::forward_click(&icon, kind, cursor_px());
+    }
+
+    /// Screen px of the chevron's slot, spanning the bar's height.
+    fn chevron_anchor(&self) -> Option<PxRect> {
+        let r = self.layout.overflow_chevron;
+        let s = self
+            .layout
+            .surfaces
+            .iter()
+            .find(|s| r.x + r.w / 2.0 >= s.x && r.x + r.w / 2.0 < s.right())?;
+        Some(to_px(
+            Rect {
+                x: r.x,
+                y: s.y,
+                w: r.w,
+                h: s.h,
+            },
+            self.scale,
+        ))
+    }
+
+    fn overflow_images(&mut self) -> (Vec<TrayId>, Vec<Option<Arc<BgraImage>>>) {
+        let over = self.tray_over.clone();
+        let ids = over
+            .iter()
+            .map(|&i| tray_id(&self.tray_entries[i].icon))
+            .collect();
+        let images = over.iter().map(|&i| self.tray_image(i)).collect();
+        (ids, images)
+    }
+
+    /// Opens the overflow above the chevron and makes it the foreground window, so a click
+    /// anywhere else, Esc or switching apps closes it.
+    fn open_overflow(&mut self) {
+        self.close_strip();
+        self.cancel_show();
+        self.set_tip_target(None);
+        // An app that died since the last redraw must not show up.
+        self.reload_tray();
+        if self.tray_over.is_empty() {
+            return;
+        }
+        let Some(anchor) = self.chevron_anchor() else {
+            return;
+        };
+        let slot = metrics(self.settings.icon_size).slot;
+        let (ids, images) = self.overflow_images();
+        let (size, _) = grid_layout(ids.len(), slot);
+        let opened = Flyout::show(
+            &self.comp,
+            anchor,
+            self.settings.position,
+            size,
+            self.monitor.dpi,
+            &self.style,
+        )
+        .and_then(|flyout| {
+            let mut grid = TrayGrid::new(&flyout)?;
+            grid.set(&self.painter, slot, &images, self.style.text)?;
+            Ok(Overflow {
+                grid,
+                flyout,
+                ids,
+                over: false,
+                pressed: None,
+            })
+        });
+        match opened {
+            Ok(o) => {
+                if !o.flyout.activate() {
+                    eprintln!("vitrobar: the tray overflow could not take the foreground");
+                }
+                self.overflow = Some(o);
+            }
+            Err(e) => eprintln!("vitrobar: tray overflow failed: {e}"),
+        }
+        if self.opts.debug_state {
+            self.dump_state();
+        }
+    }
+
+    /// True if it was open.
+    fn close_overflow(&mut self) -> bool {
+        let Some(o) = self.overflow.take() else {
+            return false;
+        };
+        if o.over {
+            self.set_tip_target(None);
+        }
+        drop(o);
+        if self.opts.debug_state {
+            self.dump_state();
+        }
+        true
+    }
+
+    /// After the tray changed: the open overflow follows (or closes when nothing is left).
+    fn sync_overflow(&mut self) {
+        if self.overflow.is_none() {
+            return;
+        }
+        if self.tray_over.is_empty() {
+            self.close_overflow();
+            return;
+        }
+        let slot = metrics(self.settings.icon_size).slot;
+        let (ids, images) = self.overflow_images();
+        let anchor = self.chevron_anchor();
+        let Some(o) = self.overflow.as_mut() else {
+            return;
+        };
+        let mut result = Ok(());
+        if o.ids.len() != ids.len() {
+            if let Some(anchor) = anchor {
+                let (size, _) = grid_layout(ids.len(), slot);
+                result = o.flyout.reshape(
+                    &self.comp,
+                    anchor,
+                    self.settings.position,
+                    size,
+                    &self.style,
+                );
+            }
+            o.pressed = None;
+        }
+        o.ids = ids;
+        let result =
+            result.and_then(|()| o.grid.set(&self.painter, slot, &images, self.style.text));
+        if let Err(e) = result {
+            eprintln!("vitrobar: tray overflow update failed: {e}");
+            self.close_overflow();
+        }
+    }
+
+    /// Mouse input on the overflow: hover highlight and tooltip, clicks to the icon owners.
+    fn on_overflow_mouse(&mut self, msg: &MSG) -> bool {
+        let pt = mouse_pos(msg.lParam);
+        let text = self.style.text;
+        let Some(o) = self.overflow.as_mut() else {
+            return false;
+        };
+        let slot = o.grid.hit(pt);
+        let mut target = None;
+        let mut click = None;
+        match msg.message {
+            WM_MOUSEMOVE => {
+                if !o.over {
+                    track_leave(msg.hwnd);
+                    o.over = true;
+                }
+                let pressed = o.pressed.is_some_and(|(p, _)| Some(p) == slot);
+                let _ = o.grid.set_hover(slot, pressed, text);
+                target = slot.and_then(|k| {
+                    let (fl, ft, _, _) = o.flyout.rect_px();
+                    let r = o.grid.slot_px(k)?;
+                    Some(TipTarget {
+                        id: *o.ids.get(k)?,
+                        anchor: (fl + r.0, ft + r.1, fl + r.2, ft + r.3),
+                    })
+                });
+            }
+            WM_MOUSELEAVE => {
+                o.over = false;
+                o.pressed = None;
+                let _ = o.grid.set_hover(None, false, text);
+            }
+            WM_LBUTTONDOWN | WM_RBUTTONDOWN => {
+                o.pressed = slot.map(|k| (k, msg.message == WM_RBUTTONDOWN));
+                let _ = o.grid.set_hover(slot, true, text);
+            }
+            WM_LBUTTONUP | WM_RBUTTONUP => {
+                let right = msg.message == WM_RBUTTONUP;
+                if let (Some(k), Some((p, pr))) = (slot, o.pressed.take()) {
+                    if p == k && pr == right {
+                        click = o.ids.get(k).copied().map(|id| (id, right));
+                    }
+                }
+                let _ = o.grid.set_hover(slot, false, text);
+            }
+            _ => return false,
+        }
+        match msg.message {
+            WM_MOUSEMOVE => self.set_tip_target(target),
+            WM_MOUSELEAVE => self.set_tip_target(None),
+            WM_LBUTTONDOWN | WM_RBUTTONDOWN => self.hide_tooltip(),
+            _ => {}
+        }
+        if let Some((id, right)) = click {
+            let idx = self
+                .tray_entries
+                .iter()
+                .position(|e| tray_id(&e.icon) == id);
+            let kind = if right {
+                TrayClick::Right
+            } else {
+                TrayClick::Left
+            };
+            self.tray_click(idx, kind);
+        }
+        true
+    }
+
+    /// Keys reach us only while the overflow is the foreground window: Esc closes it.
+    fn on_key(&mut self, msg: &MSG, dirty: &mut Dirty) -> bool {
+        let ours = self
+            .overflow
+            .as_ref()
+            .is_some_and(|o| o.flyout.hwnd() == msg.hwnd);
+        if !ours {
+            return false;
+        }
+        if msg.wParam.0 == usize::from(VK_ESCAPE.0) {
+            self.close_overflow();
+            dirty.visuals = true;
+        }
         true
     }
 
@@ -1173,7 +1815,19 @@ impl App {
         if !matches!(hit, Hit::App(_)) {
             self.close_strip();
         }
+        if hit != Hit::Chevron {
+            self.close_overflow();
+        }
         match hit {
+            Hit::Chevron => {
+                if !self.close_overflow() {
+                    self.open_overflow();
+                }
+            }
+            Hit::Tray(k) => {
+                let idx = self.tray_bar.get(k).copied();
+                self.tray_click(idx, TrayClick::Left);
+            }
             Hit::Start => open_stock_start(),
             Hit::Quick => self.launcher.launch(Job::QuickSettings),
             Hit::Clock => self.launcher.launch(Job::Notifications),
@@ -1229,6 +1883,24 @@ impl App {
         dirty.clock |= inbox.clock;
         dirty.icons |= inbox.icons;
         dirty.fullscreen |= inbox.fullscreen;
+        // The model is shared with the host; the messages only say it changed.
+        dirty.visuals |= !inbox.tray.is_empty();
+        let deactivated = take_deactivated();
+        if self
+            .overflow
+            .as_ref()
+            .is_some_and(|o| deactivated.contains(&o.flyout.hwnd()))
+        {
+            self.close_overflow();
+            dirty.visuals = true;
+        }
+        if inbox.taskbar_created || inbox.shell || inbox.display || inbox.fullscreen {
+            // Explorer may have raised its own Shell_TrayWnd (restart, settings, display or
+            // full-screen changes): go back above it.
+            if let Some(t) = &self.tray {
+                t.reassert_topmost();
+            }
+        }
         if inbox.taskbar_created {
             self.on_taskbar_created();
         } else if inbox.shell || inbox.display {
@@ -1332,8 +2004,10 @@ pub fn run(opts: Options) -> Result<()> {
             // it in the inbox (the same path a nested modal loop would take).
             match msg.message {
                 WM_QUIT => break 'event,
-                WM_MOUSEMOVE | WM_MOUSELEAVE | WM_LBUTTONDOWN | WM_LBUTTONUP
+                WM_MOUSEMOVE | WM_MOUSELEAVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN
+                | WM_RBUTTONUP
                     if app.on_mouse(&msg, &mut dirty) => {}
+                WM_KEYDOWN if app.on_key(&msg, &mut dirty) => {}
                 _ => unsafe {
                     let _ = TranslateMessage(&msg);
                     DispatchMessageW(&msg);

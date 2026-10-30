@@ -29,11 +29,15 @@ pub fn set_appbar_hwnd(hwnd: Option<HWND>) {
     APPBAR_HWND.store(hwnd.map_or(0, |h| h.0 as isize), Ordering::SeqCst);
 }
 
-/// Unregisters the appbar, then gives the stock taskbar back. Safe to call from any thread
-/// and any number of times.
+/// Destroys Vitrobar's `Shell_TrayWnd` (and asks every app to register its tray icons with
+/// Explorer again), unregisters the appbar, then gives the stock taskbar back. Safe to call
+/// from any thread and any number of times.
 pub fn restore_now() {
     let _lock = RESTORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     RESTORED.store(true, Ordering::SeqCst);
+    // First: while our tray window lives, the appbar and auto-hide calls below pass through
+    // it (it forwards them); afterwards they go straight to Explorer.
+    vitro_win::tray_host::shutdown_global();
     let h = APPBAR_HWND.swap(0, Ordering::SeqCst);
     if h != 0 {
         unregister(HWND(h as *mut _));

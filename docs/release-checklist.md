@@ -104,3 +104,36 @@ Automated where safe (run on a dev machine; they change the real shell state and
   `WM_CLOSE` on its `VitrobarNotify` window and check `ABM_GETSTATE`, the taskbar's visibility,
   `restore.json` and the RunOnce value. Step 3 needs a window that can take the foreground,
   which a script usually cannot: check it by hand.
+
+## Tray
+
+Introduced by stage 1, Task 12. Vitrobar runs its own (invisible, 0 x 0) `Shell_TrayWnd`, so
+every app's `Shell_NotifyIcon` calls reach it first; each call (and every appbar call) is also
+forwarded to Explorer's real taskbar, so Explorer's own tray never loses track. Icons whose
+identity key is listed in `tray-promoted` (`settings.toml`) sit in the bar; all others are in
+the overflow behind the chevron. Use a few real tray apps (Discord, Steam, OneDrive, ...).
+
+1. Start Vitrobar: within 2 s the existing tray icons appear in the overflow (click the
+   chevron). Hidden icons (apps that hid theirs) are not shown.
+2. In the overflow and (promoted) in the bar: left click, right click (the app's menu opens in
+   front, near the cursor) and double click behave as on the stock taskbar. Resting on an icon
+   for half a second shows its tooltip; it goes when the cursor leaves.
+3. The overflow closes on: the chevron again, Esc, a click anywhere else (another window, the
+   desktop, the bar), switching apps.
+4. `Stop-Process -Name explorer -Force` (see the Stock taskbar step 2 caution): within 2 s of
+   Explorer coming back, the icons are back in Vitrobar.
+5. End a tray app with `taskkill /F /IM <app>.exe`: its icon goes the next time the tray
+   redraws (hover the bar) or the overflow opens.
+6. Exit Vitrobar (and, separately, End task + `vitrobar.exe --restore`): the stock taskbar's
+   tray shows every icon again, and no window of class `Shell_TrayWnd` belongs to a Vitrobar
+   process.
+
+Automated where safe:
+
+- `cargo test -p vitro-win --test tray -- --ignored --test-threads=1`: a test window's
+  `Shell_NotifyIconW` Add / SetVersion / Delete reach the host within 1 s, clicks arrive with
+  the version-4 packing, a dead owner is swept, `FindWindow` finds ours while it runs and
+  Explorer's afterwards, and appbar calls still get Explorer's answer.
+- Steps 1, 2, 3 and 5 with a tray app of your own (a PowerShell `NotifyIcon` that logs its
+  clicks) driven against `vitrobar.exe --debug-state` (the `tray`, `overflow` and `tooltip`
+  fields). Only ever click the test app's own icon: clicks are forwarded to real apps.

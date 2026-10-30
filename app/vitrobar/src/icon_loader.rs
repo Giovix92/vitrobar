@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use vitro_core::image::BgraImage;
 use vitro_win::icons::{load_icon, IconSource};
+use vitro_win::tray_host::OwnedIcon;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
@@ -27,6 +28,24 @@ pub enum IconSrc {
     Aumid(String),
     Path(String),
     Window(u64),
+    /// A tray icon's image (the tray host's copy, kept alive while it is loading or cached).
+    Tray(TrayImage),
+}
+
+/// A tray icon copy, compared and hashed by its handle (each copy has its own handle).
+#[derive(Clone, Debug)]
+pub struct TrayImage(pub Arc<OwnedIcon>);
+
+impl PartialEq for TrayImage {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.handle() == other.0.handle()
+    }
+}
+impl Eq for TrayImage {}
+impl std::hash::Hash for TrayImage {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.handle().hash(state);
+    }
 }
 
 impl IconSrc {
@@ -35,6 +54,7 @@ impl IconSrc {
             IconSrc::Aumid(a) => IconSource::Aumid(a),
             IconSrc::Path(p) => IconSource::Path(p),
             IconSrc::Window(h) => IconSource::Window(HWND(*h as usize as *mut _)),
+            IconSrc::Tray(t) => IconSource::TrayHandle(t.0.handle()),
         }
     }
 }
@@ -139,6 +159,13 @@ impl IconLoader {
             any = true;
         }
         any
+    }
+
+    /// Forgets the finished entries (loaded or failed) of every source `drop` selects: a
+    /// tray icon whose image was replaced or that went away.
+    pub fn forget(&mut self, drop: impl Fn(&IconSrc) -> bool) {
+        self.slots
+            .retain(|(src, _), slot| matches!(slot, Slot::Pending) || !drop(src));
     }
 
     /// Keeps the map bounded: past the cap, forget entries `keep` does not want.

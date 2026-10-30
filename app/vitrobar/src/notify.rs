@@ -9,8 +9,10 @@
 use std::cell::RefCell;
 use std::sync::OnceLock;
 
+use vitro_core::tray_wire::TrayMessage;
 use vitro_win::appbar::WM_VITRO_APPBAR;
 use vitro_win::stock_taskbar::taskbar_created_msg;
+use vitro_win::tray_host::{take_tray_message, WM_VITRO_TRAY};
 use vitro_win::window_tracker::{
     shell_hook_message_id, take_window_event, translate_shell_hook, WindowEvent,
     WM_VITRO_WINDOW_EVENT,
@@ -39,6 +41,8 @@ pub const TIMER_HOVER_HIDE: usize = 0x5704;
 pub const TIMER_MARGIN_COLLAPSE: usize = 0x5705;
 /// One-shot after `TaskbarCreated`: Explorer may show its taskbar again once it is up.
 pub const TIMER_REASSERT: usize = 0x5706;
+/// One-shot: the cursor rested on a tray icon long enough for its tooltip (500 ms).
+pub const TIMER_TRAY_TIP: usize = 0x5707;
 
 /// Everything the notify window received since the last [`take_inbox`].
 #[derive(Debug, Default, PartialEq)]
@@ -63,6 +67,8 @@ pub struct Inbox {
     pub appbar_pos: bool,
     /// A full-screen app may have opened or closed (`ABN_FULLSCREENAPP`).
     pub fullscreen: bool,
+    /// Tray messages the tray host accepted, in arrival order.
+    pub tray: Vec<TrayMessage>,
 }
 
 thread_local! {
@@ -106,6 +112,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // delivered to this procedure exactly once, so the box is reclaimed exactly once.
             let ev = unsafe { take_window_event(lparam) };
             with_inbox(|i| i.events.push(ev));
+            return LRESULT(0);
+        }
+        WM_VITRO_TRAY => {
+            // SAFETY: only the tray host posts this message to the notify window; each
+            // message is delivered here exactly once, so the box is reclaimed exactly once.
+            let m = unsafe { take_tray_message(lparam) };
+            with_inbox(|i| i.tray.push(m));
             return LRESULT(0);
         }
         WM_TIMER => {
@@ -212,25 +225,32 @@ impl NotifyWindow {
 
 impl Drop for NotifyWindow {
     fn drop(&mut self) {
-        // Reclaim boxed window events still queued (the tracker must already be dropped),
-        // then destroy the window.
+        // Reclaim boxed window events and tray messages still queued (the tracker and the
+        // tray host must already be dropped), then destroy the window.
         let mut msg = MSG::default();
         // SAFETY: every WM_VITRO_WINDOW_EVENT on this window was posted by the tracker; the
         // ones still queued were never dispatched and are reclaimed here exactly once.
         // PeekMessage returns WM_QUIT whatever the filter (the bar windows post one when they
-        // are destroyed), so only real window events are reclaimed.
+        // are destroyed), so only real window events are reclaimed. The same holds for the
+        // tray host's WM_VITRO_TRAY (the next id up).
+        const _: () = assert!(WM_VITRO_TRAY == WM_VITRO_WINDOW_EVENT + 1);
         unsafe {
             while PeekMessageW(
                 &mut msg,
                 Some(self.hwnd),
                 WM_VITRO_WINDOW_EVENT,
-                WM_VITRO_WINDOW_EVENT,
+                WM_VITRO_TRAY,
                 PM_REMOVE,
             )
             .as_bool()
             {
-                if msg.message == WM_VITRO_WINDOW_EVENT && msg.hwnd == self.hwnd {
+                if msg.hwnd != self.hwnd {
+                    continue;
+                }
+                if msg.message == WM_VITRO_WINDOW_EVENT {
                     let _ = take_window_event(msg.lParam);
+                } else if msg.message == WM_VITRO_TRAY {
+                    let _ = take_tray_message(msg.lParam);
                 }
             }
             let _ = DestroyWindow(self.hwnd);
@@ -294,6 +314,26 @@ mod tests {
             )
             .unwrap();
             PostMessageW(Some(n.hwnd), WM_APP_ICON, WPARAM(0), LPARAM(0)).unwrap();
+            let tray = Box::into_raw(Box::new(TrayMessage {
+                op: vitro_core::tray_wire::TrayOp::Delete,
+                id: vitro_core::tray_wire::TrayIconId {
+                    hwnd: 1,
+                    uid: 2,
+                    guid: None,
+                },
+                callback_msg: None,
+                hicon: None,
+                tip: None,
+                hidden: None,
+                version: None,
+            }));
+            PostMessageW(
+                Some(n.hwnd),
+                WM_VITRO_TRAY,
+                WPARAM(0),
+                LPARAM(tray as isize),
+            )
+            .unwrap();
             // As a nested modal loop would: DispatchMessage, not the app's own peek path.
             pump(n.hwnd);
             SendMessageW(
@@ -336,6 +376,8 @@ mod tests {
         assert!(inbox.shell && inbox.display && inbox.taskbar_created);
         assert!(inbox.fullscreen && inbox.appbar_pos);
         assert!(inbox.timers.contains(&TIMER_CLOCK));
+        assert_eq!(inbox.tray.len(), 1);
+        assert_eq!(inbox.tray[0].id.uid, 2);
         assert_eq!(take_inbox(), Inbox::default());
     }
 }

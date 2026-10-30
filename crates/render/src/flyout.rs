@@ -5,6 +5,7 @@
 //! (a window that repaints updates its thumbnail) and cost Vitrobar no redraws. The glass
 //! and the titles are drawn once when the strip opens.
 
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
@@ -26,8 +27,9 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowPlacement, GetWindowRect, IsIconic,
-    IsWindow, LoadCursorW, RegisterClassExW, ShowWindow, IDC_ARROW, MA_NOACTIVATE,
-    SW_SHOWNOACTIVATE, WINDOWPLACEMENT, WM_MOUSEACTIVATE, WNDCLASSEXW, WS_EX_NOACTIVATE,
+    IsWindow, LoadCursorW, RegisterClassExW, SetForegroundWindow, SetWindowPos, ShowWindow,
+    HWND_TOPMOST, IDC_ARROW, MA_NOACTIVATE, SWP_NOACTIVATE, SW_SHOWNOACTIVATE, WA_INACTIVE,
+    WINDOWPLACEMENT, WM_ACTIVATE, WM_MOUSEACTIVATE, WNDCLASSEXW, WS_EX_NOACTIVATE,
     WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::UI::Composition::Desktop::DesktopWindowTarget;
@@ -179,10 +181,28 @@ fn register_class() -> Result<()> {
         .clone()
 }
 
+thread_local! {
+    /// Flyouts that lost activation since the last [`take_deactivated`] (this thread's).
+    static DEACTIVATED: RefCell<Vec<HWND>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Flyouts (made active with [`Flyout::activate`]) that were deactivated since the last
+/// call: the user clicked elsewhere or switched apps.
+pub fn take_deactivated() -> Vec<HWND> {
+    DEACTIVATED.with(|d| std::mem::take(&mut *d.borrow_mut()))
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     // Mouse input is read by the app's message loop before dispatch.
     match msg {
         WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+        WM_ACTIVATE => {
+            if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE {
+                DEACTIVATED.with(|d| d.borrow_mut().push(hwnd));
+            }
+            // SAFETY: default handling with the arguments we were given.
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
         // SAFETY: default handling with the arguments we were given.
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
@@ -217,6 +237,7 @@ pub struct Flyout {
     // Field order = drop order: the target before the window it draws into.
     _target: DesktopWindowTarget,
     root: ContainerVisual,
+    glass: Visual,
     hwnd: HWND,
     rect_px: PxRect,
     scale: f32,
@@ -290,6 +311,7 @@ impl Flyout {
             Ok(Self {
                 _target: target,
                 root,
+                glass,
                 hwnd,
                 rect_px: (x, y, x + size.0, y + size.1),
                 scale,
@@ -313,6 +335,62 @@ impl Flyout {
     /// Physical px per DIP.
     pub fn scale(&self) -> f32 {
         self.scale
+    }
+
+    /// The flyout's visual tree: the glass is its bottom child; content goes on top.
+    pub fn root(&self) -> &ContainerVisual {
+        &self.root
+    }
+
+    /// Makes the flyout the foreground window (it then hears keys, and a click elsewhere
+    /// deactivates it: see [`take_deactivated`]). Only allowed right after the user clicked
+    /// one of our windows; false if Windows refused.
+    pub fn activate(&self) -> bool {
+        // SAFETY: plain call on our own window.
+        unsafe { SetForegroundWindow(self.hwnd) }.as_bool()
+    }
+
+    /// Gives the flyout a new size (and place next to `anchor_px`), redrawing the glass.
+    pub fn reshape(
+        &mut self,
+        comp: &Comp,
+        anchor_px: PxRect,
+        position: Position,
+        size_dip: (f32, f32),
+        style: &MaterialStyle,
+    ) -> Result<()> {
+        let s = self.scale;
+        let size = (
+            (size_dip.0 * s).round() as i32,
+            (size_dip.1 * s).round() as i32,
+        );
+        let gap = (ANCHOR_GAP_DIP * s).round() as i32;
+        let (x, y) = place(anchor_px, position, size, gap, work_area(anchor_px));
+        let rect = (x, y, x + size.0, y + size.1);
+        if rect == self.rect_px {
+            return Ok(());
+        }
+        // SAFETY: plain call on our own window.
+        unsafe {
+            SetWindowPos(
+                self.hwnd,
+                Some(HWND_TOPMOST),
+                x,
+                y,
+                size.0,
+                size.1,
+                SWP_NOACTIVATE,
+            )?
+        };
+        let size_v = Vector2::new(size.0 as f32, size.1 as f32);
+        self.root.SetSize(size_v)?;
+        let glass: Visual = backdrop_visual(comp, style, size_v, RADIUS_DIP * s)?.cast()?;
+        let children = self.root.Children()?;
+        children.Remove(&self.glass)?;
+        children.InsertAtBottom(&glass)?;
+        self.glass = glass;
+        self.rect_px = rect;
+        Ok(())
     }
 }
 
