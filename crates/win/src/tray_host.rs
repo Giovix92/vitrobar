@@ -65,13 +65,12 @@ pub const NIN_SELECT: u32 = WM_USER;
 const FORWARD_TIMEOUT_MS: u32 = 2000;
 /// How long the shutdown waits for the host thread to destroy its window.
 const SHUTDOWN_TIMEOUT_MS: u32 = 2000;
-/// Explorer re-raises its own (hidden) taskbar a little after work-area, settings and display
-/// changes, often after our immediate reassert: one more raise this long after each trigger.
+/// Explorer re-raises its own (hidden) taskbar a little after start-up, TaskbarCreated,
+/// settings and display changes, often after our immediate raise: one more raise this long
+/// after each of those (only those: they are rare, so this never becomes a cadence).
 const RAISE_AGAIN_MS: u32 = 500;
 /// One-shot timer on the host window for that second raise.
 const TIMER_RAISE_AGAIN: usize = 1;
-/// Posted to the host window (`wParam` = [`quit_cookie`]): raise now and once more later.
-const WM_TRAY_RAISE: u32 = WM_APP + 0x41;
 
 /// The class name every `Shell_NotifyIcon` caller looks for.
 const TRAY_CLASS: PCWSTR = w!("Shell_TrayWnd");
@@ -356,10 +355,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(1)
         }
-        WM_TRAY_RAISE if wparam.0 == quit_cookie() => {
-            raise_now_and_later(hwnd);
-            LRESULT(0)
-        }
         WM_TIMER if wparam.0 == TIMER_RAISE_AGAIN => {
             // SAFETY: our own timer on our own window.
             unsafe {
@@ -635,19 +630,10 @@ impl TrayHost {
     }
 
     /// Goes back to the top of the topmost band, so `FindWindow` keeps finding us before
-    /// Explorer's window, now and once more shortly after (Explorer tends to re-raise its own
-    /// taskbar a moment after the events that call this). Never waits.
+    /// Explorer's window: one asynchronous raise, never waits. (The host itself adds a
+    /// delayed second raise after start-up, TaskbarCreated, settings and display changes.)
     pub fn reassert_topmost(&self) {
         raise(self.hwnd);
-        // SAFETY: posting plain values to our own host window.
-        unsafe {
-            let _ = PostMessageW(
-                Some(self.hwnd),
-                WM_TRAY_RAISE,
-                WPARAM(quit_cookie()),
-                LPARAM(0),
-            );
-        }
     }
 
     /// The icons, in the order they were added.

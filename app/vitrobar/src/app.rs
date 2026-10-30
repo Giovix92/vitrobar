@@ -1907,9 +1907,10 @@ impl App {
             self.close_overflow();
             dirty.visuals = true;
         }
-        if inbox.taskbar_created || inbox.shell || inbox.display || inbox.fullscreen {
-            // Explorer may have raised its own Shell_TrayWnd (restart, settings, display or
-            // full-screen changes): go back above it.
+        if inbox.fullscreen {
+            // Explorer may have raised its own Shell_TrayWnd for the full-screen change: go
+            // back above it. (Restarts, settings and display changes reach the tray host's
+            // own window, which handles them.)
             if let Some(t) = &self.tray {
                 t.reassert_topmost();
             }
