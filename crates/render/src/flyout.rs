@@ -26,7 +26,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowPlacement, GetWindowRect, IsIconic,
-    IsWindow, LoadCursorW, RegisterClassExW, ShowWindow, IDC_ARROW, MA_NOACTIVATE, SW_HIDE,
+    IsWindow, LoadCursorW, RegisterClassExW, ShowWindow, IDC_ARROW, MA_NOACTIVATE,
     SW_SHOWNOACTIVATE, WINDOWPLACEMENT, WM_MOUSEACTIVATE, WNDCLASSEXW, WS_EX_NOACTIVATE,
     WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
@@ -314,15 +314,11 @@ impl Flyout {
     pub fn scale(&self) -> f32 {
         self.scale
     }
-
-    pub fn hide(&mut self) {
-        // SAFETY: plain call on our own window.
-        unsafe {
-            let _ = ShowWindow(self.hwnd, SW_HIDE);
-        }
-    }
 }
 
+/// Dropping the flyout is hiding it: the window is destroyed. There is deliberately no
+/// separate `hide`, which would leave the [`ThumbnailStrip`] (a separate value) with
+/// thumbnails registered against a hidden window. Drop the strip first, then the flyout.
 impl Drop for Flyout {
     fn drop(&mut self) {
         // SAFETY: destroying our own window if it still exists.

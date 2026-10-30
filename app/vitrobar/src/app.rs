@@ -39,13 +39,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::bar_window::{
-    create_bar_window, hit_test, mouse_pos, track_leave, BarWindow, Hit, PxRect,
+    create_bar_window, hit_test, mouse_pos, track_leave, BarWindow, Hit, MarginMode, PxRect,
 };
 use crate::icon_loader::{IconLoader, IconSrc, Lookup, MAX_ICON_PX};
 use crate::launcher::{Job, Launcher};
 use crate::notify::{
     take_inbox, Inbox, NotifyWindow, TIMER_CLOCK, TIMER_GPU_RETRY, TIMER_HOVER_HIDE,
-    TIMER_HOVER_SHOW,
+    TIMER_HOVER_SHOW, TIMER_MARGIN_COLLAPSE,
 };
 use crate::window_set::WindowSet;
 
@@ -213,6 +213,8 @@ struct App {
     show_pending: Option<usize>,
     /// TIMER_HOVER_HIDE is armed.
     hide_pending: bool,
+    /// TIMER_MARGIN_COLLAPSE is armed (some bar margin is lingering).
+    collapse_pending: bool,
     /// The cursor is over the flyout (tracked for WM_MOUSELEAVE).
     over_flyout: bool,
     /// Thumbnail under the button press in the flyout.
@@ -292,6 +294,7 @@ impl App {
             tracking: None,
             show_pending: None,
             hide_pending: false,
+            collapse_pending: false,
             over_flyout: false,
             flyout_pressed: None,
             show_suppressed: false,
@@ -687,6 +690,13 @@ impl App {
                     }
                 }
             }
+            TIMER_MARGIN_COLLAPSE => {
+                self.kill_timer(TIMER_MARGIN_COLLAPSE);
+                self.collapse_pending = false;
+                for b in &mut self.bars {
+                    b.window.finish_linger();
+                }
+            }
             TIMER_HOVER_HIDE => {
                 self.kill_timer(TIMER_HOVER_HIDE);
                 self.hide_pending = false;
@@ -801,13 +811,56 @@ impl App {
     }
 
     /// Only the bar window under the cursor, while it is over an app, takes input in (and
-    /// shows content in) its margin.
+    /// shows content in) its margin. When the hover ends the margin keeps drawing but stops
+    /// taking input for the length of the shrink-back (one-shot timer), then collapses.
     fn sync_expanded(&mut self) {
         let on_app = matches!(self.hover, Some(Hit::App(_)));
         let tracking = self.tracking;
+        let mut lingering = false;
+        let mut began = false;
         for b in &mut self.bars {
-            b.window
-                .set_expanded(on_app && tracking == Some(b.window.hwnd));
+            if on_app && tracking == Some(b.window.hwnd) {
+                b.window.set_expanded(true);
+            } else {
+                if b.window.mode() == MarginMode::Active {
+                    if self.sys.animations {
+                        b.window.begin_linger();
+                        began = true;
+                    } else {
+                        b.window.set_expanded(false);
+                    }
+                }
+                lingering |= b.window.mode() == MarginMode::Lingering;
+            }
+        }
+        if began {
+            self.arm_collapse();
+        } else if lingering {
+            // Already counting down.
+        } else if self.collapse_pending {
+            self.collapse_pending = false;
+            self.kill_timer(TIMER_MARGIN_COLLAPSE);
+        }
+    }
+
+    /// (Re)starts the one-shot that ends the margin shrink-back.
+    fn arm_collapse(&mut self) {
+        // SAFETY: one-shot timer on our own window (killed when it fires); re-setting the id
+        // restarts it.
+        let id = unsafe {
+            SetTimer(
+                Some(self.notify.hwnd),
+                TIMER_MARGIN_COLLAPSE,
+                self.hover_style.duration_ms.max(1),
+                None,
+            )
+        };
+        self.collapse_pending = id != 0;
+        if id == 0 {
+            // No timer available: collapse now rather than leave the margin lingering.
+            for b in &mut self.bars {
+                b.window.finish_linger();
+            }
         }
     }
 

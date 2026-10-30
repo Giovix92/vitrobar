@@ -31,6 +31,8 @@ pub const TIMER_GPU_RETRY: usize = 0x5702;
 /// One-shot hover timers of the thumbnail strip (400 ms to open, 300 ms to close).
 pub const TIMER_HOVER_SHOW: usize = 0x5703;
 pub const TIMER_HOVER_HIDE: usize = 0x5704;
+/// One-shot: the hover motion has finished, so the bar margins can collapse.
+pub const TIMER_MARGIN_COLLAPSE: usize = 0x5705;
 
 /// Everything the notify window received since the last [`take_inbox`].
 #[derive(Debug, Default, PartialEq)]

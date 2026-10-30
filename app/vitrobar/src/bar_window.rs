@@ -4,7 +4,9 @@
 //!
 //! A window can carry a transparent margin beyond the bar's outer edge (Magnify grows icons
 //! past it). The margin is outside the window region, so it is click-through, except while
-//! [`BarWindow::set_expanded`] says an icon may be drawn there.
+//! [`BarWindow::set_expanded`] says an icon may be drawn there. When the hover ends the
+//! margin keeps drawing (so the shrink-back is not cut) but stops taking input: see
+//! [`MarginMode`].
 
 use std::sync::OnceLock;
 
@@ -12,19 +14,22 @@ use vitro_core::layout::{BarLayout, Rect};
 use vitro_render::compositor::{window_target, Comp};
 use vitro_render::{Vector2, Vector3};
 use windows::core::{w, Error, Interface, Result, BOOL, HSTRING, PCWSTR};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_USE_HOSTBACKDROPBRUSH, DWMWA_WINDOW_CORNER_PREFERENCE,
     DWMWCP_DONOTROUND,
 };
-use windows::Win32::Graphics::Gdi::{CreateRectRgn, DeleteObject, SetWindowRgn, HRGN};
+use windows::Win32::Graphics::Gdi::{
+    CreateRectRgn, DeleteObject, ScreenToClient, SetWindowRgn, HRGN,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, IsWindow, LoadCursorW, PostQuitMessage,
-    RegisterClassExW, SetWindowPos, ShowWindow, HWND_TOPMOST, IDC_ARROW, MA_NOACTIVATE,
-    SWP_NOACTIVATE, SW_SHOWNOACTIVATE, WM_DESTROY, WM_MOUSEACTIVATE, WNDCLASSEXW, WS_EX_NOACTIVATE,
-    WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW, IsWindow, LoadCursorW,
+    PostQuitMessage, RegisterClassExW, SetWindowLongPtrW, SetWindowPos, ShowWindow, GWLP_USERDATA,
+    HWND_TOPMOST, IDC_ARROW, MA_NOACTIVATE, SWP_NOACTIVATE, SW_SHOWNOACTIVATE, WM_DESTROY,
+    WM_MOUSEACTIVATE, WM_NCHITTEST, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::UI::Composition::Desktop::DesktopWindowTarget;
 use windows::UI::Composition::{ContainerVisual, Visual};
@@ -34,6 +39,80 @@ pub const BAR_CLASS: &str = "VitrobarBar";
 
 /// `(left, top, right, bottom)` in physical pixels.
 pub type PxRect = (i32, i32, i32, i32);
+
+/// How a bar window treats its transparent margins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarginMode {
+    /// Window region = the bar alone: margins neither draw nor take input.
+    Clipped,
+    /// Whole window: an icon may be drawn in the margins, which also take input.
+    Active,
+    /// The hover ended and the shrink-back is still animating: margins keep drawing but
+    /// are transparent to hit testing (`WM_NCHITTEST` answers `HTTRANSPARENT`).
+    Lingering,
+}
+
+impl MarginMode {
+    /// Mode after a resize. A margin that just appeared starts `Clipped` (never inherits an
+    /// `Active` left over from before it was removed, which would make the transparent
+    /// margin swallow clicks); no margin at all is also `Clipped`.
+    pub fn after_resize(self, had_margin: bool, margin: (i32, i32)) -> Self {
+        if margin == (0, 0) || !had_margin {
+            Self::Clipped
+        } else {
+            self
+        }
+    }
+
+    /// Hover started (`true`) or ended without waiting (`false`).
+    pub fn set_expanded(self, on: bool) -> Self {
+        if on {
+            Self::Active
+        } else {
+            Self::Clipped
+        }
+    }
+
+    /// Hover ended: keep drawing, stop taking input.
+    pub fn begin_linger(self) -> Self {
+        if self == Self::Active {
+            Self::Lingering
+        } else {
+            self
+        }
+    }
+
+    /// The shrink-back is over.
+    pub fn finish_linger(self) -> Self {
+        if self == Self::Lingering {
+            Self::Clipped
+        } else {
+            self
+        }
+    }
+
+    /// No window region at all (the whole window draws).
+    fn whole_window(self, margin: (i32, i32)) -> bool {
+        margin == (0, 0) || self != Self::Clipped
+    }
+}
+
+/// `GWLP_USERDATA` payload telling `WM_NCHITTEST` where the bar is while lingering
+/// (0 = not lingering): bit 0 set, bar top in bits 1..32, bar height in bits 32..64.
+fn pack_linger(top: i32, h: i32) -> isize {
+    (1u64 | (((top.max(0) as u64) << 1) & 0xFFFF_FFFE) | ((h.max(0) as u64) << 32)) as isize
+}
+
+/// Whether client y lies in a margin, given a [`pack_linger`] value.
+fn in_margin(packed: isize, y: i32) -> bool {
+    if packed == 0 {
+        return false;
+    }
+    let p = packed as u64;
+    let top = ((p & 0xFFFF_FFFF) >> 1) as i32;
+    let h = (p >> 32) as i32;
+    y < top || y >= top + h
+}
 
 pub struct BarWindow {
     pub hwnd: HWND,
@@ -45,7 +124,7 @@ pub struct BarWindow {
     rect_px: PxRect,
     /// Extra px above and below the bar.
     margin: (i32, i32),
-    expanded: bool,
+    mode: MarginMode,
 }
 
 fn window_rect(r: PxRect, m: (i32, i32)) -> PxRect {
@@ -80,6 +159,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     // locale broadcasts go to the notify window.
     match msg {
         WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+        WM_NCHITTEST => {
+            // SAFETY: plain calls on our own window.
+            unsafe {
+                let packed = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+                if packed != 0 {
+                    let mut p = POINT {
+                        x: (lparam.0 & 0xFFFF) as i16 as i32,
+                        y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
+                    };
+                    if ScreenToClient(hwnd, &mut p).as_bool() && in_margin(packed, p.y) {
+                        return LRESULT(-1); // HTTRANSPARENT
+                    }
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+        }
         WM_DESTROY => {
             // SAFETY: plain call. A bar destroyed from outside (WM_CLOSE) ends the app.
             unsafe { PostQuitMessage(0) };
@@ -135,17 +230,17 @@ pub fn create_bar_window(comp: &Comp, rect_px: PxRect, margin: (i32, i32)) -> Re
         let content = comp.CreateContainerVisual()?;
         root.Children()?.InsertAtTop(&content)?;
         target.SetRoot(&root)?;
-        let mut w = BarWindow {
+        let w = BarWindow {
             hwnd,
             _target: target,
             root,
             content,
             rect_px,
             margin,
-            expanded: true,
+            mode: MarginMode::Clipped,
         };
         w.layout_visuals()?;
-        w.set_expanded(false);
+        w.apply_region();
         Ok(w)
     };
     // SAFETY: destroying the window we just created.
@@ -169,7 +264,11 @@ impl BarWindow {
 
     /// The margins currently take input (see [`BarWindow::set_expanded`]).
     pub fn expanded(&self) -> bool {
-        self.expanded && self.margin != (0, 0)
+        self.mode == MarginMode::Active && self.margin != (0, 0)
+    }
+
+    pub fn mode(&self) -> MarginMode {
+        self.mode
     }
 
     fn layout_visuals(&self) -> Result<()> {
@@ -188,10 +287,24 @@ impl BarWindow {
     /// Whether the margins take mouse input and show content (while an icon is magnified).
     /// Collapsed, the window region is the bar alone and the margins are click-through.
     pub fn set_expanded(&mut self, on: bool) {
-        if self.margin == (0, 0) || on == self.expanded {
+        self.set_mode(self.mode.set_expanded(on));
+    }
+
+    /// The hover ended: the margins keep showing content (the icon is shrinking back) but
+    /// stop taking input. Follow with [`BarWindow::finish_linger`] after the motion.
+    pub fn begin_linger(&mut self) {
+        self.set_mode(self.mode.begin_linger());
+    }
+
+    pub fn finish_linger(&mut self) {
+        self.set_mode(self.mode.finish_linger());
+    }
+
+    fn set_mode(&mut self, mode: MarginMode) {
+        if self.margin == (0, 0) || mode == self.mode {
             return;
         }
-        self.expanded = on;
+        self.mode = mode;
         self.apply_region();
     }
 
@@ -203,7 +316,17 @@ impl BarWindow {
         // SAFETY: plain calls on our own window. On success the system owns the region; on
         // failure it is still ours and is deleted. A null region means the whole window.
         unsafe {
-            let rgn = if self.expanded {
+            let lingering = self.mode == MarginMode::Lingering && self.margin != (0, 0);
+            SetWindowLongPtrW(
+                self.hwnd,
+                GWLP_USERDATA,
+                if lingering {
+                    pack_linger(self.margin.0, h)
+                } else {
+                    0
+                },
+            );
+            let rgn = if self.mode.whole_window(self.margin) {
                 HRGN::default()
             } else {
                 CreateRectRgn(0, self.margin.0, w, self.margin.0 + h)
@@ -235,12 +358,10 @@ impl BarWindow {
         let had_margin = self.margin != (0, 0);
         self.rect_px = rect_px;
         self.margin = margin;
+        self.mode = self.mode.after_resize(had_margin, margin);
         self.layout_visuals()?;
         if margin != (0, 0) || had_margin {
             // The region follows the new size (or is removed with the margin).
-            if margin == (0, 0) {
-                self.expanded = true;
-            }
             self.apply_region();
         }
         Ok(())
@@ -402,6 +523,44 @@ mod tests {
         let y = l.apps[0].y + 1.0;
         assert_eq!(hit_test(&l, edge - 0.01, y), Some(Hit::App(0)));
         assert_eq!(hit_test(&l, edge, y), Some(Hit::App(1)));
+    }
+
+    #[test]
+    fn margin_appearing_after_hover_starts_clipped() {
+        // 0 -> non-zero margin after an Active hover: must not inherit Active, or the
+        // transparent margin would swallow clicks.
+        let m = MarginMode::Active.after_resize(false, (30, 0));
+        assert_eq!(m, MarginMode::Clipped);
+        assert!(!m.whole_window((30, 0)));
+        // Margin removed: clipped state, whole window (nothing to clip).
+        let m = MarginMode::Active.after_resize(true, (0, 0));
+        assert_eq!(m, MarginMode::Clipped);
+        assert!(m.whole_window((0, 0)));
+        // A plain resize with a margin keeps an ongoing hover.
+        assert_eq!(
+            MarginMode::Active.after_resize(true, (30, 0)),
+            MarginMode::Active
+        );
+    }
+
+    #[test]
+    fn linger_keeps_drawing_but_not_input() {
+        let m = MarginMode::Active.begin_linger();
+        assert_eq!(m, MarginMode::Lingering);
+        assert!(m.whole_window((30, 0)), "margin keeps drawing");
+        assert_eq!(MarginMode::Clipped.begin_linger(), MarginMode::Clipped);
+        assert_eq!(m.finish_linger(), MarginMode::Clipped);
+        assert_eq!(MarginMode::Active.finish_linger(), MarginMode::Active);
+        assert_eq!(m.set_expanded(true), MarginMode::Active, "hover again");
+    }
+
+    #[test]
+    fn linger_hit_test_covers_only_the_margins() {
+        assert!(!in_margin(0, 5), "not lingering: nothing transparent");
+        let p = pack_linger(30, 48);
+        assert!(in_margin(p, 0) && in_margin(p, 29));
+        assert!(!in_margin(p, 30) && !in_margin(p, 77));
+        assert!(in_margin(p, 78));
     }
 
     #[test]

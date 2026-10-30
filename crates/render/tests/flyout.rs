@@ -6,10 +6,10 @@ use vitro_render::compositor::init_compositor;
 use vitro_render::device::create_gpu_device;
 use vitro_render::flyout::{live_thumbnails, Flyout, ThumbnailStrip, FLYOUT_CLASS};
 use vitro_render::surfaces::Painter;
-use windows::core::{w, PCWSTR};
+use windows::core::w;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, FindWindowW, IsWindow, IsWindowVisible, ShowWindow,
+    CreateWindowExW, DestroyWindow, GetClassNameW, IsWindow, IsWindowVisible, ShowWindow,
     SW_SHOWNOACTIVATE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
@@ -74,15 +74,18 @@ fn strip_registers_live_thumbnails_and_hit_tests() {
     assert_eq!(size, (428.0, 162.0));
 
     let anchor = (500, 900, 540, 948);
-    let mut flyout = Flyout::show(&comp, anchor, Position::Bottom, size, 96, &style).unwrap();
+    let flyout = Flyout::show(&comp, anchor, Position::Bottom, size, 96, &style).unwrap();
     let (l, t, r, bottom) = flyout.rect_px();
     assert_eq!((r - l, bottom - t), (428, 162));
     assert_eq!(bottom, 900 - 8, "8 DIP above the anchor");
     // SAFETY: plain queries.
     unsafe {
+        // Our own window, not whatever FindWindow would match (a running Vitrobar has one).
+        let mut class = [0u16; 64];
+        let n = GetClassNameW(flyout.hwnd(), &mut class) as usize;
         assert_eq!(
-            FindWindowW(FLYOUT_CLASS, PCWSTR::null()).unwrap(),
-            flyout.hwnd()
+            String::from_utf16_lossy(&class[..n]),
+            FLYOUT_CLASS.to_string().unwrap()
         );
         assert!(IsWindowVisible(flyout.hwnd()).as_bool());
     }
@@ -111,9 +114,6 @@ fn strip_registers_live_thumbnails_and_hit_tests() {
         before,
         "dropping the strip unregisters them"
     );
-    flyout.hide();
-    // SAFETY: plain query.
-    unsafe { assert!(!IsWindowVisible(flyout.hwnd()).as_bool()) };
     let h = flyout.hwnd();
     drop(flyout);
     // SAFETY: plain query.
