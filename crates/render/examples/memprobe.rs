@@ -1,6 +1,11 @@
 //! Private bytes (`PrivateUsage`, what the perf check budgets) after each step of the GPU
 //! set-up Vitrobar does: compositor, DXGI, D3D11 device, D2D, composition graphics device,
 //! surfaces, drawing. Diagnostic tool for the 40 MB budget (stage 1, Task 16).
+//!
+//! Diagnostic only: it repeats the set-up of `vitro_render::device` by hand instead of
+//! calling it (to time each step), so it may drift from what the app does. Vitrobar's
+//! default device is WARP (`--warp` here); without `--warp` this measures the hardware
+//! device on the minimum-power adapter (`DeviceKind::MinPowerHardware`).
 //! `cargo run --release -p vitro-render --example memprobe -- [options]`
 //!   --fl <9_1|10_0|10_1|11_0|11_1>   one feature level only (default: the runtime's list)
 //!   --single                         D3D11_CREATE_DEVICE_SINGLETHREADED
