@@ -281,7 +281,9 @@ fn set_runonce() -> Result<()> {
     .ok()
 }
 
-fn delete_runonce() -> Result<()> {
+/// Deletes the `RunOnce\VitrobarRestore` value (absent is fine). Only for paths that also
+/// drop the record (the restore) and for test teardown.
+pub fn delete_runonce() -> Result<()> {
     // SAFETY: plain call with static strings.
     let r = unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, RUNONCE_KEY, RUNONCE_VALUE) };
     if r == ERROR_SUCCESS || r == ERROR_FILE_NOT_FOUND {
@@ -289,6 +291,21 @@ fn delete_runonce() -> Result<()> {
     } else {
         r.ok()
     }
+}
+
+/// Puts the `RunOnce\VitrobarRestore` value back when a restore record exists; returns
+/// whether it did. Windows deletes a RunOnce value *before* it runs the command, so a
+/// `--restore` that finds a live bar (and therefore leaves the record to it) calls this to
+/// keep the invariant "record exists => RunOnce exists". Holds [`ShellLock`] around the
+/// check and the write (recursive, so a caller may already hold it); on a lock timeout it
+/// writes anyway: an extra safety net is always the safe direction.
+pub fn rearm_runonce_if_record(record_path: &Path) -> Result<bool> {
+    let _lock = ShellLock::acquire(SHELL_LOCK_TIMEOUT_MS);
+    if !record_path.exists() {
+        return Ok(false);
+    }
+    set_runonce()?;
+    Ok(true)
 }
 
 /// The `RunOnce\VitrobarRestore` value exists.

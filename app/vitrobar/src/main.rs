@@ -16,6 +16,7 @@ mod shell;
 mod watchdog;
 mod window_set;
 
+use std::path::Path;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
@@ -36,11 +37,27 @@ fn restore_mode() -> ExitCode {
         eprintln!("vitrobar: LOCALAPPDATA is not set");
         return ExitCode::FAILURE;
     };
+    restore_mode_at(&path)
+}
+
+/// A live bar owns the shell: leave its record alone, but put back the RunOnce value that
+/// Windows deleted before starting this `--restore`, so the record keeps its safety net.
+/// Called with [`ShellLock`] held.
+fn leave_to_the_live_bar(path: &Path) -> ExitCode {
+    if let Err(e) = vitro_win::stock_taskbar::rearm_runonce_if_record(path) {
+        eprintln!("vitrobar: could not set the RunOnce safety net again: {e}");
+    }
+    ExitCode::SUCCESS
+}
+
+fn restore_mode_at(path: &Path) -> ExitCode {
     let bar_running = || watchdog::mutex_exists(watchdog::BAR_MUTEX);
     if bar_running() {
-        // A live bar owns the shell (and keeps the record and the RunOnce value): restoring
-        // now would delete its record and let it hide the taskbar for good.
-        return ExitCode::SUCCESS;
+        // Restoring now would delete the live bar's record and let it hide the taskbar for
+        // good. But Windows deleted the RunOnce value that started us before running it, so
+        // the record would be left without its safety net: put the value back.
+        let _shell = ShellLock::acquire(SHELL_LOCK_TIMEOUT_MS);
+        return leave_to_the_live_bar(path);
     }
     if path.exists() {
         let end = Instant::now() + RESTORE_WAIT;
@@ -53,10 +70,10 @@ fn restore_mode() -> ExitCode {
     // is seen here) or starts after this restore is complete. On a timeout: restore anyway.
     let _shell = ShellLock::acquire(SHELL_LOCK_TIMEOUT_MS);
     if bar_running() {
-        // An autostarted bar came up while we waited for Explorer.
-        return ExitCode::SUCCESS;
+        // An autostarted bar came up while we waited for Explorer (the lock is held).
+        return leave_to_the_live_bar(path);
     }
-    let restored = vitro_win::stock_taskbar::restore_stock_taskbar_within(&path, 0);
+    let restored = vitro_win::stock_taskbar::restore_stock_taskbar_within(path, 0);
     if vitro_win::stock_taskbar::stock_taskbar_present() {
         // A Vitrobar that ended without cleaning up may have hidden the taskbar and held the
         // tray icons: show it, and ask every app to register its icons with Explorer again.
@@ -166,5 +183,50 @@ fn main() -> ExitCode {
         Mode::Adopt(pid) => watchdog::adopt(pid, &opts.pass_on),
         Mode::Restore => restore_mode(),
         Mode::Bar => bar_mode(opts),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vitro_win::stock_taskbar::{
+        delete_runonce, rearm_runonce_if_record, runonce_exists, RestoreRecord,
+    };
+
+    /// Removes the RunOnce value and the temporary record however the test ends (the value
+    /// points at the test binary, which cannot restore anything).
+    struct Teardown(std::path::PathBuf);
+    impl Drop for Teardown {
+        fn drop(&mut self) {
+            let _ = delete_runonce();
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Windows deleted `RunOnce\VitrobarRestore` before running `--restore`, which finds a
+    /// live bar: the record stays and the RunOnce value is back.
+    #[test]
+    #[ignore = "writes HKCU RunOnce VitrobarRestore and holds the bar mutex"]
+    fn restore_with_a_live_bar_rearms_runonce() {
+        assert!(!runonce_exists(), "a VitrobarRestore value is already set");
+        let dir = std::env::temp_dir().join(format!("vitrobar-rearm-{}", std::process::id()));
+        let _t = Teardown(dir.clone());
+        let path = dir.join("restore.json");
+        RestoreRecord {
+            original_autohide: false,
+        }
+        .write(&path)
+        .unwrap();
+        let bar = watchdog::NamedMutex::acquire(watchdog::BAR_MUTEX)
+            .expect("a Vitrobar bar is running: stop it before this test");
+        assert_eq!(restore_mode_at(&path), ExitCode::SUCCESS);
+        assert!(path.exists(), "the live bar's record was left alone");
+        assert!(runonce_exists(), "the RunOnce safety net is back");
+        drop(bar);
+        // Without a record there is nothing to re-arm.
+        delete_runonce().unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(!rearm_runonce_if_record(&path).unwrap());
+        assert!(!runonce_exists());
     }
 }
