@@ -2,25 +2,32 @@
 
 mod app;
 mod bar_window;
+mod icon_loader;
+mod notify;
+mod window_set;
 
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: vitrobar [--bar]";
+const USAGE: &str = "usage: vitrobar [--bar] [--debug-state]";
 
 fn main() -> ExitCode {
-    let arg = std::env::args().nth(1);
-    match arg.as_deref() {
-        // No arguments behaves like `--bar` for now.
-        None | Some("--bar") => match app::run() {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("vitrobar: {e}");
-                ExitCode::FAILURE
+    let mut opts = app::Options::default();
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            // No arguments behaves like `--bar` for now.
+            "--bar" => {}
+            "--debug-state" => opts.debug_state = true,
+            other => {
+                eprintln!("vitrobar: unknown argument {other:?}\n{USAGE}");
+                return ExitCode::from(2);
             }
-        },
-        Some(other) => {
-            eprintln!("vitrobar: unknown argument {other:?}\n{USAGE}");
-            ExitCode::from(2)
+        }
+    }
+    match app::run(opts) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("vitrobar: {e}");
+            ExitCode::FAILURE
         }
     }
 }
