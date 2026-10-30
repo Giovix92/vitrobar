@@ -1,6 +1,7 @@
 //! vitro-win: Win32 / WinRT system queries and integration.
 
 pub mod appbar;
+pub mod autostart;
 pub mod desktops;
 pub mod icons;
 pub mod launch;

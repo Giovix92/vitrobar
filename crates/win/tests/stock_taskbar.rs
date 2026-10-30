@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use vitro_core::settings::StockTaskbar;
 use vitro_win::stock_taskbar::{
-    autohide_now, restore_stock_taskbar, runonce_exists, stock_taskbar_visible,
+    autohide_now, restore_stock_taskbar, runonce_exists, show_stock_taskbar, stock_taskbar_visible,
     take_over_stock_taskbar, RestoreRecord,
 };
 
@@ -116,6 +116,55 @@ fn second_take_over_keeps_the_first_original() {
         RestoreRecord::from_json(&text).map(|r| r.original_autohide),
         Some(original)
     );
+    restore_stock_taskbar(&p).unwrap();
+    assert_eq!(autohide_now(), original);
+    assert!(!runonce_exists());
+}
+
+#[test]
+#[ignore = "changes the real stock taskbar"]
+fn unreadable_record_is_replaced_by_the_windows_default() {
+    // A crashed run left a torn record behind while auto-hide is (Vitrobar's) on: that "on"
+    // must not become the original.
+    let original = autohide_now();
+    let p = temp_record("torn");
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, "{\"original_autohide\":tr").unwrap();
+    let _c = Cleanup(p.clone());
+    take_over_stock_taskbar(StockTaskbar::AutoHide, &p).unwrap();
+    assert!(autohide_now());
+    let text = std::fs::read_to_string(&p).unwrap();
+    assert_eq!(
+        RestoreRecord::from_json(&text),
+        Some(RestoreRecord {
+            original_autohide: false
+        })
+    );
+    // Put the machine's real original back, whatever it is.
+    RestoreRecord {
+        original_autohide: original,
+    }
+    .write(&p)
+    .unwrap();
+    restore_stock_taskbar(&p).unwrap();
+    assert_eq!(autohide_now(), original);
+    assert!(!runonce_exists());
+}
+
+#[test]
+#[ignore = "changes the real stock taskbar"]
+fn show_works_without_a_record() {
+    // Another instance (or RunOnce --restore) consumed the record while the taskbar is
+    // hidden: a restore finds nothing to do, the explicit show still brings it back.
+    let original = autohide_now();
+    let p = temp_record("consumed");
+    let _c = Cleanup(p.clone());
+    take_over_stock_taskbar(StockTaskbar::Hidden, &p).unwrap();
+    assert!(eventually(|| !stock_taskbar_visible()));
+    let other = temp_missing();
+    restore_stock_taskbar(&other).unwrap();
+    show_stock_taskbar();
+    assert!(eventually(stock_taskbar_visible));
     restore_stock_taskbar(&p).unwrap();
     assert_eq!(autohide_now(), original);
     assert!(!runonce_exists());

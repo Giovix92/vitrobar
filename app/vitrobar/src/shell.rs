@@ -9,8 +9,8 @@ use std::sync::Mutex;
 use vitro_core::settings::StockTaskbar;
 use vitro_win::appbar::unregister;
 use vitro_win::stock_taskbar::{
-    default_record_path, reassert_hidden, restore_stock_taskbar, stock_taskbar_windows,
-    take_over_stock_taskbar,
+    default_record_path, reassert_hidden, restore_stock_taskbar, show_stock_taskbar,
+    stock_taskbar_windows, take_over_stock_taskbar,
 };
 use windows::Win32::Foundation::HWND;
 
@@ -21,6 +21,10 @@ static APPBAR_HWNDS: Mutex<Vec<isize>> = Mutex::new(Vec::new());
 static RESTORED: AtomicBool = AtomicBool::new(false);
 /// Serializes restores (the console handler runs on its own thread).
 static RESTORE_LOCK: Mutex<()> = Mutex::new(());
+/// This process hid Explorer's taskbar windows at some point: every restore shows them
+/// again, even when the record is gone (another instance, or a RunOnce `--restore` run while
+/// this one was alive, consumed it).
+static HID_TASKBAR: AtomicBool = AtomicBool::new(false);
 
 pub fn record_path() -> Option<PathBuf> {
     default_record_path()
@@ -48,6 +52,30 @@ pub fn remove_appbar_hwnd(hwnd: HWND) {
 /// from any thread and any number of times.
 pub fn restore_now() {
     let _lock = RESTORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    restore_locked();
+}
+
+/// The panic hook's restore: like [`restore_now`], but if the panic happened inside a
+/// restore (the lock is held by this very thread) it only does the parts that cannot
+/// deadlock.
+pub fn restore_after_panic() {
+    match RESTORE_LOCK.try_lock() {
+        Ok(_lock) => restore_locked(),
+        Err(std::sync::TryLockError::Poisoned(e)) => {
+            let _lock = e.into_inner();
+            restore_locked();
+        }
+        Err(std::sync::TryLockError::WouldBlock) => {
+            RESTORED.store(true, Ordering::SeqCst);
+            if let Some(p) = record_path() {
+                let _ = restore_stock_taskbar(&p);
+            }
+            show_stock_taskbar();
+        }
+    }
+}
+
+fn restore_locked() {
     RESTORED.store(true, Ordering::SeqCst);
     // First: while our tray window lives, the appbar and auto-hide calls below pass through
     // it (it forwards them); afterwards they go straight to Explorer.
@@ -60,6 +88,9 @@ pub fn restore_now() {
         if let Err(e) = restore_stock_taskbar(&p) {
             eprintln!("vitrobar: could not restore the stock taskbar: {e}");
         }
+    }
+    if HID_TASKBAR.load(Ordering::SeqCst) {
+        show_stock_taskbar();
     }
 }
 
@@ -90,6 +121,10 @@ impl StockGuard {
             eprintln!("vitrobar: LOCALAPPDATA is not set; the stock taskbar stays");
             return;
         };
+        if self.mode == StockTaskbar::Hidden {
+            // Before the windows are hidden, so no way out can miss showing them.
+            HID_TASKBAR.store(true, Ordering::SeqCst);
+        }
         match take_over_stock_taskbar(self.mode, &p) {
             Ok(()) => {
                 self.active = true;

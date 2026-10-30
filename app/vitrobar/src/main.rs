@@ -1,4 +1,10 @@
 //! Vitrobar: a glass taskbar for Windows 11.
+//!
+//! Release builds are GUI-subsystem programs (no console window, also not for the
+//! watchdog); `--console` attaches to the console of the process that started Vitrobar to
+//! show its diagnostics. Debug builds keep their console.
+
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
 mod bar_window;
@@ -7,12 +13,17 @@ mod launcher;
 mod menus;
 mod notify;
 mod shell;
+mod watchdog;
 mod window_set;
 
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-const USAGE: &str = "usage: vitrobar [--bar] [--debug-state] | --restore";
+const USAGE: &str =
+    "usage: vitrobar [--debug-state] [--console]   (the watchdog, which starts the bar)\n\
+       vitrobar --bar [--parent <pid>] [--debug-state] [--console]\n\
+       vitrobar --adopt <bar pid> [--debug-state] [--console]\n\
+       vitrobar --restore";
 
 /// `--restore` (the RunOnce safety net, run at sign-in): Explorer may still be starting, so
 /// wait a little for its taskbar before putting it back.
@@ -23,16 +34,27 @@ fn restore_mode() -> ExitCode {
         eprintln!("vitrobar: LOCALAPPDATA is not set");
         return ExitCode::FAILURE;
     };
+    let bar_running = || watchdog::mutex_exists(watchdog::BAR_MUTEX);
+    if bar_running() {
+        // A live bar owns the shell (and keeps the record and the RunOnce value): restoring
+        // now would delete its record and let it hide the taskbar for good.
+        return ExitCode::SUCCESS;
+    }
     if path.exists() {
         let end = Instant::now() + RESTORE_WAIT;
         while !vitro_win::stock_taskbar::stock_taskbar_present() && Instant::now() < end {
             std::thread::sleep(Duration::from_millis(250));
         }
     }
+    if bar_running() {
+        // An autostarted bar came up while we waited for Explorer.
+        return ExitCode::SUCCESS;
+    }
     let restored = vitro_win::stock_taskbar::restore_stock_taskbar(&path);
     if vitro_win::stock_taskbar::stock_taskbar_present() {
-        // A Vitrobar that ended without cleaning up may have held the tray icons: ask every
-        // app to register them with Explorer again.
+        // A Vitrobar that ended without cleaning up may have hidden the taskbar and held the
+        // tray icons: show it, and ask every app to register its icons with Explorer again.
+        vitro_win::stock_taskbar::show_stock_taskbar();
         vitro_win::tray_host::broadcast_taskbar_created();
     }
     match restored {
@@ -44,20 +66,18 @@ fn restore_mode() -> ExitCode {
     }
 }
 
-fn main() -> ExitCode {
-    let mut opts = app::Options::default();
-    for arg in std::env::args().skip(1) {
-        match arg.as_str() {
-            // No arguments behaves like `--bar` for now.
-            "--bar" => {}
-            "--debug-state" => opts.debug_state = true,
-            "--restore" => return restore_mode(),
-            other => {
-                eprintln!("vitrobar: unknown argument {other:?}\n{USAGE}");
-                return ExitCode::from(2);
-            }
-        }
-    }
+fn bar_mode(opts: app::Options) -> ExitCode {
+    let Some(_lock) = watchdog::NamedMutex::acquire(watchdog::BAR_MUTEX) else {
+        // A bar already runs: nothing to do (exit 0, so a watchdog that started us ends).
+        return ExitCode::SUCCESS;
+    };
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        // A panic may cross an `extern "system"` frame (and abort): restore before that.
+        shell::restore_after_panic();
+        std::process::exit(101);
+    }));
     match app::run(opts) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -66,5 +86,72 @@ fn main() -> ExitCode {
             eprintln!("vitrobar: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn attach_console() {
+    use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+    // SAFETY: plain call; failing (no parent console) leaves the diagnostics silent.
+    unsafe {
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
+#[cfg(debug_assertions)]
+fn attach_console() {}
+
+enum Mode {
+    Watchdog,
+    Bar,
+    Adopt(u32),
+    Restore,
+}
+
+fn parse_pid(v: Option<String>) -> Option<u32> {
+    v.and_then(|s| s.parse().ok())
+}
+
+fn main() -> ExitCode {
+    let mut mode = Mode::Watchdog;
+    let mut opts = app::Options::default();
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--bar" => mode = Mode::Bar,
+            "--restore" => mode = Mode::Restore,
+            "--adopt" => match parse_pid(args.next()) {
+                Some(pid) => mode = Mode::Adopt(pid),
+                None => {
+                    eprintln!("vitrobar: --adopt needs a process id\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--parent" => match parse_pid(args.next()) {
+                Some(pid) => opts.parent = Some(pid),
+                None => {
+                    eprintln!("vitrobar: --parent needs a process id\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--debug-state" => {
+                opts.debug_state = true;
+                opts.pass_on.push(arg);
+            }
+            "--console" => {
+                attach_console();
+                opts.pass_on.push(arg);
+            }
+            other => {
+                eprintln!("vitrobar: unknown argument {other:?}\n{USAGE}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    match mode {
+        Mode::Watchdog => watchdog::run(&opts.pass_on),
+        Mode::Adopt(pid) => watchdog::adopt(pid, &opts.pass_on),
+        Mode::Restore => restore_mode(),
+        Mode::Bar => bar_mode(opts),
     }
 }

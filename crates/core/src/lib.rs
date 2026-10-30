@@ -5,6 +5,7 @@ pub mod clock;
 pub mod i18n;
 pub mod image;
 pub mod layout;
+pub mod restart;
 pub mod settings;
 pub mod style;
 pub mod tray_model;

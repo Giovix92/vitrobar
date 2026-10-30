@@ -55,12 +55,14 @@ use vitro_win::time_format::clock_now;
 use vitro_win::tray_host::{tray_identity_key, TrayClick, TrayEntry, TrayHost};
 use vitro_win::window_tracker::{WindowEvent, WindowTracker};
 use windows::core::{Error, Result, BOOL};
-use windows::Win32::Foundation::{E_FAIL, HWND, LPARAM, WAIT_FAILED, WAIT_OBJECT_0, WPARAM};
+use windows::Win32::Foundation::{
+    E_FAIL, HANDLE, HWND, LPARAM, WAIT_FAILED, WAIT_OBJECT_0, WPARAM,
+};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::Console::{
     SetConsoleCtrlHandler, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
 };
-use windows::Win32::System::Threading::{GetCurrentThreadId, INFINITE};
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetDoubleClickTime, VK_ESCAPE};
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetForegroundWindow, GetMessagePos, IsWindow, KillTimer,
@@ -83,10 +85,14 @@ use crate::shell::{self, StockGuard};
 use crate::window_set::WindowSet;
 
 /// Command-line options for the bar process.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Options {
     /// Print one `vitrobar-state {json}` line on stderr whenever the bar's content changes.
     pub debug_state: bool,
+    /// The watchdog's pid (`--parent`); watched so a new watchdog can adopt the bar.
+    pub parent: Option<u32>,
+    /// Arguments handed on to a watchdog this bar starts (`--debug-state`, `--console`).
+    pub pass_on: Vec<String>,
 }
 
 /// `WM_MOUSELEAVE` (CommCtrl.h); defined here to avoid pulling in the Controls feature.
@@ -2500,8 +2506,8 @@ impl App {
             MenuChoice::SetIconSize(v) => std::mem::replace(&mut s.icon_size, v) != v,
             MenuChoice::SetPosition(v) => std::mem::replace(&mut s.position, v) != v,
             MenuChoice::ToggleStartWithWindows => {
-                // The Run key itself is written by a later stage; the setting is kept now.
                 s.start_with_windows = !s.start_with_windows;
+                apply_autostart(s.start_with_windows);
                 self.save_settings();
                 return;
             }
@@ -2691,6 +2697,13 @@ impl Drop for ComGuard {
     }
 }
 
+/// Writes (or removes) the `Run\Vitrobar` value to match the setting.
+fn apply_autostart(enabled: bool) {
+    if let Err(e) = vitro_win::autostart::set_autostart(enabled) {
+        eprintln!("vitrobar: could not update \"Start with Windows\": {e}");
+    }
+}
+
 pub fn run(opts: Options) -> Result<()> {
     // SAFETY: plain apartment initialisation of the UI thread; balanced by ComGuard.
     unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()? };
@@ -2698,8 +2711,10 @@ pub fn run(opts: Options) -> Result<()> {
     // SAFETY: plain calls; the handler only posts a message.
     unsafe {
         UI_THREAD.store(GetCurrentThreadId(), Ordering::SeqCst);
-        SetConsoleCtrlHandler(Some(on_console_ctrl), true)?;
+        // Fails harmlessly in a build without a console.
+        let _ = SetConsoleCtrlHandler(Some(on_console_ctrl), true);
     }
+    let mut parent = crate::watchdog::ParentWatch::new(opts.parent, opts.pass_on.clone());
 
     let path = settings_path();
     let mut settings = path.as_deref().map(settings::load).unwrap_or_default();
@@ -2719,17 +2734,25 @@ pub fn run(opts: Options) -> Result<()> {
             }
         }
     }
+    apply_autostart(settings.start_with_windows);
     // Before the bar shows; restored when `app` (or a failing `App::new`) drops it.
     let stock = StockGuard::take_over(settings.stock_taskbar);
+    #[cfg(debug_assertions)]
+    if std::env::var_os("VITROBAR_TEST_PANIC").is_some() {
+        // Test hook (debug builds only): proves the panic hook restores the shell.
+        panic!("VITROBAR_TEST_PANIC");
+    }
     let mut app = App::new(opts, settings, path, stock)?;
     let mut msg = MSG::default();
     'event: loop {
         let removed = app.gpu.removed_event();
-        // SAFETY: the handle stays valid while `app.gpu` lives.
+        let mut handles: Vec<HANDLE> = vec![removed];
+        handles.extend(parent.handle());
+        // SAFETY: the handles stay valid while `app.gpu` and `parent` live.
         let wait = unsafe {
             MsgWaitForMultipleObjectsEx(
-                Some(&[removed]),
-                INFINITE,
+                Some(&handles),
+                parent.timeout_ms(),
                 QS_ALLINPUT,
                 MWMO_INPUTAVAILABLE,
             )
@@ -2741,7 +2764,11 @@ pub fn run(opts: Options) -> Result<()> {
         let mut dirty = Dirty::default();
         if wait == WAIT_OBJECT_0 {
             app.on_device_removed(&mut dirty);
+        } else if handles.len() > 1 && wait.0 == WAIT_OBJECT_0.0 + 1 {
+            parent.on_parent_exit();
         }
+        // Cheap: starts an adopting watchdog only once one is due.
+        parent.tick();
         // SAFETY: standard message pump; boxed window events are reclaimed exactly once.
         while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
             // Everything for the notify window goes through its window procedure, which records

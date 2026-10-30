@@ -197,11 +197,21 @@ fn set_tray_visible(show: bool) {
     for h in tray_windows() {
         // SAFETY: plain calls. Async, so a hung Explorer can never block the caller.
         unsafe {
-            if IsWindowVisible(h).as_bool() != show {
+            // A show is always posted: a hide posted earlier (by a bar that just died, say)
+            // may still be waiting in Explorer's queue while the window reads as visible,
+            // and would land after a skipped show. Explorer handles posts in order.
+            if show || IsWindowVisible(h).as_bool() {
                 let _ = ShowWindowAsync(h, if show { SW_SHOWNA } else { SW_HIDE });
             }
         }
     }
+}
+
+/// Shows every Explorer taskbar window, whether or not a restore record exists. A Vitrobar
+/// that hid them calls this on its way out even when another instance (or a RunOnce
+/// `--restore`) already consumed the record.
+pub fn show_stock_taskbar() {
+    set_tray_visible(true);
 }
 
 fn runonce_command() -> Result<HSTRING> {
@@ -261,12 +271,19 @@ pub fn take_over_stock_taskbar(mode: StockTaskbar, record_path: &Path) -> Result
     if !stock_taskbar_present() {
         return Err(Error::new(E_FAIL, "the stock taskbar is not running"));
     }
-    if !matches!(RestoreRecord::read(record_path), Ok(Some(_))) {
-        RestoreRecord {
-            original_autohide: autohide_now(),
-        }
-        .write(record_path)
-        .map_err(io_err)?;
+    let original = match RestoreRecord::read(record_path) {
+        Ok(Some(_)) => None,
+        Ok(None) => Some(autohide_now()),
+        // A record that cannot be read was left by a run that never restored: the current
+        // auto-hide state is most likely Vitrobar's own "on", so it is no evidence of the
+        // original. Record the Windows default instead.
+        Err(e) if e.kind() == io::ErrorKind::InvalidData => Some(false),
+        Err(e) => return Err(io_err(e)),
+    };
+    if let Some(original_autohide) = original {
+        RestoreRecord { original_autohide }
+            .write(record_path)
+            .map_err(io_err)?;
     }
     set_runonce()?;
     set_autohide(true)?;

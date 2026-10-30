@@ -218,3 +218,31 @@ made-up monitor (deleting the file and posting again removes it; changing its DP
 again re-lays it out). A virtual desktop switch can be simulated by posting `WM_TIMER` with id
 `0x5602` to the same window (a `vitrobar-desktop-switched` line follows). Steps 5 to 8 need a
 person.
+
+## Safety net
+
+Introduced by stage 1, Task 15. `vitrobar.exe` with no arguments is a small watchdog (no
+window, under 2 MB private memory) that starts `vitrobar.exe --bar --parent <pid>`. If the
+bar crashes, the watchdog gives the stock taskbar back at once and starts the bar again; the
+fourth crash within a minute makes it give up, leaving the stock taskbar. If the watchdog
+dies, the bar starts `vitrobar.exe --adopt <bar pid>` a second later. "Start with Windows"
+is the `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\Vitrobar` value. Release builds
+show no console window; add `--console` to see diagnostics in the console that started them.
+
+1. Kill only the bar process:
+   `Get-CimInstance Win32_Process -Filter "Name='vitrobar.exe'" | ? CommandLine -like '*--bar*' | % { Stop-Process -Id $_.ProcessId -Force }`
+   → the stock taskbar appears at once (well under 1 s), Vitrobar comes back within 2 s and
+   hides it again; tray icons return to Vitrobar.
+2. Kill the bar 4 times within a minute → after the fourth the stock taskbar stays (both
+   monitors, auto-hide back as it was) and no `vitrobar.exe` is left running.
+3. Task Manager › Details › `vitrobar.exe` (the one without `--bar`) › End process tree →
+   nothing starts again; the taskbar may stay hidden until the next sign-in. Sign out and in:
+   the stock taskbar is normal, auto-hide as originally set (the RunOnce `--restore` ran),
+   and `HKCU\...\RunOnce\VitrobarRestore` and `%LOCALAPPDATA%\Vitrobar\restore.json` are gone.
+4. Launch `vitrobar.exe` twice → only one bar (the second launch exits at once).
+5. Bar menu › "Start with Windows" off → the `Run\Vitrobar` value is removed; on again → it
+   is `"<path to vitrobar.exe>"`. Sign in with it on: Vitrobar starts by itself.
+6. Kill only the watchdog: about a second later a `vitrobar.exe --adopt <bar pid>` is
+   running; killing the bar then still brings the stock taskbar back and the bar again.
+7. With Vitrobar running, run `vitrobar.exe --restore` → it does nothing (the taskbar stays
+   Vitrobar's; Vitrobar's own exit later restores it).
