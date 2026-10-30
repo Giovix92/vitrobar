@@ -127,6 +127,12 @@ the overflow behind the chevron. Use a few real tray apps (Discord, Steam, OneDr
 6. Exit Vitrobar (and, separately, End task + `vitrobar.exe --restore`): the stock taskbar's
    tray shows every icon again, and no window of class `Shell_TrayWnd` belongs to a Vitrobar
    process.
+7. While Vitrobar runs (its `Shell_TrayWnd` is the one `FindWindow` finds), the bar's strip is
+   still reserved: a maximized window stops at the bar in Pill (reserve on), Islands and Full,
+   at the bottom and at the top, and after every live change of shape or position. Appbar calls
+   with a rectangle carry a shared block that only the process owning the found
+   `Shell_TrayWnd` can open, so the host re-allocates it for Explorer (a regression here shows
+   as the work area not following the bar).
 
 Automated where safe:
 
@@ -134,6 +140,9 @@ Automated where safe:
   `Shell_NotifyIconW` Add / SetVersion / Delete reach the host within 1 s, clicks arrive with
   the version-4 packing, a dead owner is swept, `FindWindow` finds ours while it runs and
   Explorer's afterwards, and appbar calls still get Explorer's answer.
+- `cargo test -p vitro-win --test tray appbar -- --ignored --test-threads=1` (step 7): an
+  appbar registered while the host runs takes exactly its reserved px off `SPI_GETWORKAREA`
+  (bottom 80, then 120, after a re-registration, at the top 64) and gives them back on removal.
 - Steps 1, 2, 3 and 5 with a tray app of your own (a PowerShell `NotifyIcon` that logs its
   clicks) driven against `vitrobar.exe --debug-state` (the `tray`, `overflow` and `tooltip`
   fields). Only ever click the test app's own icon: clicks are forwarded to real apps.

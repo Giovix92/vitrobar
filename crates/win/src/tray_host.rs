@@ -11,6 +11,8 @@
 //!   `WM_USER`..`WM_APP` range) is forwarded synchronously to Explorer's real `Shell_TrayWnd`,
 //!   so Explorer keeps exactly the state it would have without Vitrobar. Appbar and other
 //!   non-tray copies get Explorer's answer; tray copies get ours (from [`TrayModel::apply`]).
+//!   Appbar calls that pass a rectangle travel in a shared block valid only in the process that
+//!   owns the `Shell_TrayWnd` found (us): it is re-allocated for Explorer (`forward_appbar`).
 //! - When the host goes away, its window is destroyed first and `TaskbarCreated` is then
 //!   posted to every top-level window, so every app registers its icons again with whatever
 //!   `Shell_TrayWnd` is left: Explorer's.
@@ -31,13 +33,17 @@ use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread::JoinHandle;
 
+use vitro_core::appbar_wire::{
+    is_appbar_data, parse_appbar_copydata, with_shared_block, APPBAR_COPYDATA_ID, APPBAR_DATA_SIZE,
+};
 use vitro_core::tray_model::{tray_key, TrayIcon, TrayModel};
 use vitro_core::tray_wire::{parse_tray_copydata, TrayMessage, TrayOp, TRAY_COPYDATA_ID};
 use windows::core::{w, Error, Result, BOOL, PCWSTR};
-use windows::Win32::Foundation::{E_FAIL, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{E_FAIL, HANDLE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentProcessId;
+use windows::Win32::UI::Shell::{SHAllocShared, SHFreeShared, SHLockShared, SHUnlockShared};
 use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, ChangeWindowMessageFilterEx, CopyIcon, CreateWindowExW,
     DefWindowProcW, DestroyIcon, DestroyWindow, DispatchMessageW, EnumWindows, GetMessageW,
@@ -202,12 +208,23 @@ fn pid_of(h: HWND) -> u32 {
 /// `lparam` must be valid for `msg` as received by the host window (for `WM_COPYDATA`, a
 /// `COPYDATASTRUCT` that the system keeps valid while the message is being handled).
 unsafe fn forward(own: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    let Some(target) = explorer_tray_window() else {
+    let Some(target) = explorer_target(own) else {
         return LRESULT(0);
     };
-    if target == own || pid_of(target) == own_pid() {
-        return LRESULT(0);
-    }
+    // SAFETY: as required by this function.
+    unsafe { deliver(target, msg, wparam, lparam) }.unwrap_or(LRESULT(0))
+}
+
+/// Explorer's `Shell_TrayWnd`, never one of ours.
+fn explorer_target(own: HWND) -> Option<HWND> {
+    explorer_tray_window().filter(|&t| t != own && pid_of(t) != own_pid())
+}
+
+/// Sends (or posts) one message to `target`; `None` when a send failed or timed out.
+///
+/// # Safety
+/// As for [`forward`].
+unsafe fn deliver(target: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
     // SAFETY: plain query about the message being handled. Anything but ISMEX_NOSEND (0) was
     // sent (SendMessage, SendNotifyMessage, SendMessageCallback).
     let sent = unsafe { InSendMessageEx(None) } != 0 || msg == WM_COPYDATA;
@@ -229,16 +246,89 @@ unsafe fn forward(own: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESUL
                 Some(&mut result),
             )
         };
-        if ok.0 == 0 {
-            return LRESULT(0);
-        }
-        LRESULT(result as isize)
+        (ok.0 != 0).then_some(LRESULT(result as isize))
     } else {
         // SAFETY: posting carries the values on unchanged, as they came to us.
         unsafe {
             let _ = PostMessageW(Some(target), msg, wparam, lparam);
         }
-        LRESULT(0)
+        Some(LRESULT(0))
+    }
+}
+
+/// Forwards an `SHAppBarMessage` copy that carries a shared block (`ABM_QUERYPOS`,
+/// `ABM_SETPOS` and the other calls that pass a rectangle), or returns `None` for the caller
+/// to forward it unchanged.
+///
+/// shell32 allocates that block for the process that owns the `Shell_TrayWnd` it found, and
+/// that is us: the block's handle is valid only here (`dwProcId` names this process; for a
+/// caller in this process it is not even a handle). Forwarded as it is, Explorer answers TRUE
+/// but neither takes the requested rectangle nor writes its answer back (measured: the work
+/// area stays as it was), so no appbar (ours, Explorer's own secondary taskbars, any other
+/// app's) gets its strip of the work area while the host runs. So the request is copied into
+/// a block allocated for Explorer, exactly as shell32 does when Explorer's window is the one
+/// found, and Explorer's answer is copied back into the caller's block before we reply.
+///
+/// # Safety
+/// `data` and `wparam` are those of the `WM_COPYDATA` being handled.
+unsafe fn forward_appbar(own: HWND, wparam: WPARAM, data: &[u8]) -> Option<LRESULT> {
+    let call = parse_appbar_copydata(data).filter(|c| c.shared != 0)?;
+    let Some(target) = explorer_target(own) else {
+        return Some(LRESULT(0));
+    };
+    let explorer = pid_of(target);
+    // SAFETY: shlwapi's shared-memory calls, used as SHAppBarMessage uses them: each lock is
+    // paired with an unlock, only APPBAR_DATA_SIZE bytes are read or written through a view
+    // checked to hold an APPBARDATA3264 (shell32 allocates exactly that), and the block made
+    // for Explorer is freed once Explorer answered.
+    unsafe {
+        let src = SHLockShared(HANDLE(call.shared as usize as *mut c_void), call.proc_id);
+        if src.is_null() {
+            return None;
+        }
+        let mut abd = [0u8; APPBAR_DATA_SIZE];
+        std::ptr::copy_nonoverlapping(src as *const u8, abd.as_mut_ptr(), APPBAR_DATA_SIZE);
+        if !is_appbar_data(&abd) {
+            let _ = SHUnlockShared(src);
+            return None;
+        }
+        let block = SHAllocShared(
+            Some(abd.as_ptr() as *const c_void),
+            APPBAR_DATA_SIZE as u32,
+            explorer,
+        );
+        if block.is_invalid() {
+            let _ = SHUnlockShared(src);
+            return None;
+        }
+        let Some(mut payload) = with_shared_block(data, block.0 as usize as u64, explorer) else {
+            let _ = SHUnlockShared(src);
+            let _ = SHFreeShared(block, explorer);
+            return None;
+        };
+        let cds = COPYDATASTRUCT {
+            dwData: APPBAR_COPYDATA_ID,
+            cbData: payload.len() as u32,
+            lpData: payload.as_mut_ptr() as *mut c_void,
+        };
+        let answer = deliver(
+            target,
+            WM_COPYDATA,
+            wparam,
+            LPARAM(&cds as *const COPYDATASTRUCT as isize),
+        );
+        if answer.is_some() {
+            let back = SHLockShared(block, explorer);
+            if !back.is_null() {
+                std::ptr::copy_nonoverlapping(back as *const u8, src as *mut u8, APPBAR_DATA_SIZE);
+                let _ = SHUnlockShared(back);
+            }
+            let _ = SHFreeShared(block, explorer);
+        }
+        // On a timeout Explorer may still handle the message later: the block is left to it
+        // (one 40-byte section handle in Explorer), never freed under it.
+        let _ = SHUnlockShared(src);
+        Some(answer.unwrap_or(LRESULT(0)))
     }
 }
 
@@ -335,7 +425,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 // give up on an icon that is perfectly alive in the bar.
                 LRESULT(ours as isize)
             } else {
-                // Appbar calls (0), icon-rect queries (3) and anything newer: Explorer answers.
+                if id == APPBAR_COPYDATA_ID {
+                    // SAFETY: `data` and `wparam` of the message being handled.
+                    if let Some(answer) = unsafe { forward_appbar(hwnd, wparam, data) } {
+                        return answer;
+                    }
+                }
+                // Other appbar calls (0), icon-rect queries (3) and anything newer: Explorer
+                // answers.
                 // SAFETY: the message as we received it.
                 unsafe { forward(hwnd, msg, wparam, lparam) }
             }

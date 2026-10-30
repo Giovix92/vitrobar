@@ -1,5 +1,6 @@
 //! vitro-core
 
+pub mod appbar_wire;
 pub mod clock;
 pub mod i18n;
 pub mod image;

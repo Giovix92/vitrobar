@@ -259,3 +259,91 @@ fn notify_icon_calls_reach_the_host_and_explorer_keeps_its_own() {
     assert_eq!(first, explorer, "FindWindow finds Explorer's again");
     assert_eq!(autohide_now(), autohide);
 }
+
+fn work_area() -> (i32, i32, i32, i32) {
+    use windows::Win32::Foundation::RECT;
+    let mut r = RECT::default();
+    // SAFETY: SPI_GETWORKAREA writes one RECT to the local.
+    unsafe {
+        SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            Some(&mut r as *mut RECT as *mut _),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+        .unwrap()
+    };
+    (r.left, r.top, r.right, r.bottom)
+}
+
+fn eventually_wa(want: impl Fn((i32, i32, i32, i32)) -> bool) -> (i32, i32, i32, i32) {
+    let end = Instant::now() + Duration::from_secs(2);
+    loop {
+        pump_for(20);
+        let wa = work_area();
+        if want(wa) || Instant::now() > end {
+            return wa;
+        }
+    }
+}
+
+#[test]
+#[ignore = "takes over the Shell_TrayWnd name for the whole desktop"]
+fn appbar_reserves_the_work_area_while_the_host_runs() {
+    use vitro_core::settings::Position;
+    use vitro_win::appbar::AppBar;
+    use vitro_win::monitors::list_monitors;
+    use windows::Win32::UI::HiDpi::{
+        SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    };
+    // Physical pixels, as the app (Per-Monitor-V2) sees them.
+    // SAFETY: plain call; fails harmlessly if the awareness is already set.
+    let _ = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+    let mon = list_monitors()
+        .into_iter()
+        .find(|m| m.primary)
+        .expect("a primary monitor")
+        .rect_px;
+    let before = work_area();
+    let bar = Owned::new();
+    let notify = Owned::new();
+
+    // Control: the same calls straight to Explorer.
+    {
+        let _ab = AppBar::register(bar.0, Position::Bottom, mon, 80).unwrap();
+        let wa = eventually_wa(|w| w.3 == before.3 - 80);
+        eprintln!("without host: before {before:?} with appbar {wa:?}");
+        assert_eq!(wa.3, before.3 - 80, "control without the host");
+    }
+    eventually_wa(|w| w == before);
+
+    let host = TrayHost::start(notify.0).unwrap();
+    // SAFETY: plain query.
+    let first = unsafe { FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()) }.unwrap();
+    assert_eq!(first, host.hwnd(), "SHAppBarMessage goes through the host");
+    {
+        let mut ab = AppBar::register(bar.0, Position::Bottom, mon, 80).unwrap();
+        let wa = eventually_wa(|w| w.3 == before.3 - 80);
+        eprintln!("with host: registered {wa:?}");
+        assert_eq!(wa.3, before.3 - 80, "ABM_NEW + ABM_SETPOS through the host");
+        ab.update(Position::Bottom, mon, 120);
+        let wa = eventually_wa(|w| w.3 == before.3 - 120);
+        assert_eq!(wa.3, before.3 - 120, "a thicker strip through the host");
+        ab.reregister().unwrap();
+        let wa = eventually_wa(|w| w.3 == before.3 - 120);
+        assert_eq!(wa.3, before.3 - 120, "re-registered (TaskbarCreated path)");
+        drop(ab);
+        let wa = eventually_wa(|w| w == before);
+        assert_eq!(
+            wa, before,
+            "ABM_REMOVE through the host gives the strip back"
+        );
+        let mut ab = AppBar::register(bar.0, Position::Top, mon, 64).unwrap();
+        let wa = eventually_wa(|w| w.1 == before.1 + 64);
+        assert_eq!(wa.1, before.1 + 64, "top edge through the host");
+        ab.update(Position::Top, mon, 64);
+    }
+    eventually_wa(|w| w == before);
+    drop(host);
+    assert_eq!(eventually_wa(|w| w == before), before);
+}
