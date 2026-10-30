@@ -284,11 +284,33 @@ fn in_app_data(path: &str, profile: &str) -> bool {
     path.to_lowercase().starts_with(&root)
 }
 
+/// Folders whose files are never what the user searches for (case-insensitive): dependency,
+/// repository, app-data and recycle-bin folders, and Python environments and caches
+/// (thousands of library files nobody opens from Start).
+const NOISE_DIRS: &[&str] = &[
+    r"\node_modules\",
+    r"\.git\",
+    r"\appdata\",
+    r"\$recycle.bin\",
+    r"\site-packages\",
+    r"\.venv\",
+    r"\__pycache__\",
+];
+
+/// Whether `path` lies in one of the [`NOISE_DIRS`].
+fn is_noise(path: &str) -> bool {
+    let p = path.to_lowercase();
+    NOISE_DIRS.iter().any(|d| p.contains(d))
+}
+
 /// A search result that is an existing regular file the user would look for: folders,
 /// items without a file system path, hidden or system files and anything in `AppData` are
 /// skipped. A `.zip`, which the shell treats as a folder, counts as a file.
 fn file_hit(item: &IShellItem) -> Option<FileHit> {
     let path = item_name(item, SIGDN_FILESYSPATH)?;
+    if is_noise(&path) {
+        return None;
+    }
     let profile = std::env::var("USERPROFILE").unwrap_or_default();
     if !profile.is_empty() && in_app_data(&path, &profile) {
         return None;
@@ -334,6 +356,27 @@ mod tests {
         ));
         assert!(!in_app_data(r"C:\Users\Ann\Documents\AppData.txt", profile));
         assert!(!in_app_data(r"C:\Users\Ann\AppDataX\x.txt", profile));
+    }
+
+    #[test]
+    fn noise_folders_are_skipped() {
+        for p in [
+            r"C:\Users\Ann\code\app\node_modules\x\index.js",
+            r"C:\Users\Ann\code\app\.GIT\config",
+            r"D:\data\AppData\Local\x.txt",
+            r"C:\$Recycle.Bin\S-1-5\x.txt",
+            r"C:\Users\Ann\proj\.venv\Lib\site-packages\numpy\x.py",
+            r"C:\Users\Ann\proj\src\__pycache__\x.pyc",
+        ] {
+            assert!(is_noise(p), "{p}");
+        }
+        for p in [
+            r"C:\Users\Ann\Documents\node_modules.txt",
+            r"C:\Users\Ann\Documents\my.git\notes.txt",
+            r"C:\Users\Ann\Documents\report.docx",
+        ] {
+            assert!(!is_noise(p), "{p}");
+        }
     }
 
     #[test]

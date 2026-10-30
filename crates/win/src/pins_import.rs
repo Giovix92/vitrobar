@@ -331,7 +331,7 @@ impl Drop for Key {
     }
 }
 
-fn known_folder_path(guid: &str) -> Option<String> {
+pub(crate) fn known_folder_path(guid: &str) -> Option<String> {
     let id = parse_guid(guid)?;
     // SAFETY: `id` is a local GUID; the returned string is ours to free with CoTaskMemFree.
     unsafe {

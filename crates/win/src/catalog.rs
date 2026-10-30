@@ -8,14 +8,15 @@ use std::time::SystemTime;
 
 use vitro_core::search::fold;
 use vitro_core::settings::Pin;
-use windows::core::{HSTRING, PCWSTR};
+use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::System::Com::{CoTaskMemFree, IBindCtx};
+use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 use windows::Win32::UI::Shell::{
     BHID_EnumItems, IEnumShellItems, IShellItem, SHCreateItemFromParsingName, SIGDN,
     SIGDN_NORMALDISPLAY, SIGDN_PARENTRELATIVEPARSING,
 };
 
-use crate::pins_import::read_link;
+use crate::pins_import::{known_folder_path, read_link};
 
 /// One recently opened file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +110,73 @@ pub fn list_all_apps() -> Vec<Pin> {
         }
     }
     dedupe_and_sort(apps)
+}
+
+/// Whether Windows keeps recently opened files (Settings › Personalization › Start ›
+/// "Show recently opened items": `Start_TrackDocs`, on when absent). When off, the Start
+/// panel shows no recent files and does not read the Recent folder.
+pub fn recent_docs_enabled() -> bool {
+    let mut value: u32 = 1;
+    let mut size = size_of::<u32>() as u32;
+    // SAFETY: `value` and `size` are locals passed with their sizes.
+    let err = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!(r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"),
+            w!("Start_TrackDocs"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut value as *mut u32 as *mut _),
+            Some(&mut size),
+        )
+    };
+    err.is_err() || value != 0
+}
+
+/// The file system path behind an `AppsFolder` parsing name, when it is one: an absolute
+/// path (`C:\...`) or a known folder followed by a path (`{GUID}\rest`). AUMIDs give `None`.
+fn parsing_name_path(name: &str, known: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let b = name.as_bytes();
+    if b.len() > 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\' {
+        return Some(name.to_string());
+    }
+    let (guid, rest) = name.split_once('\\')?;
+    if !guid.starts_with('{') || rest.is_empty() {
+        return None;
+    }
+    let root = known(guid)?;
+    Some(format!("{}\\{}", root.trim_end_matches('\\'), rest))
+}
+
+/// Where a pin's program lives, for "Open file location": its shortcut, its executable, or
+/// the path behind its `AppsFolder` parsing name. `None` for packaged apps.
+pub fn file_location(p: &Pin) -> Option<String> {
+    let some = |v: &Option<String>| v.as_deref().filter(|s| !s.is_empty()).map(str::to_owned);
+    some(&p.link)
+        .or_else(|| some(&p.path))
+        .or_else(|| parsing_name_path(p.aumid.as_deref()?, known_folder_path))
+}
+
+/// The bar pin for an `AppsFolder` entry (see [`list_all_apps`]): a desktop program whose
+/// parsing name is a path becomes a path pin (the bar groups and launches those by their
+/// executable); a real AUMID stays an AUMID pin. Other pins are returned unchanged.
+pub fn bar_pin(p: &Pin) -> Pin {
+    if p.link.is_some() || p.path.is_some() {
+        return p.clone();
+    }
+    match p
+        .aumid
+        .as_deref()
+        .and_then(|a| parsing_name_path(a, known_folder_path))
+    {
+        Some(path) => Pin {
+            aumid: None,
+            path: Some(path),
+            name: p.name.clone(),
+            link: None,
+        },
+        None => p.clone(),
+    }
 }
 
 fn recent_folder() -> Option<PathBuf> {
@@ -250,6 +318,42 @@ mod tests {
             name: name.into(),
             link: None,
         }
+    }
+
+    #[test]
+    fn parsing_names_that_are_paths() {
+        let known = |g: &str| (g == "{AAAA}").then(|| "C:\\Program Files\\".to_string());
+        assert_eq!(
+            parsing_name_path(r"C:\Tools\x.exe", known).as_deref(),
+            Some(r"C:\Tools\x.exe")
+        );
+        assert_eq!(
+            parsing_name_path(r"{AAAA}\App\app.exe", known).as_deref(),
+            Some(r"C:\Program Files\App\app.exe")
+        );
+        assert_eq!(parsing_name_path(r"{BBBB}\App\app.exe", known), None);
+        assert_eq!(
+            parsing_name_path("Microsoft.Paint_8wekyb3d8bbwe!App", known),
+            None
+        );
+        assert_eq!(parsing_name_path("Chrome", known), None);
+    }
+
+    #[test]
+    fn bar_pin_keeps_aumids_and_resolves_paths() {
+        let packaged = pin("Paint", "Microsoft.Paint_8wekyb3d8bbwe!App");
+        assert_eq!(bar_pin(&packaged), packaged);
+        let desktop = pin("Tool", r"C:\Tools\tool.exe");
+        let b = bar_pin(&desktop);
+        assert_eq!(
+            (b.aumid, b.path.as_deref()),
+            (None, Some(r"C:\Tools\tool.exe"))
+        );
+        assert_eq!(
+            file_location(&desktop).as_deref(),
+            Some(r"C:\Tools\tool.exe")
+        );
+        assert_eq!(file_location(&packaged), None);
     }
 
     #[test]

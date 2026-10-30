@@ -98,6 +98,26 @@ pub fn shell_open(file: &HSTRING) -> Result<()> {
     unsafe { ShellExecuteExW(&mut info) }
 }
 
+/// Opens an Explorer window on the folder holding `path`, with the item selected ("Open file
+/// location"). Blocking; needs COM initialised on the calling thread.
+pub fn reveal_in_folder(path: &str) -> Result<()> {
+    if path.is_empty() || path.contains('"') {
+        return Err(Error::from(E_INVALIDARG));
+    }
+    let params = HSTRING::from(format!("/select,\"{path}\""));
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_FLAG_NO_UI | SEE_MASK_NOASYNC,
+        lpVerb: w!("open"),
+        lpFile: w!("explorer.exe"),
+        lpParameters: PCWSTR(params.as_ptr()),
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
+    // SAFETY: `info` and the strings it points to outlive the call.
+    unsafe { ShellExecuteExW(&mut info) }
+}
+
 /// Restores the window if minimized, then brings it to the foreground. The click on the
 /// bar gave this process the right to set the foreground window. Returns whether
 /// `SetForegroundWindow` reported success.
@@ -220,6 +240,12 @@ mod tests {
     fn cancelled_is_the_hresult_shell_execute_reports() {
         // ShellExecuteEx fails with HRESULT_FROM_WIN32(ERROR_CANCELLED) when UAC is declined.
         assert_eq!(ERROR_CANCELLED.to_hresult().0 as u32, 0x8007_04C7);
+    }
+
+    #[test]
+    fn reveal_refuses_empty_and_quoted_paths() {
+        assert!(reveal_in_folder("").is_err());
+        assert!(reveal_in_folder("a\"b").is_err());
     }
 
     #[test]

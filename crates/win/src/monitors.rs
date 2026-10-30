@@ -1,9 +1,10 @@
 //! Display monitors in physical pixels (the process is Per-Monitor-V2 DPI aware).
 
 use windows::core::BOOL;
-use windows::Win32::Foundation::{LPARAM, RECT};
+use windows::Win32::Foundation::{LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
+    EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, HDC, HMONITOR, MONITORINFO,
+    MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::MONITORINFOF_PRIMARY;
@@ -68,6 +69,31 @@ unsafe extern "system" fn collect(hmon: HMONITOR, _: HDC, _: *mut RECT, data: LP
 /// The [`MonitorInfo::id`] of a monitor handle (what `WindowInfo::monitor` holds).
 pub fn monitor_id(hmon: HMONITOR) -> Option<u64> {
     info(hmon).map(|m| m.id)
+}
+
+/// The work area (the monitor minus the space appbars reserve) of the monitor whose
+/// rectangle is `rect_px`, in physical px. A made-up monitor (or one that went away) has no
+/// work area of its own: its whole rectangle is returned.
+pub fn work_area_px(rect_px: (i32, i32, i32, i32)) -> (i32, i32, i32, i32) {
+    let (l, t, r, b) = rect_px;
+    let centre = POINT {
+        x: l + (r - l) / 2,
+        y: t + (b - t) / 2,
+    };
+    let mut mi = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: plain queries; `mi` is a sized local.
+    let ok =
+        unsafe { GetMonitorInfoW(MonitorFromPoint(centre, MONITOR_DEFAULTTONEAREST), &mut mi) };
+    let w = mi.rcWork;
+    let inside = w.left >= l && w.top >= t && w.right <= r && w.bottom <= b;
+    if ok.as_bool() && inside && w.right > w.left && w.bottom > w.top {
+        (w.left, w.top, w.right, w.bottom)
+    } else {
+        rect_px
+    }
 }
 
 /// Device name of the monitor [`parse_monitor_spec`] makes up (never a real GDI name).
@@ -143,6 +169,20 @@ mod tests {
         ] {
             assert_eq!(parse_monitor_spec(bad), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn work_area_lies_inside_its_monitor() {
+        for m in list_monitors() {
+            let w = work_area_px(m.rect_px);
+            let r = m.rect_px;
+            assert!(
+                w.0 >= r.0 && w.1 >= r.1 && w.2 <= r.2 && w.3 <= r.3,
+                "{w:?} {r:?}"
+            );
+        }
+        let fake = (100_000, 0, 101_000, 1000);
+        assert_eq!(work_area_px(fake), fake);
     }
 
     #[test]
