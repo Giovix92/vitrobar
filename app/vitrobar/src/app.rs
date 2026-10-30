@@ -16,7 +16,7 @@ use vitro_core::style::{hover_style, material_style, HoverStyle, MaterialStyle, 
 use vitro_core::windows_model::{
     build_groups, click_action, AppGroup, ClickAction, GroupKey, Hwnd,
 };
-use vitro_render::bar_visual::{BarVisual, ItemState, VisualEnv};
+use vitro_render::bar_visual::{hover_timing, BarVisual, ItemState, VisualEnv};
 use vitro_render::compositor::{init_compositor, Comp};
 use vitro_render::device::{create_gpu_device, GpuDevice};
 use vitro_render::flyout::{live_thumbnails, Flyout, ThumbnailStrip};
@@ -851,7 +851,7 @@ impl App {
             SetTimer(
                 Some(self.notify.hwnd),
                 TIMER_MARGIN_COLLAPSE,
-                self.hover_style.duration_ms.max(1),
+                hover_timing(&self.hover_style).0.max(1),
                 None,
             )
         };
