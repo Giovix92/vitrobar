@@ -30,10 +30,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use vitro_core::clock::ms_until_next_minute;
-use vitro_core::i18n::{lang_from_tag, Lang};
+use vitro_core::i18n::{lang_from_tag, tr, Key, Lang};
 use vitro_core::image::BgraImage;
 use vitro_core::layout::{compute_layout, diff_monitors, metrics, BarLayout, LayoutInput, Rect};
+use vitro_core::search::ResultKind;
 use vitro_core::settings::{self, Pin, Position, Settings, ThemeChoice};
+use vitro_core::start_layout::{panel_layout, place_panel};
 use vitro_core::style::{hover_style, material_style, HoverStyle, MaterialStyle, Rgba, Theme};
 use vitro_core::tray_model::{split_promoted, TrayIcon};
 use vitro_core::windows_model::{
@@ -45,12 +47,14 @@ use vitro_render::bar_visual::{
 use vitro_render::compositor::{init_compositor, Comp};
 use vitro_render::device::{create_gpu_device, GpuDevice};
 use vitro_render::flyout::{live_thumbnails, take_deactivated, Flyout, ThumbnailStrip};
+use vitro_render::panel::take_panel_deactivated;
 use vitro_render::surfaces::{FontKind, Painter};
 use vitro_render::tray_flyout::{grid_layout, Tooltip, TrayGrid};
 use vitro_win::appbar::{is_fullscreen_on_rect, reserved_rect, AppBar};
+use vitro_win::catalog::{bar_pin, file_location};
 use vitro_win::desktops::Desktops;
 use vitro_win::launch::{activate_window, close_window, minimize_window, open_stock_start};
-use vitro_win::monitors::{list_monitors, parse_monitor_spec, MonitorInfo};
+use vitro_win::monitors::{list_monitors, parse_monitor_spec, work_area_px, MonitorInfo};
 use vitro_win::pins_import::{import_promoted_tray, import_windows_pins};
 use vitro_win::system_theme::{read_system_theme, user_ui_language_tag, SystemTheme};
 use vitro_win::time_format::clock_now;
@@ -64,13 +68,17 @@ use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTME
 use windows::Win32::System::Console::{
     SetConsoleCtrlHandler, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
 };
+use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::Threading::GetCurrentThreadId;
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetDoubleClickTime, VK_ESCAPE};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetDoubleClickTime, GetKeyState, VK_CONTROL, VK_ESCAPE, VK_F4, VK_MENU,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetForegroundWindow, GetMessagePos, IsWindow, KillTimer,
     MsgWaitForMultipleObjectsEx, PeekMessageW, PostMessageW, PostQuitMessage, PostThreadMessageW,
-    SetTimer, TranslateMessage, MSG, MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT, WM_KEYDOWN,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NULL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    SetTimer, TranslateMessage, MSG, MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT, WM_CHAR,
+    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NULL, WM_QUIT,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
 };
 
 use crate::bar_window::{
@@ -78,12 +86,15 @@ use crate::bar_window::{
 };
 use crate::icon_loader::{IconLoader, IconSrc, Lookup, TrayImage, MAX_ICON_PX};
 use crate::launcher::{Job, Launcher};
-use crate::menus::{app_menu, bar_menu, MenuChoice};
+use crate::menus::{app_menu, bar_menu, power_menu, start_item_menu, MenuChoice};
 use crate::notify::{
     inbox_pending, take_inbox, Inbox, NotifyWindow, TIMER_CLOCK, TIMER_GPU_RETRY, TIMER_HOVER_HIDE,
     TIMER_HOVER_SHOW, TIMER_MARGIN_COLLAPSE, TIMER_REASSERT, TIMER_TRAY_TIP, WM_APP_TAKE_OVER,
 };
 use crate::shell::{self, StockGuard};
+use crate::start::{
+    launch_job, same_app, Look, MenuItem, StartAction, StartData, StartInput, StartPanel,
+};
 use crate::window_set::WindowSet;
 
 /// Command-line options for the bar process.
@@ -123,6 +134,10 @@ const TRAY_TIP_MS: u32 = 500;
 /// it). Honoured only together with `--debug-state` (ruling R13): an environment variable
 /// alone never changes a normal run. Unset in normal use.
 const FAKE_MONITOR_ENV: &str = "VITROBAR_FAKE_MONITOR";
+
+/// Debug hook for live tests of the Start panel's power menu: `1` makes every power action a
+/// dry run (recorded, never carried out). Honoured only together with `--debug-state`.
+const POWER_DRY_RUN_ENV: &str = "VITROBAR_POWER_DRY_RUN";
 
 /// The monitors bars belong on: the real ones (primary first), plus the debug hook's when
 /// `debug_state` (`--debug-state`) is on.
@@ -492,6 +507,10 @@ struct App {
     tooltip: Option<Tooltip>,
     overflow: Option<Overflow>,
     strip: Option<Strip>,
+    /// The open Start panel (its visuals and window go before the compositor and GPU).
+    start: Option<StartPanel>,
+    /// What the Start panel shows, cached across opens, and its worker threads.
+    start_data: StartData,
     /// One per monitor, in [`current_monitors`] order: the first carries the tray area.
     monitors: Vec<MonitorBar>,
     tracker: WindowTracker,
@@ -558,6 +577,11 @@ struct App {
     /// Last left click on a tray icon, to tell a double click.
     last_left: Option<(TrayId, Instant)>,
     last_dump: String,
+    /// The high half of a character typed into the Start panel as two `WM_CHAR`s.
+    surrogate: Option<u16>,
+    /// Time stamp (`MSG::time`, the `GetTickCount` clock) of the input being handled: the
+    /// Start panel's open time is measured from it.
+    input_time: u32,
 }
 
 impl App {
@@ -571,6 +595,8 @@ impl App {
         let comp = init_compositor()?;
         let gpu = create_gpu_device(&comp)?;
         let painter = Painter::new(&gpu)?;
+        // Carry 11: digits, shaping and line breaking follow the Windows display language.
+        painter.set_locale(&user_ui_language_tag().unwrap_or_else(|| "en-US".into()));
         let monitors: Vec<MonitorBar> = current_monitors(opts.debug_state)
             .into_iter()
             .enumerate()
@@ -595,6 +621,8 @@ impl App {
             tooltip: None,
             overflow: None,
             strip: None,
+            start: None,
+            start_data: StartData::new(),
             monitors,
             tracker,
             icons,
@@ -637,6 +665,8 @@ impl App {
             msg_pt: (0, 0),
             last_left: None,
             last_dump: String::new(),
+            surrogate: None,
+            input_time: 0,
         };
         app.tick_clock();
         // Show the bars before the (slower) first window enumeration.
@@ -847,11 +877,14 @@ impl App {
         items
     }
 
-    /// Keeps the icon cache bounded to what some bar (or the tray) still shows.
+    /// Keeps the icon cache bounded to what some bar (or the tray, or the open Start panel)
+    /// still shows.
     fn trim_icons(&mut self) {
         let monitors = &self.monitors;
+        let start = self.start.as_ref().map(|s| &s.icon_srcs);
         self.icons.trim(|src| {
             matches!(src, IconSrc::Tray(_))
+                || start.is_some_and(|s| s.contains(src))
                 || monitors
                     .iter()
                     .any(|m| m.groups.iter().any(|g| icon_sources(g).contains(src)))
@@ -1098,6 +1131,7 @@ impl App {
     /// Explorer restarted: hide its new taskbar, register the appbars with the new shell and
     /// reconnect to its virtual desktop manager.
     fn on_taskbar_created(&mut self, dirty: &mut Dirty) {
+        self.close_start();
         self.stock.on_taskbar_created();
         // The old manager is a proxy into the Explorer that just ended: every query on it
         // would fail open (every window "on the current desktop") until the next restart.
@@ -1142,6 +1176,9 @@ impl App {
             if tray {
                 self.close_overflow();
                 self.set_tip_target(None);
+            }
+            if self.start.as_ref().is_some_and(|s| s.monitor == id) {
+                self.close_start();
             }
             if self.cur == id {
                 self.cancel_show();
@@ -1429,8 +1466,10 @@ impl App {
             st.shape, st.material, st.hover, st.icon_size, st.position, st.start_with_windows
         );
         let pins: Vec<String> = st.pins.iter().map(|p| json_str(&p.name)).collect();
+        let start = self.dump_start();
         let dump = format!(
-            "{{\"settings\":{},\"pins\":[{}],\"tray_host\":{},\"chevron\":{},\"tray\":[{}],\"overflow\":{},\"tooltip\":{},\"fullscreen\":{},\"stock_taken\":{},\"appbar\":{},\"hover\":{},\"strip\":{},\"live_thumbnails\":{},\"bars\":[{}],\"groups\":{},\"shown\":{},\"start\":{},\"quick\":{},\"clock\":{},\"clock_text\":{},\"more\":{},\"apps\":[{}],\"cur\":{},\"monitors\":[{}]}}",
+            "{{\"start\":{},\"settings\":{},\"pins\":[{}],\"tray_host\":{},\"chevron\":{},\"tray\":[{}],\"overflow\":{},\"tooltip\":{},\"fullscreen\":{},\"stock_taken\":{},\"appbar\":{},\"hover\":{},\"strip\":{},\"live_thumbnails\":{},\"bars\":[{}],\"groups\":{},\"shown\":{},\"start_button\":{},\"quick\":{},\"clock\":{},\"clock_text\":{},\"more\":{},\"apps\":[{}],\"cur\":{},\"monitors\":[{}]}}",
+            start,
             settings,
             pins.join(","),
             tray_host,
@@ -1618,6 +1657,10 @@ impl App {
 
     fn on_mouse_inner(&mut self, msg: &MSG, dirty: &mut Dirty) -> bool {
         self.msg_pt = message_pos();
+        self.input_time = msg.time;
+        if self.start.as_ref().is_some_and(|s| s.hwnd() == msg.hwnd) {
+            return self.on_start_mouse(msg, dirty);
+        }
         if self
             .strip
             .as_ref()
@@ -1702,7 +1745,7 @@ impl App {
                 dirty.bars.insert(self.cur);
                 if pressed.is_some() && pressed == hit {
                     if let Some(h) = hit {
-                        self.click(h);
+                        self.click(h, dirty);
                     }
                 }
             }
@@ -2068,8 +2111,13 @@ impl App {
         true
     }
 
-    /// Keys reach us only while the overflow is the foreground window: Esc closes it.
+    /// Keys reach us only while the overflow or the Start panel is the foreground window:
+    /// Esc closes the overflow; the Start panel gets every key.
     fn on_key(&mut self, msg: &MSG, dirty: &mut Dirty) -> bool {
+        if self.start.as_ref().is_some_and(|s| s.hwnd() == msg.hwnd) {
+            self.on_start_key(msg, dirty);
+            return true;
+        }
         let ours = self
             .overflow
             .as_ref()
@@ -2388,7 +2436,7 @@ impl App {
         }
     }
 
-    fn click(&mut self, hit: Hit) {
+    fn click(&mut self, hit: Hit, dirty: &mut Dirty) {
         if !matches!(hit, Hit::App(_)) {
             self.close_strip();
         }
@@ -2405,7 +2453,11 @@ impl App {
                 let idx = self.tray_bar.get(k).copied();
                 self.tray_click(idx, TrayClick::Left);
             }
-            Hit::Start => open_stock_start(),
+            Hit::Start => {
+                if let Some(k) = self.mon_index(self.cur) {
+                    self.toggle_start(k, dirty);
+                }
+            }
             Hit::Quick => self.launcher.launch(Job::QuickSettings),
             Hit::Clock => self.launcher.launch(Job::Notifications),
             Hit::App(i) => {
@@ -2445,6 +2497,7 @@ impl App {
     /// Ends every transient interaction (strip, overflow, tooltip, hover, presses, margin
     /// expansion): before a modal menu and before the bar is laid out anew.
     fn reset_interaction(&mut self) {
+        self.close_start();
         self.close_strip();
         self.close_overflow();
         self.set_tip_target(None);
@@ -2460,6 +2513,458 @@ impl App {
         for b in self.all_bars_mut() {
             b.window.set_expanded(false);
         }
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Start panel (controller in `start.rs`; here only the wiring)
+    // -----------------------------------------------------------------------------------
+
+    /// The Start button (and, later, the Windows key): opens the Start panel on monitor `k`,
+    /// or closes it when it is already open there (open elsewhere, it moves to `k`).
+    /// `StartStyle::FullScreen` opens the panel too until the full-screen grid exists.
+    fn toggle_start(&mut self, k: usize, dirty: &mut Dirty) {
+        let Some(id) = self.monitors.get(k).map(MonitorBar::id) else {
+            return;
+        };
+        if let Some(open) = self.start.as_ref().map(|s| s.monitor) {
+            self.close_start();
+            if open == id {
+                return;
+            }
+        }
+        self.open_start(k, dirty);
+    }
+
+    fn open_start(&mut self, k: usize, dirty: &mut Dirty) {
+        let began = Instant::now();
+        // Strip, overflow and tooltip close; the hover on the bar ends.
+        self.reset_interaction();
+        dirty.bars.insert(self.monitors[k].id());
+        if self.settings.start_pins.is_empty() && !self.settings.pins.is_empty() {
+            // First open: Start begins with the bar's pins.
+            self.settings.start_pins = self.settings.pins.clone();
+            self.save_settings();
+        }
+        let mb = &self.monitors[k];
+        let s = mb.scale();
+        let (l, t, r, b) = work_area_px(mb.info.rect_px);
+        let work = Rect {
+            x: l as f32 / s,
+            y: t as f32 / s,
+            w: (r - l) as f32 / s,
+            h: (b - t) as f32 / s,
+        };
+        let rect = place_panel(mb.layout.start, self.settings.position, work);
+        let layout = panel_layout(rect);
+        let (id, dpi) = (mb.id(), mb.info.dpi);
+        // Cached data draws the first frame; the workers refresh it in the background.
+        self.start_data.refresh(self.notify.hwnd);
+        self.start_data.drain();
+        let lang = ui_lang(&self.settings);
+        let before_show = began.elapsed();
+        let opened = StartPanel::open(
+            &self.comp,
+            &layout,
+            to_px(rect, s),
+            dpi,
+            &self.style,
+            id,
+            tr(lang, Key::Start),
+        );
+        let shown = began.elapsed();
+        let mut drawn = shown;
+        match opened {
+            Ok(sp) => {
+                self.start = Some(sp);
+                self.start_draw();
+                drawn = began.elapsed();
+                if let Some(sp) = self.start.as_mut() {
+                    // Carry 12: Windows may refuse the foreground; the panel then takes it
+                    // on its first click.
+                    if !sp.activate() {
+                        eprintln!("vitrobar: the Start panel could not take the foreground");
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("vitrobar: the Start panel failed ({e}); opening the stock Start");
+                open_stock_start();
+            }
+        }
+        if self.opts.debug_state {
+            // SAFETY: plain query.
+            let now = unsafe { GetTickCount() };
+            eprintln!(
+                "vitrobar-start-open ms={} build_ms={} (prepare {} show {} draw {} activate {}) activated={}",
+                now.wrapping_sub(self.input_time),
+                began.elapsed().as_millis(),
+                before_show.as_millis(),
+                (shown - before_show).as_millis(),
+                (drawn - shown).as_millis(),
+                (began.elapsed() - drawn).as_millis(),
+                self.start.as_ref().is_some_and(|s| s.activated)
+            );
+            self.dump_state();
+        }
+    }
+
+    /// Closes the Start panel: its visuals and window go, and its icons leave the cache
+    /// (unless a bar shows them). True if it was open.
+    fn close_start(&mut self) -> bool {
+        let Some(sp) = self.start.take() else {
+            return false;
+        };
+        let srcs = sp.icon_srcs.clone();
+        drop(sp);
+        let monitors = &self.monitors;
+        self.icons.forget(|src| {
+            srcs.contains(src)
+                && !monitors
+                    .iter()
+                    .any(|m| m.groups.iter().any(|g| icon_sources(g).contains(src)))
+        });
+        if let Some(fs) = &self.start_data.files {
+            // Stops a search still running (revision 0 is never current).
+            fs.query(0, String::new());
+        }
+        self.surrogate = None;
+        if self.opts.debug_state {
+            self.dump_state();
+        }
+        true
+    }
+
+    fn start_look(&self) -> (Rgba, Lang) {
+        (
+            rgb(self.settings.accent.unwrap_or(self.sys.accent)),
+            ui_lang(&self.settings),
+        )
+    }
+
+    /// Redraws the open Start panel (only what changed is drawn again).
+    fn start_render(&mut self) {
+        if self.start_draw() && self.opts.debug_state {
+            self.dump_state();
+        }
+    }
+
+    /// [`Self::start_render`] without the debug state dump (the open path dumps once, after
+    /// measuring). False when the panel is not open or could not be drawn (it is then closed).
+    fn start_draw(&mut self) -> bool {
+        let (accent, lang) = self.start_look();
+        let Some(sp) = self.start.as_mut() else {
+            return false;
+        };
+        let look = Look {
+            style: &self.style,
+            accent,
+            lang,
+        };
+        let drawn = sp.render(
+            &self.painter,
+            &mut self.icons,
+            &self.start_data,
+            &self.settings.start_pins,
+            &look,
+        );
+        if let Err(e) = drawn {
+            eprintln!("vitrobar: the Start panel could not be drawn: {e}");
+            self.close_start();
+            return false;
+        }
+        true
+    }
+
+    /// The catalog, recent files or account name arrived.
+    fn start_refresh(&mut self, apps_changed: bool) {
+        let lang = ui_lang(&self.settings);
+        let Some(sp) = self.start.as_mut() else {
+            return;
+        };
+        if apps_changed {
+            sp.research(&self.start_data, lang, true);
+        }
+        self.start_render();
+    }
+
+    /// File-search results arrived (always drained, so the next wake-up is posted).
+    fn on_file_results(&mut self) {
+        let Some((rev, hits)) = self.start_data.files.as_ref().and_then(|f| f.drain()) else {
+            return;
+        };
+        let lang = ui_lang(&self.settings);
+        let Some(sp) = self.start.as_mut() else {
+            return;
+        };
+        if sp.files_arrived(rev, hits, &self.start_data, lang) {
+            self.start_render();
+        }
+    }
+
+    /// Feeds `input` to the panel's state machine and carries out what it asks for.
+    fn start_input(&mut self, input: StartInput, dirty: &mut Dirty) {
+        let lang = ui_lang(&self.settings);
+        let Some(sp) = self.start.as_mut() else {
+            return;
+        };
+        let action = sp.handle(input, &self.start_data, &self.settings.start_pins, lang);
+        if let Some((rev, text)) = sp.research(&self.start_data, lang, false) {
+            if let Some(fs) = &self.start_data.files {
+                fs.query(rev, text);
+            }
+        }
+        self.start_action(action, dirty);
+    }
+
+    fn start_action(&mut self, action: StartAction, dirty: &mut Dirty) {
+        let debug = self.opts.debug_state;
+        match action {
+            StartAction::None => {}
+            StartAction::Redraw => self.start_render(),
+            StartAction::Close => {
+                self.close_start();
+            }
+            StartAction::Launch(p) => {
+                self.close_start();
+                if debug {
+                    eprintln!("vitrobar-start-launch {}", json_str(&p.name));
+                }
+                if let Some(job) = launch_job(&p) {
+                    self.launcher.launch(job);
+                }
+            }
+            StartAction::Open(target) => {
+                self.close_start();
+                if debug {
+                    eprintln!("vitrobar-start-open-item {}", json_str(&target));
+                }
+                self.launcher.launch(Job::Open(target));
+            }
+            StartAction::Power(a) => {
+                self.close_start();
+                if debug {
+                    eprintln!("vitrobar-power {a:?}");
+                }
+                self.launcher.launch(Job::Power(a));
+            }
+            StartAction::PowerMenu(pt) => {
+                let Some(sp) = &self.start else { return };
+                let (l, t, _, _) = sp.rect_px();
+                let lang = ui_lang(&self.settings);
+                let choice = power_menu(sp.hwnd(), (l + pt.0, t + pt.1), lang);
+                if let Some(a) = choice {
+                    self.start_action(StartAction::Power(a), dirty);
+                }
+            }
+            StartAction::CopyMath(text) => {
+                if let Err(e) = vitro_win::clipboard::set_text(self.notify.hwnd, &text) {
+                    eprintln!("vitrobar: could not copy the result: {e}");
+                } else if debug {
+                    eprintln!("vitrobar-start-copied {}", text.chars().count());
+                }
+                self.close_start();
+            }
+            StartAction::Menu(pt, item) => self.start_item_menu(pt, item, dirty),
+        }
+    }
+
+    /// Right-click on a Start pin or an All-apps entry: pin / unpin (Start and bar), open
+    /// the file location. Changes are saved at once.
+    fn start_item_menu(&mut self, pt: (i32, i32), item: MenuItem, dirty: &mut Dirty) {
+        let Some(sp) = &self.start else { return };
+        let pin = match item {
+            MenuItem::Pin(i) => self.settings.start_pins.get(i).cloned(),
+            MenuItem::App(a) => self.start_data.apps.get(a).cloned(),
+        };
+        let Some(pin) = pin else { return };
+        let bar = bar_pin(&pin);
+        let on_bar = |p: &Pin| same_app(p, &pin) || same_app(p, &bar);
+        let in_start = self.settings.start_pins.iter().any(|p| same_app(p, &pin));
+        let in_bar = self.settings.pins.iter().any(on_bar);
+        let location = file_location(&pin);
+        let (l, t, _, _) = sp.rect_px();
+        let lang = ui_lang(&self.settings);
+        let choice = start_item_menu(
+            sp.hwnd(),
+            (l + pt.0, t + pt.1),
+            in_start,
+            in_bar,
+            location.is_some(),
+            lang,
+        );
+        if self.opts.debug_state {
+            eprintln!("vitrobar-menu start {choice:?}");
+        }
+        match choice {
+            Some(MenuChoice::PinToStart) if !in_start => {
+                self.settings.start_pins.push(pin);
+                self.save_settings();
+            }
+            Some(MenuChoice::UnpinFromStart) => {
+                self.settings.start_pins.retain(|p| !same_app(p, &pin));
+                self.save_settings();
+            }
+            Some(MenuChoice::Pin) if !in_bar => {
+                self.settings.pins.push(bar);
+                self.pins_changed(dirty);
+            }
+            Some(MenuChoice::Unpin) => {
+                self.settings.pins.retain(|p| !on_bar(p));
+                self.pins_changed(dirty);
+            }
+            Some(MenuChoice::OpenFileLocation) => {
+                if let Some(path) = location {
+                    self.close_start();
+                    self.launcher.launch(Job::Reveal(path));
+                }
+                return;
+            }
+            _ => return,
+        }
+        if let Some(sp) = self.start.as_mut() {
+            sp.state.hover = None;
+        }
+        self.start_render();
+    }
+
+    /// Mouse input on the Start panel (client px).
+    fn on_start_mouse(&mut self, msg: &MSG, dirty: &mut Dirty) -> bool {
+        let pt = mouse_pos(msg.lParam);
+        let Some(sp) = self.start.as_mut() else {
+            return false;
+        };
+        let input = match msg.message {
+            WM_MOUSEMOVE => {
+                if !sp.tracking {
+                    track_leave(msg.hwnd);
+                    sp.tracking = true;
+                }
+                StartInput::Move(pt)
+            }
+            WM_MOUSELEAVE => {
+                sp.tracking = false;
+                StartInput::Leave
+            }
+            WM_LBUTTONUP => StartInput::Click(pt),
+            WM_RBUTTONUP => StartInput::RightClick(pt),
+            WM_LBUTTONDOWN | WM_RBUTTONDOWN => return true,
+            _ => return false,
+        };
+        self.start_input(input, dirty);
+        true
+    }
+
+    /// A key on the Start panel. Ctrl+V pastes the clipboard's text.
+    fn on_start_key(&mut self, msg: &MSG, dirty: &mut Dirty) {
+        self.input_time = msg.time;
+        let vk = msg.wParam.0 as u32;
+        // SAFETY: plain queries of this thread's keyboard state.
+        let (ctrl, alt) = unsafe {
+            (
+                GetKeyState(i32::from(VK_CONTROL.0)) < 0,
+                GetKeyState(i32::from(VK_MENU.0)) < 0,
+            )
+        };
+        // AltGr (Ctrl+Alt) types characters: it is not Ctrl.
+        let ctrl = ctrl && !alt;
+        if ctrl && vk == u32::from(b'V') {
+            let text = self
+                .start
+                .as_ref()
+                .and_then(|s| vitro_win::clipboard::get_text(s.hwnd(), 4096));
+            if let Some(text) = text {
+                self.start_input(StartInput::Paste(text), dirty);
+            }
+            return;
+        }
+        self.start_input(StartInput::Key(vk, ctrl), dirty);
+    }
+
+    /// `WM_CHAR`, `WM_MOUSEWHEEL` and `WM_SYSKEYDOWN` on the Start panel; false for anything
+    /// else (it is dispatched as usual).
+    fn on_start_msg(&mut self, msg: &MSG, dirty: &mut Dirty) -> bool {
+        if !self.start.as_ref().is_some_and(|s| s.hwnd() == msg.hwnd) {
+            return false;
+        }
+        match msg.message {
+            WM_CHAR => {
+                let u = msg.wParam.0 as u16;
+                let c = match u {
+                    0xD800..=0xDBFF => {
+                        self.surrogate = Some(u);
+                        return true;
+                    }
+                    0xDC00..=0xDFFF => {
+                        let Some(hi) = self.surrogate.take() else {
+                            return true;
+                        };
+                        char::decode_utf16([hi, u]).next().and_then(|r| r.ok())
+                    }
+                    _ => char::from_u32(u32::from(u)),
+                };
+                // Control characters (Ctrl+letters, Backspace, Esc, DEL) come as keys.
+                if let Some(c) = c.filter(|c| *c >= ' ' && *c != '\u{7F}') {
+                    self.start_input(StartInput::Char(c), dirty);
+                }
+                true
+            }
+            WM_MOUSEWHEEL => {
+                let delta = ((msg.wParam.0 >> 16) & 0xFFFF) as u16 as i16;
+                self.start_input(StartInput::Wheel(i32::from(delta)), dirty);
+                true
+            }
+            WM_SYSKEYDOWN if msg.wParam.0 == usize::from(VK_F4.0) => {
+                // Alt+F4 closes the panel (and not the window behind our back).
+                self.close_start();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The `"start"` object of the state dump. Never the query text: only its length.
+    fn dump_start(&self) -> String {
+        let dry = vitro_win::power::last_dry_run()
+            .map_or("null".to_string(), |a| json_str(&format!("{a:?}")));
+        let Some(sp) = &self.start else {
+            return format!(
+                "{{\"open\":false,\"catalog\":{},\"power_dry_run\":{}}}",
+                self.start_data.apps.len(),
+                dry
+            );
+        };
+        let st = &sp.state;
+        let (l, t, _, _) = sp.rect_px();
+        let screen = |r: PxRect| json_rect((l + r.0, t + r.1, l + r.2, t + r.3));
+        let top = match sp.results.first() {
+            Some(ResultKind::Math(_)) => "\"math\"",
+            Some(ResultKind::App(_)) => "\"app\"",
+            Some(ResultKind::Setting(_)) => "\"setting\"",
+            Some(ResultKind::File(_)) => "\"file\"",
+            None => "null",
+        };
+        format!(
+            "{{\"open\":true,\"mode\":\"{}\",\"query\":{},\"results\":{},\"top\":{},\"search\":{},\"all_apps\":{},\"list\":{},\"power\":{},\"selected\":{},\"files\":{},\"scroll\":{},\"hwnd\":{},\"rect\":{},\"monitor\":{},\"activated\":{},\"catalog\":{},\"recent\":{},\"recent_enabled\":{},\"power_dry_run\":{}}}",
+            st.mode.name(),
+            st.input.text().chars().count(),
+            sp.results.len(),
+            top,
+            screen(sp.geom.search),
+            screen(sp.geom.all_apps),
+            screen(sp.geom.list),
+            screen(sp.geom.power),
+            st.selected,
+            sp.files.len(),
+            st.scroll.round() as i32,
+            sp.hwnd().0 as usize,
+            json_rect(sp.rect_px()),
+            sp.monitor,
+            sp.activated,
+            self.start_data.apps.len(),
+            self.start_data.recent.len(),
+            self.start_data.recent_enabled,
+            dry
+        )
     }
 
     /// Right-click: the menu of app `app`, or the bar's own menu. Modal.
@@ -2619,6 +3124,23 @@ impl App {
         // really changed.
         dirty.monitors |= inbox.display || inbox.dpi || inbox.workarea || inbox.session;
         dirty.display |= inbox.display || inbox.session;
+        if inbox.start_data {
+            // Always drained (a pending wake-up blocks the next one), shown only while open.
+            let (apps_changed, any) = self.start_data.drain();
+            if any {
+                self.start_refresh(apps_changed);
+            }
+        }
+        if inbox.files {
+            self.on_file_results();
+        }
+        if take_panel_deactivated()
+            .iter()
+            .any(|h| self.start.as_ref().is_some_and(|s| s.hwnd() == *h))
+        {
+            // A click elsewhere or a switch to another app.
+            self.close_start();
+        }
         let deactivated = take_deactivated();
         if self
             .overflow
@@ -2702,13 +3224,16 @@ impl App {
                 self.sys = sys;
                 self.style = style;
                 redraw = true;
+                // Its glass was made for the old style.
+                self.close_start();
             }
         }
         if d.clock {
             redraw |= self.tick_clock();
         }
-        if d.icons {
-            redraw |= self.icons.drain();
+        if d.icons && self.icons.drain() {
+            redraw = true;
+            self.start_render();
         }
         if redraw {
             self.refresh()?;
@@ -2790,6 +3315,11 @@ pub fn run(opts: Options) -> Result<()> {
         let _ = SetConsoleCtrlHandler(Some(on_console_ctrl), true);
     }
     let mut parent = crate::watchdog::ParentWatch::new(opts.parent, opts.pass_on.clone());
+    if opts.debug_state && std::env::var(POWER_DRY_RUN_ENV).is_ok_and(|v| v == "1") {
+        // Carry 8: live tests of the power menu record the action instead of doing it.
+        vitro_win::power::set_dry_run(true);
+        eprintln!("vitrobar: power actions are a dry run");
+    }
 
     let path = settings_path();
     let (mut settings, status) = path
@@ -2881,7 +3411,11 @@ pub fn run(opts: Options) -> Result<()> {
                 WM_MOUSEMOVE | WM_MOUSELEAVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN
                 | WM_RBUTTONUP
                     if app.on_mouse(&msg, &mut dirty) => {}
-                WM_KEYDOWN if app.on_key(&msg, &mut dirty) => {}
+                // Then translated, so the Start panel's characters follow as WM_CHAR.
+                WM_KEYDOWN if app.on_key(&msg, &mut dirty) => unsafe {
+                    let _ = TranslateMessage(&msg);
+                },
+                WM_CHAR | WM_SYSKEYDOWN | WM_MOUSEWHEEL if app.on_start_msg(&msg, &mut dirty) => {}
                 _ => unsafe {
                     let _ = TranslateMessage(&msg);
                     DispatchMessageW(&msg);

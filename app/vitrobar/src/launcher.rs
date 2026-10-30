@@ -4,8 +4,11 @@
 use std::sync::mpsc::{channel, Sender};
 
 use vitro_core::settings::Pin;
-use vitro_win::launch::{launch_pin, open_stock_notifications, open_stock_quick_settings};
-use windows::core::Result;
+use vitro_win::launch::{
+    launch_pin, open_stock_notifications, open_stock_quick_settings, reveal_in_folder, shell_open,
+};
+use vitro_win::power::{perform, PowerAction};
+use windows::core::{Result, HSTRING};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 
 #[derive(Debug, Clone)]
@@ -13,6 +16,12 @@ pub enum Job {
     Pin(Pin),
     QuickSettings,
     Notifications,
+    /// A file, folder or URI (`ms-settings:`, `shell:AppsFolder\<id>`) opened by the shell.
+    Open(String),
+    /// "Open file location": Explorer on the item's folder, the item selected.
+    Reveal(String),
+    /// A power-menu action. A failure (Sleep without the privilege, say) is only logged.
+    Power(PowerAction),
 }
 
 pub struct Launcher {
@@ -37,6 +46,9 @@ fn run(job: &Job) -> Result<()> {
         Job::Pin(p) => launch_pin(p),
         Job::QuickSettings => open_stock_quick_settings(),
         Job::Notifications => open_stock_notifications(),
+        Job::Open(target) => shell_open(&HSTRING::from(target.as_str())),
+        Job::Reveal(path) => reveal_in_folder(path),
+        Job::Power(a) => perform(*a),
     }
 }
 
@@ -91,5 +103,24 @@ mod tests {
         let (job, result) = rx.recv_timeout(Duration::from_secs(20)).unwrap();
         assert!(matches!(job, Job::Pin(_)));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn open_failures_and_dry_run_power_come_back_as_reports() {
+        vitro_win::power::set_dry_run(true);
+        let (tx, rx) = channel();
+        let launcher = Launcher::start(Some(tx)).unwrap();
+        launcher.launch(Job::Open(r"C:\does\not\exist\vitrobar-test.txt".into()));
+        launcher.launch(Job::Power(PowerAction::ShutDown));
+        let (job, result) = rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        assert!(matches!(job, Job::Open(_)));
+        assert!(result.is_err());
+        let (job, result) = rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        assert!(matches!(job, Job::Power(PowerAction::ShutDown)));
+        assert!(result.is_ok());
+        assert_eq!(
+            vitro_win::power::last_dry_run(),
+            Some(PowerAction::ShutDown)
+        );
     }
 }

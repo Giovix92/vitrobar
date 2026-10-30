@@ -9,6 +9,7 @@
 
 use vitro_core::i18n::{tr, Key, Lang};
 use vitro_core::settings::{HoverEffect, IconSize, Material, Position, Settings, Shape};
+use vitro_win::power::PowerAction;
 use windows::core::{Result, HSTRING, PWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -34,6 +35,9 @@ pub enum MenuChoice {
     SetPosition(Position),
     ToggleStartWithWindows,
     Exit,
+    PinToStart,
+    UnpinFromStart,
+    OpenFileLocation,
 }
 
 const SHAPES: &[(Shape, Key)] = &[
@@ -60,6 +64,15 @@ const SIZES: &[(IconSize, Key)] = &[
     (IconSize::Large, Key::Large),
 ];
 const POSITIONS: &[(Position, Key)] = &[(Position::Bottom, Key::Bottom), (Position::Top, Key::Top)];
+/// The Start panel's power menu, in order.
+const POWER: &[(PowerAction, Key)] = &[
+    (PowerAction::Lock, Key::Lock),
+    (PowerAction::Sleep, Key::Sleep),
+    (PowerAction::Restart, Key::Restart),
+    (PowerAction::ShutDown, Key::ShutDown),
+    (PowerAction::SignOut, Key::SignOut),
+    (PowerAction::SwitchUser, Key::SwitchUser),
+];
 
 // Command ids: 0 is "nothing chosen"; submenu entries are base + index.
 const ID_PIN: u32 = 1;
@@ -68,11 +81,15 @@ const ID_NEW_WINDOW: u32 = 3;
 const ID_CLOSE_ALL: u32 = 4;
 const ID_START_WITH_WINDOWS: u32 = 5;
 const ID_EXIT: u32 = 6;
+const ID_PIN_TO_START: u32 = 7;
+const ID_UNPIN_FROM_START: u32 = 8;
+const ID_OPEN_LOCATION: u32 = 9;
 const ID_SHAPE: u32 = 0x100;
 const ID_MATERIAL: u32 = 0x200;
 const ID_HOVER: u32 = 0x300;
 const ID_SIZE: u32 = 0x400;
 const ID_POSITION: u32 = 0x500;
+const ID_POWER: u32 = 0x600;
 
 fn pick<T: Copy>(list: &[(T, Key)], base: u32, id: u32) -> Option<T> {
     let i = id.checked_sub(base)? as usize;
@@ -88,6 +105,9 @@ fn choice_for(id: u32) -> Option<MenuChoice> {
         ID_CLOSE_ALL => MenuChoice::CloseAll,
         ID_START_WITH_WINDOWS => MenuChoice::ToggleStartWithWindows,
         ID_EXIT => MenuChoice::Exit,
+        ID_PIN_TO_START => MenuChoice::PinToStart,
+        ID_UNPIN_FROM_START => MenuChoice::UnpinFromStart,
+        ID_OPEN_LOCATION => MenuChoice::OpenFileLocation,
         _ => match id & !0xFF {
             ID_SHAPE => MenuChoice::SetShape(pick(SHAPES, ID_SHAPE, id)?),
             ID_MATERIAL => MenuChoice::SetMaterial(pick(MATERIALS, ID_MATERIAL, id)?),
@@ -246,6 +266,69 @@ pub fn app_menu(
     choice_for(menu.track(owner, pt_px))
 }
 
+/// The menu of an app in the Start panel (a pin or an All-apps entry). `owner` is the panel,
+/// so the menu does not take its activation away.
+pub fn start_item_menu(
+    owner: HWND,
+    pt_px: (i32, i32),
+    in_start: bool,
+    in_bar: bool,
+    has_location: bool,
+    lang: Lang,
+) -> Option<MenuChoice> {
+    let build = || -> Result<Menu> {
+        let m = Menu::new()?;
+        if in_start {
+            m.item(
+                ID_UNPIN_FROM_START,
+                tr(lang, Key::UnpinFromStart),
+                false,
+                false,
+            )?;
+        } else {
+            m.item(ID_PIN_TO_START, tr(lang, Key::PinToStart), false, false)?;
+        }
+        if in_bar {
+            m.item(ID_UNPIN, tr(lang, Key::Unpin), false, false)?;
+        } else {
+            m.item(ID_PIN, tr(lang, Key::Pin), false, false)?;
+        }
+        if has_location {
+            m.separator()?;
+            m.item(
+                ID_OPEN_LOCATION,
+                tr(lang, Key::OpenFileLocation),
+                false,
+                false,
+            )?;
+        }
+        Ok(m)
+    };
+    let menu = report("Start item", build())?;
+    choice_for(menu.track(owner, pt_px))
+}
+
+/// The power action behind a command id of the power menu.
+fn power_for(id: u32) -> Option<PowerAction> {
+    pick(POWER, ID_POWER, id).filter(|_| id & !0xFF == ID_POWER)
+}
+
+/// The Start panel's power menu (Lock, Sleep, Restart, Shut down, Sign out, Switch user).
+pub fn power_menu(owner: HWND, pt_px: (i32, i32), lang: Lang) -> Option<PowerAction> {
+    let build = || -> Result<Menu> {
+        let m = Menu::new()?;
+        for (i, (_, key)) in POWER.iter().enumerate() {
+            if i == 2 {
+                m.separator()?;
+            }
+            m.item(ID_POWER + i as u32, tr(lang, *key), false, false)?;
+        }
+        Ok(m)
+    };
+    let menu = report("power", build())?;
+    power_for(menu.track(owner, pt_px))
+}
+
 /// The bar's own menu; the current settings carry radio checks.
 pub fn bar_menu(owner: HWND, pt_px: (i32, i32), s: &Settings, lang: Lang) -> Option<MenuChoice> {
     let build = || -> Result<Menu> {
@@ -286,6 +369,22 @@ mod tests {
             Some(MenuChoice::ToggleStartWithWindows)
         );
         assert_eq!(choice_for(ID_EXIT), Some(MenuChoice::Exit));
+        assert_eq!(choice_for(ID_PIN_TO_START), Some(MenuChoice::PinToStart));
+        assert_eq!(
+            choice_for(ID_UNPIN_FROM_START),
+            Some(MenuChoice::UnpinFromStart)
+        );
+        assert_eq!(
+            choice_for(ID_OPEN_LOCATION),
+            Some(MenuChoice::OpenFileLocation)
+        );
+        for (i, (a, _)) in POWER.iter().enumerate() {
+            assert_eq!(power_for(ID_POWER + i as u32), Some(*a));
+            assert_eq!(choice_for(ID_POWER + i as u32), None);
+        }
+        assert_eq!(power_for(ID_POWER + 6), None);
+        assert_eq!(power_for(0), None);
+        assert_eq!(power_for(ID_EXIT), None);
         for (i, (v, _)) in SHAPES.iter().enumerate() {
             assert_eq!(
                 choice_for(ID_SHAPE + i as u32),

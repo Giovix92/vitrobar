@@ -43,6 +43,11 @@ pub const WM_APP_ICON: u32 = WM_APP + 0x22;
 /// Posted once after the first frame: take the stock taskbar over now (R12: the bar shows
 /// first, the slow `ABM_SETSTATE` round trip to Explorer comes after).
 pub const WM_APP_TAKE_OVER: u32 = WM_APP + 0x23;
+// WM_APP + 0x24 is the keyboard hook's wake-up (ruling S2).
+/// File-search results are waiting (payload-free wake-up from the search worker, ruling S2).
+pub const WM_APP_FILE_SEARCH: u32 = WM_APP + 0x25;
+/// The Start panel's app catalog or recent files were read (payload-free wake-up).
+pub const WM_APP_START_DATA: u32 = WM_APP + 0x26;
 
 /// Timers on the notify window (ids distinct from the tracker's 0x5601/0x5602).
 pub const TIMER_CLOCK: usize = 0x5701;
@@ -92,6 +97,10 @@ pub struct Inbox {
     pub tray: Vec<TrayMessage>,
     /// [`WM_APP_TAKE_OVER`] arrived: finish the start-up.
     pub take_over: bool,
+    /// [`WM_APP_FILE_SEARCH`]: drain the file search.
+    pub files: bool,
+    /// [`WM_APP_START_DATA`]: drain the Start panel's data worker.
+    pub start_data: bool,
 }
 
 thread_local! {
@@ -172,6 +181,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_APP_TAKE_OVER => {
             with_inbox(|i| i.take_over = true);
+            return LRESULT(0);
+        }
+        WM_APP_FILE_SEARCH => {
+            // A wake-up: wParam / lParam are ignored (anyone may post this id).
+            with_inbox(|i| i.files = true);
+            return LRESULT(0);
+        }
+        WM_APP_START_DATA => {
+            // A wake-up: wParam / lParam are ignored (anyone may post this id).
+            with_inbox(|i| i.start_data = true);
             return LRESULT(0);
         }
         WM_VITRO_APPBAR => {

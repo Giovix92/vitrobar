@@ -13,6 +13,7 @@ mod launcher;
 mod menus;
 mod notify;
 mod shell;
+mod start;
 mod watchdog;
 mod window_set;
 

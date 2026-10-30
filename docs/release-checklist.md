@@ -25,8 +25,8 @@ Explorer windows open, no `settings.toml` (or one with an empty pin list).
 
 Also check while you are here:
 
-- Start opens the Windows Start menu, the quick-settings button opens Quick Settings, the
-  clock opens the notification centre and calendar.
+- Start opens Vitrobar's Start panel (see "Start menu"), the quick-settings button opens
+  Quick Settings, the clock opens the notification centre and calendar.
 - An icon that takes long to load shows a soft rounded placeholder first; the bar never
   freezes while icons load.
 - An app asking for attention (e.g. a chat app flashing) gets an accent plate that pulses
@@ -219,6 +219,57 @@ made-up monitor (deleting the file and posting again removes it; changing its DP
 again re-lays it out). A virtual desktop switch can be simulated by posting `WM_TIMER` with id
 `0x5602` to the same window (a `vitrobar-desktop-switched` line follows). Steps 5 to 8 need a
 person.
+
+## Start menu
+
+Introduced by stage 2, Task 6. The Start button opens Vitrobar's own Start panel: a glass
+panel (640 x 720 DIP, smaller on short screens) above the Start button (below it with the bar
+at the top), with a search box, the pinned apps, recent files, the account and the power
+button. For trial runs use `VITROBAR_SETTINGS=<file>` (with `first-run-done = true` and
+`start-with-windows = false`). To try the power menu without powering anything off, start
+with `--debug-state` and `VITROBAR_POWER_DRY_RUN=1`: every power action is then only recorded
+(`vitrobar-power <action>` on stderr) and nothing happens.
+
+1. Click Start: the panel appears at once (well under 150 ms; with `--debug-state` the line
+   `vitrobar-start-open ms=<n>` gives the time from the click), takes the keyboard focus (the
+   caret shows in the search box) and closes the tray overflow, a thumbnail strip or a
+   tooltip that was open. Click Start again: it closes. Click on the desktop or switch apps
+   (Alt+Tab): it closes. Esc closes it; Alt+F4 closes only the panel.
+2. The first time, "Pinned" shows the bar's pins (up to 6 x 3); icons that are still loading
+   show a soft placeholder. The footer shows the account's initial in an accent circle and
+   the display name; clicking it opens Settings › Accounts › Your info.
+3. "Recent" lists the last 4 files opened (icon, name, folder; click opens the file). With
+   Settings › Personalization › Start › "Show recently opened items" off it says "No recent
+   files" (and Vitrobar does not read the Recent folder).
+4. Type `paint` (or any app name): the pinned grid is replaced at once by results (apps,
+   Settings pages, files from the Windows Search index; never files under `node_modules`,
+   `.git`, `AppData`, the Recycle Bin or Python environments). The first result is
+   highlighted; ↑/↓ move the highlight, Enter runs it and the panel closes. Esc clears the
+   text (back to the pinned grid), a second Esc closes. Ctrl+V pastes (line breaks become
+   spaces), Ctrl+Backspace deletes a word, ←/→/Home/End move the caret. Emoji typed with
+   Win+. arrive whole.
+5. Type `2+2`: the first result is "= 4 · Calculator · Press Enter to copy"; Enter puts `4` on
+   the clipboard. Huge or tiny results use scientific notation (`10^300` → `1e300`); with
+   Italian Windows the decimal separator is a comma.
+6. Type `volume` (Italian: `suono`): Settings › Sound is offered; Enter opens it.
+7. Click "All apps ›": every installed app, alphabetically, under letter headers. The wheel
+   scrolls smoothly (no flicker, no redraw of the whole list); "‹ Back" returns. Clicking an
+   app starts it (desktop apps too, through `shell:AppsFolder`).
+8. Right-click a pinned app or an app in All apps / the results: Pin to Start / Unpin from
+   Start, Pin to bar / Unpin from bar, and Open file location for desktop programs. Each
+   change is saved at once (check `settings.toml`) and the bar updates; the panel stays open.
+9. Power button: the menu offers Lock, Sleep, Restart, Shut down, Sign out, Switch user. In a
+   dry run choose Shut down → `vitrobar-power ShutDown` and nothing happens. On a test machine
+   (not in a dry run) check each action once; Sleep on a machine without sleep support fails
+   quietly (the panel closes, nothing else happens).
+10. Bar at the top (bar menu › Position › Top): the panel opens below the Start button. With
+    two monitors, each bar's Start opens the panel on its own monitor (with the work area of
+    that monitor); clicking the other monitor's Start moves it there.
+11. Memory (Task Manager › Details, private working set of all `vitrobar.exe`): with the
+    panel open (All apps scrolled through) under 60 MB; 3 s after closing it under 40 MB.
+    Opening and closing 20 times in a row does not make it grow.
+12. Change the colour mode or accent colour while the panel is open: it closes; the next
+    open uses the new colours.
 
 ## Safety net
 
