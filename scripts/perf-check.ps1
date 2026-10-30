@@ -19,6 +19,17 @@
     always closes Vitrobar, runs `vitrobar.exe --restore` and checks the stock taskbar at
     the end, also when something fails.
 
+    How it knows which windows are its own:
+      - Character Map, Paint, its own test window: the process it started (Start-Process
+        -PassThru) and that process's children.
+      - Calculator: calc.exe only asks Windows to start the packaged CalculatorApp, so the
+        check takes the first CalculatorApp process that appears after its launch.
+      - File Explorer windows share Explorer's process: each opens a temp folder with a
+        unique name and is recognised by that title.
+    So do not open Calculator yourself while the check runs. The memory figure is the bar
+    with everything that is open on the desktop: run it on a quiet desktop (no other apps
+    beyond the usual tray ones) for a number comparable with the budget.
+
 .PARAMETER Exe
     The vitrobar.exe to check (normally target\release\vitrobar.exe).
 .PARAMETER Apps
@@ -82,6 +93,15 @@ public static class VitroPerf {
             return true;
         }, IntPtr.Zero);
         return list;
+    }
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern int InternalGetWindowText(IntPtr hwnd, StringBuilder text, int max);
+    // Never sends a message to the window's thread (a hung window cannot block the check).
+    public static string Title(IntPtr hwnd) {
+        var sb = new StringBuilder(512);
+        InternalGetWindowText(hwnd, sb, sb.Capacity);
+        return sb.ToString();
     }
 
     public static IntPtr[] WindowsOfClass(string cls) {
@@ -224,54 +244,78 @@ function Get-VitroProcesses {
     foreach ($id in @($vitroPids)) { Get-Process -Id $id -ErrorAction SilentlyContinue }
 }
 
-function Start-Tracked([string]$file, [string[]]$arguments, [string]$realName) {
-    # `realName`: the process that ends up owning the window when `file` is only a launcher
-    # (calc.exe starts CalculatorApp). New processes of that name are ours.
-    $before = @(Get-Process -Name $realName -ErrorAction SilentlyContinue | ForEach-Object Id)
-    try {
-        if ($arguments) { $p = Start-Process -FilePath $file -ArgumentList $arguments -PassThru }
-        else { $p = Start-Process -FilePath $file -PassThru }
-    } catch {
+function Start-Tracked([string]$file, [string]$handOff) {
+    # The started process owns its window (Win32 apps). `handOff`: the process name a
+    # launcher hands over to when it only asks Windows to start a packaged app (calc.exe ->
+    # CalculatorApp, started by the system, not as our child); then the first process of
+    # that name that appears after the launch is ours. Looked for only until it appears.
+    $before = if ($handOff) { @(Get-Process -Name $handOff -ErrorAction SilentlyContinue | ForEach-Object Id) } else { @() }
+    $t0 = Get-Date
+    try { $p = Start-Process -FilePath $file -PassThru }
+    catch {
         Write-Note "could not start $file`: $($_.Exception.Message)"
         return $false
     }
-    $deadline = (Get-Date).AddSeconds(8)
-    do {
-        $new = @(Get-Process -Name $realName -ErrorAction SilentlyContinue | Where-Object { $before -notcontains $_.Id })
-        if ($new.Count -gt 0) { break }
-        Start-Sleep -Milliseconds 200
-    } while ((Get-Date) -lt $deadline)
-    foreach ($n in $new) { $ownPids.Add($n.Id) }
-    if ($p -and -not $p.HasExited -and $ownPids -notcontains $p.Id) { $ownPids.Add($p.Id) }
-    return ($new.Count -gt 0)
+    if (-not $handOff) {
+        if ($p.HasExited) { return $false }
+        $ownPids.Add($p.Id)
+        return $true
+    }
+    $deadline = $t0.AddSeconds(8)
+    while ((Get-Date) -lt $deadline) {
+        $new = @(Get-Process -Name $handOff -ErrorAction SilentlyContinue |
+            Where-Object { $before -notcontains $_.Id -and $_.StartTime -ge $t0.AddSeconds(-1) } |
+            Sort-Object StartTime)
+        if ($new.Count -gt 0) {
+            $ownPids.Add($new[0].Id)
+            return $true
+        }
+        if (-not $p.HasExited -and ((Get-Date) - $t0).TotalSeconds -ge 3) {
+            # No hand-over (classic calc on Windows Server): the launched process is the app.
+            $ownPids.Add($p.Id)
+            return $true
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    return $false
+}
+
+function Test-OurFolderTitle([string]$title, [string]$name) {
+    # File Explorer titles are "<folder>" or "<folder> - File Explorer" (localized suffix).
+    return $title -eq $name -or $title.StartsWith("$name - ")
 }
 
 function Open-Apps([int]$count) {
     $plan = @(
-        @('charmap.exe', 'charmap'), @('charmap.exe', 'charmap'), @('charmap.exe', 'charmap'),
-        @('mspaint.exe', 'mspaint'), @('mspaint.exe', 'mspaint'), @('mspaint.exe', 'mspaint'),
+        @('charmap.exe', ''), @('charmap.exe', ''), @('charmap.exe', ''),
+        @('mspaint.exe', ''), @('mspaint.exe', ''), @('mspaint.exe', ''),
         @('explorer', ''), @('explorer', ''),
         @('calc.exe', 'CalculatorApp'),
         @('form', '')
     )
     $n = 0
-    $explorerDir = Join-Path $temp 'folder'
-    New-Item -ItemType Directory -Path $explorerDir -Force | Out-Null
+    $folders = 0
     foreach ($app in $plan | Select-Object -First $count) {
         $ok = $false
         if ($app[0] -eq 'explorer' -and -not (Get-Process -Name explorer -ErrorAction SilentlyContinue)) {
             # No shell running (a CI runner): explorer.exe would start one. Another app instead.
-            $app = @('charmap.exe', 'charmap')
+            $app = @('charmap.exe', '')
         }
         switch ($app[0]) {
             'explorer' {
-                # File Explorer windows share one process: track the new window, not a process.
+                # File Explorer windows share Explorer's process: open a folder with a unique
+                # name and take only the new window that shows it.
+                $folders++
+                $name = "$tag-$folders"
+                $dir = Join-Path $temp $name
+                New-Item -ItemType Directory -Path $dir -Force | Out-Null
                 $before = [VitroPerf]::WindowsOfClass('CabinetWClass')
-                Start-Process -FilePath explorer.exe -ArgumentList "/n,`"$explorerDir`""
+                Start-Process -FilePath explorer.exe -ArgumentList "/n,`"$dir`""
                 $deadline = (Get-Date).AddSeconds(8)
                 do {
                     Start-Sleep -Milliseconds 200
-                    $new = @([VitroPerf]::WindowsOfClass('CabinetWClass') | Where-Object { $before -notcontains $_ -and $ownWindows -notcontains $_ })
+                    $new = @([VitroPerf]::WindowsOfClass('CabinetWClass') |
+                        Where-Object { $before -notcontains $_ -and (Test-OurFolderTitle ([VitroPerf]::Title($_)) $name) })
                 } while ($new.Count -eq 0 -and (Get-Date) -lt $deadline)
                 foreach ($h in $new) { $ownWindows.Add($h) }
                 $ok = $new.Count -gt 0
@@ -281,14 +325,7 @@ function Open-Apps([int]$count) {
                 $h = [VitroPerf]::OpenWindow($tag)
                 if ($h -ne [IntPtr]::Zero) { $ownWindows.Add($h); $ok = $true }
             }
-            default {
-                $realName = if ($app[1] -eq 'CalculatorApp' -and -not (Get-Command CalculatorApp.exe -ErrorAction SilentlyContinue) -and (Test-Path "$env:WINDIR\System32\win32calc.exe")) { 'win32calc' } else { $app[1] }
-                $ok = Start-Tracked $app[0] $null $realName
-                if (-not $ok -and $app[1] -eq 'CalculatorApp') {
-                    # Classic calc (Windows Server): calc.exe itself owns the window.
-                    $ok = Start-Tracked $app[0] $null 'calc'
-                }
-            }
+            default { $ok = Start-Tracked $app[0] $app[1] }
         }
         if ($ok) { $n++ } else { Write-Note "no window for $($app[0])" }
     }
@@ -312,6 +349,18 @@ function Stop-Vitrobar {
 }
 
 function Close-Apps {
+    # Children the started apps spawned since are theirs, so ours too.
+    foreach ($c in @(Get-CimInstance Win32_Process | Where-Object { $ownPids -contains [int]$_.ParentProcessId })) {
+        if ($ownPids -notcontains [int]$c.ProcessId) { $ownPids.Add([int]$c.ProcessId) }
+    }
+    # A File Explorer window on one of this run's folders that showed up too late to be
+    # tracked is still ours (the folder names are unique to this run).
+    foreach ($h in [VitroPerf]::WindowsOfClass('CabinetWClass')) {
+        if ($ownWindows -notcontains $h -and [VitroPerf]::Title($h).StartsWith("$tag-")) {
+            $ownWindows.Add($h)
+            $failures.Add('explorer_window_tracked_late')
+        }
+    }
     foreach ($h in $ownWindows) { if ([VitroPerf]::Alive($h)) { [VitroPerf]::Close($h) } }
     foreach ($id in $ownPids) { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue }
     $deadline = (Get-Date).AddSeconds(5)
@@ -340,7 +389,7 @@ try {
 
     $opened = Open-Apps $Apps
     $result.apps = $opened
-    if ($opened -lt $Apps) { Write-Note "opened $opened of $Apps apps" }
+    if ($opened -lt $Apps) { $failures.Add("apps_opened_$opened`_of_$Apps") }
 
     Start-Sleep -Seconds $SettleSeconds
 
@@ -366,28 +415,38 @@ try {
 } catch {
     $failures.Add("error: $($_.Exception.Message)")
 } finally {
-    Stop-Vitrobar
-    Close-Apps
-    # The safety net, whatever happened above.
-    try { Start-Process -FilePath $exePath -ArgumentList '--restore' -Wait } catch { $failures.Add('restore_failed') }
+    # Every step on its own: a failing one never skips the ones after it, and the JSON is
+    # always printed.
+    try { Stop-Vitrobar } catch { $failures.Add("stop_vitrobar: $($_.Exception.Message)") }
+    try { Close-Apps } catch { $failures.Add("close_apps: $($_.Exception.Message)") }
+    try {
+        # The safety net, whatever happened above.
+        $r = Start-Process -FilePath $exePath -ArgumentList '--restore' -Wait -PassThru
+        if ($r.ExitCode -ne 0) { $failures.Add("restore_exit_$($r.ExitCode)") }
+    } catch { $failures.Add("restore_failed: $($_.Exception.Message)") }
     $env:VITROBAR_SETTINGS = $oldSettingsEnv
-    $runAfter = (Get-ItemProperty -LiteralPath $runKey -Name Vitrobar -ErrorAction SilentlyContinue)
-    $runAfter = if ($runAfter) { $runAfter.Vitrobar } else { $null }
-    if ($runAfter -ne $runBefore) {
-        if ($null -eq $runBefore) { Remove-ItemProperty -LiteralPath $runKey -Name Vitrobar -ErrorAction SilentlyContinue }
-        else { Set-ItemProperty -LiteralPath $runKey -Name Vitrobar -Value $runBefore }
-        $failures.Add('autostart_changed')
-    }
-    $explorer = @(Get-Process -Name explorer -ErrorAction SilentlyContinue | ForEach-Object Id)
-    $owner = [VitroPerf]::TrayOwner()
-    if ($owner -ne 0) {
-        $shellOk = ($explorer -contains [int]$owner) -and ([VitroPerf]::TrayCount() -eq 1) -and [VitroPerf]::TrayVisible()
-        $result.shell_ok = $shellOk
-        if (-not $shellOk) { $failures.Add('shell_not_restored') }
-    } else {
-        $result.shell_ok = $null   # no Explorer taskbar on this machine (e.g. a CI runner)
-    }
-    Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
+    try {
+        $runAfter = (Get-ItemProperty -LiteralPath $runKey -Name Vitrobar -ErrorAction SilentlyContinue)
+        $runAfter = if ($runAfter) { $runAfter.Vitrobar } else { $null }
+        if ($runAfter -ne $runBefore) {
+            if ($null -eq $runBefore) { Remove-ItemProperty -LiteralPath $runKey -Name Vitrobar -ErrorAction SilentlyContinue }
+            else { Set-ItemProperty -LiteralPath $runKey -Name Vitrobar -Value $runBefore }
+            $failures.Add('autostart_changed')
+        }
+    } catch { $failures.Add("run_key: $($_.Exception.Message)") }
+    try {
+        $explorer = @(Get-Process -Name explorer -ErrorAction SilentlyContinue | ForEach-Object Id)
+        $owner = [VitroPerf]::TrayOwner()
+        if ($owner -ne 0) {
+            $shellOk = ($explorer -contains [int]$owner) -and ([VitroPerf]::TrayCount() -eq 1) -and [VitroPerf]::TrayVisible()
+            $result.shell_ok = $shellOk
+            if (-not $shellOk) { $failures.Add('shell_not_restored') }
+        } else {
+            $result.shell_ok = $null   # no Explorer taskbar on this machine (e.g. a CI runner)
+        }
+    } catch { $failures.Add("shell_check: $($_.Exception.Message)") }
+    try { Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction Stop }
+    catch { Write-Note "could not remove $temp`: $($_.Exception.Message)" }
     $result.failures = @($failures)
     $result.pass = ($failures.Count -eq 0)
     $result | ConvertTo-Json -Compress

@@ -251,21 +251,34 @@ show no console window; add `--console` to see diagnostics in the console that s
 
 Introduced by stage 1, Task 16. Run on a laptop with an integrated and a discrete GPU, on
 battery and on mains, with a release build. `scripts/perf-check.ps1` opens its own test
-windows (Character Map ×3, Paint ×3, File Explorer ×2 on a temp folder, Calculator, one
+windows (Character Map ×3, Paint ×3, File Explorer ×2 on temp folders, Calculator, one
 plain test window), uses a throw-away settings file and closes only what it opened; quit
 any running Vitrobar first (the script refuses to start next to one).
+
+**Controlled desktop.** The memory gate measures the bar with everything that is open, so
+run it on a quiet desktop: no apps open beyond the usual tray ones, and do not open or
+close apps while it runs. Do not open Calculator yourself meanwhile either: the check takes
+the first Calculator process that appears after its launch as its own (calc.exe only asks
+Windows to start the packaged app). Explorer windows are recognised by their unique temp
+folder name, Character Map and Paint by the process the check started.
 
 1. `pwsh scripts/perf-check.ps1 -Exe target\release\vitrobar.exe -MeasureStartup` → one
    line of JSON with `"pass": true`:
    - `memory_mb` < 40: the largest sum of private bytes (`PrivateMemorySize64`, the
      commit charge) of all Vitrobar processes (watchdog + bar) over 30 s, bar idle, panels
-     closed, 10 apps open (plus whatever else is open on the desktop);
-   - `cpu_ms` ≤ 50: CPU time of all Vitrobar processes over those 30 s;
+     closed, 10 apps open. Expected since the WARP drawing device (Task 16): about 14–15 MB
+     (bar ~12.5–13, watchdog ~1.7); a number near 40 means the content is drawn on a
+     hardware device again;
+   - `cpu_ms` ≤ 50: CPU time of all Vitrobar processes over those 30 s (with WARP a clock
+     redraw in the window can show as one 15.6 ms tick);
    - `exe_mb` < 5;
    - `startup_ms` < 300: launch of `vitrobar.exe` (the watchdog) until a visible
-     `VitrobarBar` window exists (polled every ~2 ms through `EnumWindows`);
+     `VitrobarBar` window exists (polled every ~2 ms through `EnumWindows`). Expected about
+     200 ms: the bar shows first and takes the stock taskbar over right after (ruling R12),
+     so the stock taskbar may stay visible under the bar for about half a second;
    - `shell_ok` true: afterwards Explorer's `Shell_TrayWnd` is the only one and visible.
-   `failures` names every budget missed. Run it 3 times; all 3 must pass.
+   `failures` names every budget missed, and every test window left open. Run it 3 times;
+   all 3 must pass.
 2. GPU idle: with the bar idle and no panel open, Task Manager › Details › "GPU" column shows
    0 for `vitrobar.exe` for 60 s. Repeat for each material (`material = "frosted"`,
    `"liquid"`, `"smoked"`, `"solid-black"`, `"solid-white"` in `settings.toml`, restart the
@@ -273,4 +286,5 @@ any running Vitrobar first (the script refuses to start next to one).
 3. Discrete GPU: it stays in low power / off while Vitrobar runs (NVIDIA or AMD control
    panel, or `Get-Counter '\GPU Engine(*)\Utilization Percentage'` lists no engine with the
    discrete GPU's LUID for the `vitrobar.exe` process id). The Performance tab of Task
-   Manager shows "GPU 1" (discrete) at 0 % with only Vitrobar running.
+   Manager shows "GPU 1" (discrete) at 0 % with only Vitrobar running. Vitrobar's own
+   drawing uses WARP (no GPU at all); the glass is composited by DWM.

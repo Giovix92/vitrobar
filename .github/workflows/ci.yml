@@ -31,10 +31,11 @@ jobs:
           name: vitrobar-x64
           path: bin
       # Enforces the exe-size and idle-CPU budgets. Memory is reported, not enforced: the
-      # runner has no GPU, so D3D runs on WARP (the software rasterizer), whose allocations
-      # are nothing like a real driver's (the GPU driver is most of the bar's private bytes
-      # on real hardware). The 40 MB budget is enforced by local runs of the same script on
-      # a real machine (docs/release-checklist.md, "Performance"). GPU use is checked by hand.
+      # runner's desktop is not the controlled one the memory gate needs (possibly no
+      # Explorer shell, so no stock taskbar, tray icons or File Explorer windows; other
+      # Windows components loaded), so its figure is not comparable. The 40 MB budget is
+      # enforced by local runs of the same script (docs/release-checklist.md,
+      # "Performance"). GPU use is checked by hand.
       - name: Performance budget check
         shell: pwsh
         run: ./scripts/perf-check.ps1 -Exe bin/vitrobar.exe -MemoryReportOnly
