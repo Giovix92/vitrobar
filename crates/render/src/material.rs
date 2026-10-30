@@ -7,9 +7,7 @@ use windows::UI::Color;
 use windows::UI::Composition::{CompositionBrush, Compositor, ContainerVisual, ShapeVisual};
 use windows_numerics::Vector2;
 
-use crate::compositor::Comp;
-
-fn color(c: Rgba) -> Color {
+pub(crate) fn color(c: Rgba) -> Color {
     Color {
         A: c.3,
         R: c.0,
@@ -44,13 +42,13 @@ fn stroke_shape(
     Ok(visual)
 }
 
+/// `comp` may be a `&Comp` too (it derefs to the compositor).
 pub fn backdrop_visual(
-    c: &Comp,
+    comp: &Compositor,
     style: &MaterialStyle,
     size: Vector2,
     radius: f32,
 ) -> Result<ContainerVisual> {
-    let comp = &c.compositor;
     let radius = radius.min(size.X / 2.0).min(size.Y / 2.0).max(0.0);
 
     let root = comp.CreateContainerVisual()?;
