@@ -1,0 +1,122 @@
+//! Taking over and restoring the stock taskbar. These change the real shell state (auto-hide,
+//! the taskbar's visibility, a RunOnce value), so they are ignored by default. Run them on a
+//! dev machine, one at a time:
+//!
+//! `cargo test -p vitro-win --test stock_taskbar -- --ignored --test-threads=1`
+//!
+//! Every test ends with the shell exactly as it found it.
+
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+use vitro_core::settings::StockTaskbar;
+use vitro_win::stock_taskbar::{
+    autohide_now, restore_stock_taskbar, runonce_exists, stock_taskbar_visible,
+    take_over_stock_taskbar, RestoreRecord,
+};
+
+fn temp_record(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("vitrobar-test-{}", std::process::id()));
+    let p = dir.join(name).join("restore.json");
+    let _ = std::fs::remove_file(&p);
+    p
+}
+
+fn temp_missing() -> PathBuf {
+    temp_record("missing")
+}
+
+/// Waits (briefly) for the asynchronous show/hide of Explorer's windows to land.
+fn eventually(mut f: impl FnMut() -> bool) -> bool {
+    let end = Instant::now() + Duration::from_secs(2);
+    loop {
+        if f() {
+            return true;
+        }
+        if Instant::now() > end {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Puts the shell back if an assertion failed half-way.
+struct Cleanup(PathBuf);
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        let _ = restore_stock_taskbar(&self.0);
+    }
+}
+
+#[test]
+#[ignore = "changes the real stock taskbar"]
+fn record_written_before_change_and_removed_after_restore() {
+    let original = autohide_now();
+    assert!(!runonce_exists(), "a VitrobarRestore value is already set");
+    let p = temp_record("record");
+    let _c = Cleanup(p.clone());
+    take_over_stock_taskbar(StockTaskbar::AutoHide, &p).unwrap();
+    assert!(p.exists());
+    let text = std::fs::read_to_string(&p).unwrap();
+    assert_eq!(
+        RestoreRecord::from_json(&text),
+        Some(RestoreRecord {
+            original_autohide: original
+        })
+    );
+    assert!(runonce_exists());
+    assert!(autohide_now());
+    restore_stock_taskbar(&p).unwrap();
+    assert!(!p.exists());
+    assert_eq!(autohide_now(), original);
+    assert!(!runonce_exists());
+    assert!(eventually(stock_taskbar_visible));
+}
+
+#[test]
+#[ignore = "changes the real stock taskbar"]
+fn restore_without_record_is_noop() {
+    let original = autohide_now();
+    assert!(restore_stock_taskbar(&temp_missing()).is_ok());
+    assert_eq!(autohide_now(), original);
+    assert!(!runonce_exists());
+}
+
+#[test]
+#[ignore = "changes the real stock taskbar"]
+fn restore_twice_is_safe() {
+    let original = autohide_now();
+    let p = temp_record("twice");
+    let _c = Cleanup(p.clone());
+    take_over_stock_taskbar(StockTaskbar::Hidden, &p).unwrap();
+    assert!(
+        eventually(|| !stock_taskbar_visible()),
+        "Hidden mode leaves the stock taskbar visible"
+    );
+    restore_stock_taskbar(&p).unwrap();
+    restore_stock_taskbar(&p).unwrap();
+    assert!(!p.exists());
+    assert_eq!(autohide_now(), original);
+    assert!(!runonce_exists());
+    assert!(eventually(stock_taskbar_visible));
+}
+
+#[test]
+#[ignore = "changes the real stock taskbar"]
+fn second_take_over_keeps_the_first_original() {
+    // A run that crashed left its record behind: the next run must not record the
+    // auto-hide it set itself as "the original".
+    let original = autohide_now();
+    let p = temp_record("crash");
+    let _c = Cleanup(p.clone());
+    take_over_stock_taskbar(StockTaskbar::AutoHide, &p).unwrap();
+    take_over_stock_taskbar(StockTaskbar::AutoHide, &p).unwrap();
+    let text = std::fs::read_to_string(&p).unwrap();
+    assert_eq!(
+        RestoreRecord::from_json(&text).map(|r| r.original_autohide),
+        Some(original)
+    );
+    restore_stock_taskbar(&p).unwrap();
+    assert_eq!(autohide_now(), original);
+    assert!(!runonce_exists());
+}

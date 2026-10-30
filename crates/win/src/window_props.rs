@@ -94,7 +94,7 @@ fn pid_of(hwnd: HWND) -> u32 {
     pid
 }
 
-fn class_name(hwnd: HWND) -> String {
+pub(crate) fn class_name(hwnd: HWND) -> String {
     let mut buf = [0u16; 256];
     // SAFETY: the slice is the output buffer.
     let n = unsafe { GetClassNameW(hwnd, &mut buf) };

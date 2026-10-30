@@ -9,6 +9,8 @@
 use std::cell::RefCell;
 use std::sync::OnceLock;
 
+use vitro_win::appbar::WM_VITRO_APPBAR;
+use vitro_win::stock_taskbar::taskbar_created_msg;
 use vitro_win::window_tracker::{
     shell_hook_message_id, take_window_event, translate_shell_hook, WindowEvent,
     WM_VITRO_WINDOW_EVENT,
@@ -16,9 +18,11 @@ use vitro_win::window_tracker::{
 use windows::core::{w, Error, Result, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Shell::{ABN_FULLSCREENAPP, ABN_POSCHANGED};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, PeekMessageW, RegisterClassExW, MSG, PM_REMOVE,
-    SPI_SETCLIENTAREAANIMATION, WM_APP, WM_DWMCOLORIZATIONCOLORCHANGED, WM_SETTINGCHANGE,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, PeekMessageW, PostQuitMessage,
+    RegisterClassExW, MSG, PM_REMOVE, SPI_SETCLIENTAREAANIMATION, WM_APP, WM_CLOSE,
+    WM_DISPLAYCHANGE, WM_DWMCOLORIZATIONCOLORCHANGED, WM_ENDSESSION, WM_SETTINGCHANGE,
     WM_THEMECHANGED, WM_TIMECHANGE, WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
@@ -33,6 +37,8 @@ pub const TIMER_HOVER_SHOW: usize = 0x5703;
 pub const TIMER_HOVER_HIDE: usize = 0x5704;
 /// One-shot: the hover motion has finished, so the bar margins can collapse.
 pub const TIMER_MARGIN_COLLAPSE: usize = 0x5705;
+/// One-shot after `TaskbarCreated`: Explorer may show its taskbar again once it is up.
+pub const TIMER_REASSERT: usize = 0x5706;
 
 /// Everything the notify window received since the last [`take_inbox`].
 #[derive(Debug, Default, PartialEq)]
@@ -47,6 +53,16 @@ pub struct Inbox {
     pub clock: bool,
     /// Icon results are waiting in the icon loader.
     pub icons: bool,
+    /// A system setting changed: Explorer may have shown its taskbar again.
+    pub shell: bool,
+    /// The display configuration changed (also re-claims the appbar's strip).
+    pub display: bool,
+    /// Explorer (re)created its taskbar (`TaskbarCreated`).
+    pub taskbar_created: bool,
+    /// `ABN_POSCHANGED`: the appbar must claim its strip again.
+    pub appbar_pos: bool,
+    /// A full-screen app may have opened or closed (`ABN_FULLSCREENAPP`).
+    pub fullscreen: bool,
 }
 
 thread_local! {
@@ -60,6 +76,15 @@ pub fn take_inbox() -> Inbox {
 
 fn with_inbox(f: impl FnOnce(&mut Inbox)) {
     INBOX.with(|i| f(&mut i.borrow_mut()));
+}
+
+/// An appbar notification ([`WM_VITRO_APPBAR`]) reached one of our windows.
+pub fn record_appbar(code: u32) {
+    match code {
+        ABN_POSCHANGED => with_inbox(|i| i.appbar_pos = true),
+        ABN_FULLSCREENAPP => with_inbox(|i| i.fullscreen = true),
+        _ => {}
+    }
 }
 
 pub struct NotifyWindow {
@@ -91,7 +116,28 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             with_inbox(|i| i.icons = true);
             return LRESULT(0);
         }
+        WM_VITRO_APPBAR => {
+            record_appbar(wparam.0 as u32);
+            return LRESULT(0);
+        }
+        WM_ENDSESSION => {
+            if wparam.0 != 0 {
+                // The process may end as soon as this returns: restore now, synchronously.
+                crate::shell::restore_now();
+                // SAFETY: plain call.
+                unsafe { PostQuitMessage(0) };
+            }
+            return LRESULT(0);
+        }
+        WM_CLOSE => {
+            // Someone asked Vitrobar to close: quit cleanly (the loop restores the shell).
+            // SAFETY: plain call.
+            unsafe { PostQuitMessage(0) };
+            return LRESULT(0);
+        }
+        WM_DISPLAYCHANGE => with_inbox(|i| i.display = true),
         WM_SETTINGCHANGE => {
+            with_inbox(|i| i.shell = true);
             let animations = wparam.0 as u32 == SPI_SETCLIENTAREAANIMATION.0;
             match setting_area(lparam).as_deref() {
                 Some("ImmersiveColorSet") => with_inbox(|i| i.theme = true),
@@ -102,6 +148,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_DWMCOLORIZATIONCOLORCHANGED | WM_THEMECHANGED => with_inbox(|i| i.theme = true),
         WM_TIMECHANGE => with_inbox(|i| i.clock = true),
+        m if m == taskbar_created_msg() => {
+            with_inbox(|i| i.taskbar_created = true);
+            return LRESULT(0);
+        }
         m if m == shell_hook_message_id() => {
             if let Some(ev) = translate_shell_hook(wparam, lparam) {
                 with_inbox(|i| i.events.push(ev));
@@ -167,6 +217,8 @@ impl Drop for NotifyWindow {
         let mut msg = MSG::default();
         // SAFETY: every WM_VITRO_WINDOW_EVENT on this window was posted by the tracker; the
         // ones still queued were never dispatched and are reclaimed here exactly once.
+        // PeekMessage returns WM_QUIT whatever the filter (the bar windows post one when they
+        // are destroyed), so only real window events are reclaimed.
         unsafe {
             while PeekMessageW(
                 &mut msg,
@@ -177,7 +229,9 @@ impl Drop for NotifyWindow {
             )
             .as_bool()
             {
-                let _ = take_window_event(msg.lParam);
+                if msg.message == WM_VITRO_WINDOW_EVENT && msg.hwnd == self.hwnd {
+                    let _ = take_window_event(msg.lParam);
+                }
             }
             let _ = DestroyWindow(self.hwnd);
         }
@@ -200,6 +254,29 @@ mod tests {
                 DispatchMessageW(&msg);
             }
         }
+    }
+
+    #[test]
+    fn drop_with_a_pending_quit_reclaims_only_window_events() {
+        let n = NotifyWindow::create().unwrap();
+        let ev = Box::into_raw(Box::new(WindowEvent::Flash(1)));
+        // SAFETY: the box is handed over to the message; the drop reclaims it.
+        unsafe {
+            PostMessageW(
+                Some(n.hwnd),
+                WM_VITRO_WINDOW_EVENT,
+                WPARAM(0),
+                LPARAM(ev as isize),
+            )
+            .unwrap();
+            // As a destroyed bar window does.
+            PostQuitMessage(0);
+        }
+        drop(n);
+        // The quit is consumed (or still pending); clear it so it cannot leak into other tests.
+        let mut msg = MSG::default();
+        // SAFETY: draining this test thread's own queue.
+        unsafe { while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {} }
     }
 
     #[test]
@@ -232,6 +309,20 @@ mod tests {
                 Some(WPARAM(SPI_SETCLIENTAREAANIMATION.0 as usize)),
                 Some(LPARAM(0)),
             );
+            SendMessageW(n.hwnd, taskbar_created_msg(), None, None);
+            SendMessageW(n.hwnd, WM_DISPLAYCHANGE, None, None);
+            SendMessageW(
+                n.hwnd,
+                WM_VITRO_APPBAR,
+                Some(WPARAM(ABN_FULLSCREENAPP as usize)),
+                Some(LPARAM(1)),
+            );
+            SendMessageW(
+                n.hwnd,
+                WM_VITRO_APPBAR,
+                Some(WPARAM(ABN_POSCHANGED as usize)),
+                None,
+            );
             SetTimer(Some(n.hwnd), TIMER_CLOCK, 1, None);
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -242,6 +333,8 @@ mod tests {
             vec![WindowEvent::Flash(42), WindowEvent::Destroyed(7)]
         );
         assert!(inbox.icons && inbox.clock && inbox.theme);
+        assert!(inbox.shell && inbox.display && inbox.taskbar_created);
+        assert!(inbox.fullscreen && inbox.appbar_pos);
         assert!(inbox.timers.contains(&TIMER_CLOCK));
         assert_eq!(take_inbox(), Inbox::default());
     }

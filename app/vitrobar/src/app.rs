@@ -1,8 +1,13 @@
 //! App state and the event-driven message loop (nothing redraws unless something happened).
 //!
 //! Timers: the minute clock tick, the tracker's coalescing timers, a one-shot GPU
-//! recreation retry and the one-shot hover timers of the thumbnail strip. Everything else is
-//! driven by window, shell and input messages.
+//! recreation retry, the one-shot hover timers of the thumbnail strip and a one-shot that
+//! hides the stock taskbar again after Explorer restarted. Everything else is driven by
+//! window, shell and input messages.
+//!
+//! The stock taskbar is taken over before the bar appears and given back on every way out
+//! ([`StockGuard`]); the main bar window is an appbar that reserves the bar's strip; the bar
+//! hides while a full-screen app covers its monitor.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -21,6 +26,7 @@ use vitro_render::compositor::{init_compositor, Comp};
 use vitro_render::device::{create_gpu_device, GpuDevice};
 use vitro_render::flyout::{live_thumbnails, Flyout, ThumbnailStrip};
 use vitro_render::surfaces::{FontKind, Painter};
+use vitro_win::appbar::{is_fullscreen_on, reserved_rect, AppBar};
 use vitro_win::desktops::Desktops;
 use vitro_win::launch::{activate_window, minimize_window, open_stock_start};
 use vitro_win::monitors::{list_monitors, MonitorInfo};
@@ -30,7 +36,9 @@ use vitro_win::window_tracker::{WindowEvent, WindowTracker};
 use windows::core::{Error, Result, BOOL};
 use windows::Win32::Foundation::{E_FAIL, HWND, LPARAM, WAIT_FAILED, WAIT_OBJECT_0, WPARAM};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
-use windows::Win32::System::Console::SetConsoleCtrlHandler;
+use windows::Win32::System::Console::{
+    SetConsoleCtrlHandler, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+};
 use windows::Win32::System::Threading::{GetCurrentThreadId, INFINITE};
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetForegroundWindow, KillTimer, MsgWaitForMultipleObjectsEx, PeekMessageW,
@@ -45,8 +53,9 @@ use crate::icon_loader::{IconLoader, IconSrc, Lookup, MAX_ICON_PX};
 use crate::launcher::{Job, Launcher};
 use crate::notify::{
     take_inbox, Inbox, NotifyWindow, TIMER_CLOCK, TIMER_GPU_RETRY, TIMER_HOVER_HIDE,
-    TIMER_HOVER_SHOW, TIMER_MARGIN_COLLAPSE,
+    TIMER_HOVER_SHOW, TIMER_MARGIN_COLLAPSE, TIMER_REASSERT,
 };
+use crate::shell::{self, StockGuard};
 use crate::window_set::WindowSet;
 
 /// Command-line options for the bar process.
@@ -70,18 +79,22 @@ const HOVER_HIDE_MS: u32 = 300;
 /// Highest point of the springy hover curve, cubic-bezier(0.3, 1.6, 0.5, 1): about 1.11 of
 /// the distance to the target.
 const SPRING_PEAK: f32 = 1.12;
+/// After `TaskbarCreated`, hide the stock taskbar once more this long later (Explorer can
+/// show it after its broadcast).
+const REASSERT_MS: u32 = 1000;
 
 static UI_THREAD: AtomicU32 = AtomicU32::new(0);
 
-unsafe extern "system" fn on_console_ctrl(_ctrl_type: u32) -> BOOL {
+unsafe extern "system" fn on_console_ctrl(ctrl_type: u32) -> BOOL {
     // Ctrl+C, Ctrl+Break, console close: ask the UI thread to quit cleanly.
     let tid = UI_THREAD.load(Ordering::SeqCst);
     // SAFETY: posting a message to a thread id carries no pointers.
-    unsafe {
-        PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0))
-            .is_ok()
-            .into()
+    let posted = unsafe { PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0)).is_ok() };
+    if [CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT].contains(&ctrl_type) {
+        // The process ends soon after this returns: give the stock taskbar back from here.
+        shell::restore_now();
     }
+    posted.into()
 }
 
 fn settings_path() -> Option<PathBuf> {
@@ -175,12 +188,16 @@ struct Dirty {
     clock: bool,
     icons: bool,
     visuals: bool,
+    /// Check whether a full-screen app covers the bar's monitor.
+    fullscreen: bool,
 }
 
 struct App {
-    // Field order = drop order: the strip, the bars, then the tracker (before its notify
-    // window), then the notify window (drains queued events), then the GPU objects, the
-    // compositor last.
+    // Field order = drop order: the appbar (unregistered before its window goes), the strip,
+    // the bars, then the tracker (before its notify window), then the notify window (drains
+    // queued events), then the GPU objects, the compositor, and last the stock taskbar guard
+    // (the shell is restored after the appbar is gone).
+    appbar: Option<AppBar>,
     strip: Option<Strip>,
     bars: Vec<Bar>,
     tracker: WindowTracker,
@@ -191,6 +208,7 @@ struct App {
     painter: Painter,
     gpu: GpuDevice,
     comp: Comp,
+    stock: StockGuard,
 
     opts: Options,
     settings: Settings,
@@ -222,20 +240,19 @@ struct App {
     /// A click on the hovered app: no strip opens until the cursor moves to another item.
     show_suppressed: bool,
     gpu_lost: bool,
+    /// A full-screen app covers the bar's monitor: the bar windows are hidden.
+    fullscreen: bool,
     /// The minute timer could not be armed; retried on the next flush.
     clock_unarmed: bool,
     last_dump: String,
 }
 
 impl App {
-    fn new(opts: Options) -> Result<Self> {
+    /// `stock` is dropped (and the shell restored) if creating the app fails.
+    fn new(opts: Options, settings: Settings, stock: StockGuard) -> Result<Self> {
         let comp = init_compositor()?;
         let gpu = create_gpu_device(&comp)?;
         let painter = Painter::new(&gpu)?;
-        // Read only: defaults when missing; the settings file is not written yet.
-        let settings = settings_path()
-            .map(|p| settings::load(&p))
-            .unwrap_or_default();
         // Primary monitor only in this stage (multi-monitor is Task 14).
         let monitor = list_monitors()
             .into_iter()
@@ -252,6 +269,7 @@ impl App {
             IconLoader::start(notify.hwnd).map_err(|e| Error::new(E_FAIL, e.to_string()))?;
         let launcher = Launcher::start(None).map_err(|e| Error::new(E_FAIL, e.to_string()))?;
         let mut app = Self {
+            appbar: None,
             strip: None,
             bars: Vec::new(),
             tracker,
@@ -262,6 +280,7 @@ impl App {
             painter,
             gpu,
             comp,
+            stock,
             opts,
             style: style_for(&settings, &sys),
             hover_style: hover_style(settings.hover),
@@ -299,6 +318,7 @@ impl App {
             flyout_pressed: None,
             show_suppressed: false,
             gpu_lost: false,
+            fullscreen: false,
             clock_unarmed: false,
             last_dump: String::new(),
         };
@@ -308,6 +328,7 @@ impl App {
         let all = app.tracker.enumerate();
         app.windows.load(&all, &app.desktops);
         app.regroup();
+        app.set_fullscreen(is_fullscreen_on(app.monitor.id));
         app.refresh()?;
         Ok(app)
     }
@@ -496,12 +517,13 @@ impl App {
                 draw_failed = Some(e);
                 break;
             }
-            if !bar.shown {
+            if !bar.shown && !self.fullscreen {
                 bar.window.show();
                 bar.shown = true;
             }
         }
         self.layout = layout;
+        self.sync_appbar();
         if let Some(e) = draw_failed {
             // Carry 2: a failed draw is usually a lost device; recover (or retry later).
             if self.gpu.is_lost() {
@@ -517,6 +539,73 @@ impl App {
             self.dump_state();
         }
         Ok(())
+    }
+
+    /// Keeps the main bar window registered as the appbar reserving the bar's strip.
+    fn sync_appbar(&mut self) {
+        let Some(bar) = self.bars.first() else {
+            self.drop_appbar();
+            return;
+        };
+        let hwnd = bar.window.hwnd;
+        let reserved = (self.layout.reserved * self.scale).round() as i32;
+        let (edge, mon) = (self.settings.position, self.monitor.rect_px);
+        match &mut self.appbar {
+            Some(ab) if ab.hwnd() == hwnd => ab.update(edge, mon, reserved),
+            _ => {
+                self.drop_appbar();
+                match AppBar::register(hwnd, edge, mon, reserved) {
+                    Ok(ab) => {
+                        shell::set_appbar_hwnd(Some(hwnd));
+                        self.appbar = Some(ab);
+                    }
+                    Err(e) => eprintln!("vitrobar: could not reserve the bar's space: {e}"),
+                }
+            }
+        }
+    }
+
+    fn drop_appbar(&mut self) {
+        if self.appbar.take().is_some() {
+            shell::set_appbar_hwnd(None);
+        }
+    }
+
+    /// Explorer restarted: hide its new taskbar and register the appbar with the new shell.
+    fn on_taskbar_created(&mut self) {
+        self.stock.on_taskbar_created();
+        if let Some(ab) = &mut self.appbar {
+            if let Err(e) = ab.reregister() {
+                eprintln!("vitrobar: could not reserve the bar's space again: {e}");
+            }
+        }
+        // SAFETY: one-shot timer on our own window (killed when it fires).
+        unsafe { SetTimer(Some(self.notify.hwnd), TIMER_REASSERT, REASSERT_MS, None) };
+    }
+
+    /// Hides the bar (at once, no animation) while a full-screen app covers its monitor, and
+    /// lets `refresh` show it again afterwards. True if the state changed.
+    fn set_fullscreen(&mut self, on: bool) -> bool {
+        if on == self.fullscreen {
+            return false;
+        }
+        self.fullscreen = on;
+        if on {
+            self.close_strip();
+            self.cancel_show();
+            self.hover = None;
+            self.pressed = None;
+            self.tracking = None;
+            for b in &mut self.bars {
+                b.window.hide();
+                b.shown = false;
+            }
+            self.sync_expanded();
+        }
+        if self.opts.debug_state {
+            self.dump_state();
+        }
+        true
     }
 
     /// Recreates the GPU device; on failure arms a one-shot retry. True when usable again.
@@ -610,8 +699,19 @@ impl App {
             Some(Hit::App(i)) => i.to_string(),
             _ => "null".to_string(),
         };
+        let appbar = match &self.appbar {
+            Some(_) => json_rect(reserved_rect(
+                self.settings.position,
+                self.monitor.rect_px,
+                (l.reserved * s).round() as i32,
+            )),
+            None => "null".to_string(),
+        };
         let dump = format!(
-            "{{\"hover\":{},\"strip\":{},\"live_thumbnails\":{},\"bars\":[{}],\"groups\":{},\"shown\":{},\"start\":{},\"quick\":{},\"clock\":{},\"clock_text\":{},\"more\":{},\"apps\":[{}]}}",
+            "{{\"fullscreen\":{},\"stock_taken\":{},\"appbar\":{},\"hover\":{},\"strip\":{},\"live_thumbnails\":{},\"bars\":[{}],\"groups\":{},\"shown\":{},\"start\":{},\"quick\":{},\"clock\":{},\"clock_text\":{},\"more\":{},\"apps\":[{}]}}",
+            self.fullscreen,
+            self.stock.active(),
+            appbar,
             hover,
             strip,
             live_thumbnails(),
@@ -635,10 +735,13 @@ impl App {
         match ev {
             WindowEvent::Created(h) | WindowEvent::Changed(h) => {
                 dirty.windows.insert(h);
+                // The foreground window moved or resized: it may have gone full screen.
+                dirty.fullscreen |= self.foreground == Some(h);
             }
             WindowEvent::Destroyed(h) => {
                 dirty.windows.remove(&h);
                 dirty.regroup |= self.windows.remove(h);
+                dirty.fullscreen |= self.fullscreen;
             }
             WindowEvent::Activated(h) => {
                 // Carry 7: activation ends a window's attention request.
@@ -648,6 +751,7 @@ impl App {
                 }
                 dirty.regroup |= self.foreground != fg;
                 self.foreground = fg;
+                dirty.fullscreen = true;
             }
             WindowEvent::Flash(h) => {
                 // Carry 7: read_window_info never reports flashing; the event does.
@@ -663,6 +767,7 @@ impl App {
                 let fg = foreground();
                 dirty.regroup |= self.foreground != fg;
                 self.foreground = fg;
+                dirty.fullscreen = true;
             }
             WindowEvent::DesktopSwitched => {
                 dirty.regroup |= self.windows.refresh_desktops(&self.desktops);
@@ -689,6 +794,10 @@ impl App {
                         self.open_strip(i);
                     }
                 }
+            }
+            TIMER_REASSERT => {
+                self.kill_timer(TIMER_REASSERT);
+                self.stock.reassert();
             }
             TIMER_MARGIN_COLLAPSE => {
                 self.kill_timer(TIMER_MARGIN_COLLAPSE);
@@ -1119,6 +1228,17 @@ impl App {
         dirty.theme |= inbox.theme;
         dirty.clock |= inbox.clock;
         dirty.icons |= inbox.icons;
+        dirty.fullscreen |= inbox.fullscreen;
+        if inbox.taskbar_created {
+            self.on_taskbar_created();
+        } else if inbox.shell || inbox.display {
+            self.stock.reassert();
+        }
+        if inbox.appbar_pos || inbox.display {
+            if let Some(ab) = &self.appbar {
+                ab.set_pos();
+            }
+        }
     }
 
     /// Applies everything collected from one drain of the queue.
@@ -1129,6 +1249,9 @@ impl App {
             }
         }
         let mut redraw = d.visuals;
+        if d.fullscreen {
+            redraw |= self.set_fullscreen(is_fullscreen_on(self.monitor.id));
+        }
         if d.regroup {
             redraw |= self.regroup();
         }
@@ -1176,7 +1299,13 @@ pub fn run(opts: Options) -> Result<()> {
         SetConsoleCtrlHandler(Some(on_console_ctrl), true)?;
     }
 
-    let mut app = App::new(opts)?;
+    // Read only: defaults when missing; the settings file is not written yet.
+    let settings = settings_path()
+        .map(|p| settings::load(&p))
+        .unwrap_or_default();
+    // Before the bar shows; restored when `app` (or a failing `App::new`) drops it.
+    let stock = StockGuard::take_over(settings.stock_taskbar);
+    let mut app = App::new(opts, settings, stock)?;
     let mut msg = MSG::default();
     'event: loop {
         let removed = app.gpu.removed_event();

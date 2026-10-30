@@ -13,11 +13,12 @@ use std::sync::OnceLock;
 use vitro_core::layout::{BarLayout, Rect};
 use vitro_render::compositor::{window_target, Comp};
 use vitro_render::{Vector2, Vector3};
+use vitro_win::appbar::WM_VITRO_APPBAR;
 use windows::core::{w, Error, Interface, Result, BOOL, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
-    DwmSetWindowAttribute, DWMWA_USE_HOSTBACKDROPBRUSH, DWMWA_WINDOW_CORNER_PREFERENCE,
-    DWMWCP_DONOTROUND,
+    DwmSetWindowAttribute, DWMWA_TRANSITIONS_FORCEDISABLED, DWMWA_USE_HOSTBACKDROPBRUSH,
+    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
 };
 use windows::Win32::Graphics::Gdi::{
     CreateRectRgn, DeleteObject, ScreenToClient, SetWindowRgn, HRGN,
@@ -27,7 +28,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TR
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW, IsWindow, LoadCursorW,
     PostQuitMessage, RegisterClassExW, SetWindowLongPtrW, SetWindowPos, ShowWindow, GWLP_USERDATA,
-    HWND_TOPMOST, IDC_ARROW, MA_NOACTIVATE, SWP_NOACTIVATE, SW_SHOWNOACTIVATE, WM_DESTROY,
+    HWND_TOPMOST, IDC_ARROW, MA_NOACTIVATE, SWP_NOACTIVATE, SW_HIDE, SW_SHOWNOACTIVATE, WM_DESTROY,
     WM_MOUSEACTIVATE, WM_NCHITTEST, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP,
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
@@ -175,6 +176,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
         }
+        WM_VITRO_APPBAR => {
+            // The main bar window is the appbar; its notifications go to the inbox.
+            crate::notify::record_appbar(wparam.0 as u32);
+            LRESULT(0)
+        }
         WM_DESTROY => {
             // SAFETY: plain call. A bar destroyed from outside (WM_CLOSE) ends the app.
             unsafe { PostQuitMessage(0) };
@@ -223,6 +229,13 @@ pub fn create_bar_window(comp: &Comp, rect_px: PxRect, margin: (i32, i32)) -> Re
                 DWMWA_WINDOW_CORNER_PREFERENCE,
                 &corners as *const _ as *const _,
                 size_of_val(&corners) as u32,
+            )?;
+            // Hiding for a full-screen app and showing again must not animate.
+            DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_TRANSITIONS_FORCEDISABLED,
+                &on as *const BOOL as *const _,
+                size_of::<BOOL>() as u32,
             )?;
         }
         let target = window_target(comp, hwnd)?;
@@ -371,6 +384,14 @@ impl BarWindow {
         // SAFETY: plain call on our own window.
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+        }
+    }
+
+    /// Hides the window at once (DWM transitions are disabled on bar windows).
+    pub fn hide(&self) {
+        // SAFETY: plain call on our own window.
+        unsafe {
+            let _ = ShowWindow(self.hwnd, SW_HIDE);
         }
     }
 

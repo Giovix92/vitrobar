@@ -60,3 +60,47 @@ the settings menu of Task 13 can switch it live: edit the file and restart the b
    at once): every effect appears in its final state with no motion (Sweep shows no streak).
 4. After the strip closes and 2 s pass: Task Manager shows 0 % CPU for `vitrobar.exe` and no
    GPU use.
+
+## Stock taskbar
+
+Introduced by stage 1, Task 11. Vitrobar switches the stock taskbar to auto-hide (Explorer
+persists that) and, in the default `stock-taskbar = "hidden"` mode, hides it. The original
+auto-hide setting goes to `%LOCALAPPDATA%\Vitrobar\restore.json` and a
+`HKCU\Software\Microsoft\Windows\CurrentVersion\RunOnce\VitrobarRestore` value runs
+`vitrobar.exe --restore` at the next sign-in if Vitrobar never got to put it back.
+
+Before you start, note the stock taskbar's auto-hide setting (Settings > Personalization >
+Taskbar > Taskbar behaviours > "Automatically hide the taskbar"). Try it once with the setting
+off and once with it on.
+
+1. Start Vitrobar: the stock taskbar disappears. Maximize a window: it stops above the bar.
+   Repeat with `shape = "pill"`, `"islands"` and `"full"` in `settings.toml`, and with
+   `position = "top"` (the window starts below the bar). With `reserve-space-floating = false`
+   a maximized window reaches the screen edge behind a floating bar.
+2. `Stop-Process -Name explorer -Force` (with no File Explorer windows open you care about, or
+   with "Restore previous folder windows at logon" on). Within 2 s of the Explorer taskbar
+   coming back, it is hidden again; the bar still works and maximized windows still stop above
+   it.
+3. Play a YouTube video full screen (or press F11 in a browser): the bar on that monitor
+   disappears at once (no animation) and any thumbnail strip closes. Leave full screen: the bar
+   comes back.
+4. Exit Vitrobar (Ctrl+C in its console; later the menu's Exit): the stock taskbar is back,
+   with exactly the auto-hide setting you noted, and `restore.json` and the RunOnce value are
+   gone.
+5. Safety net: start Vitrobar, end it with Task Manager (End task), then run
+   `vitrobar.exe --restore` (or sign out and back in): the stock taskbar is back as before.
+6. `stock-taskbar = "auto-hide"`: the stock taskbar stays, auto-hidden, under the bar; exit puts
+   its setting back.
+
+Automated where safe (run on a dev machine; they change the real shell state and restore it):
+
+- `cargo test -p vitro-win --test stock_taskbar -- --ignored --test-threads=1`: the record is
+  written before any change, a crashed run's record is kept, restore is idempotent and removes
+  the record and the RunOnce value.
+- Steps 1 and 4 and a simulated step 2 (the taskbar is re-shown, then `TaskbarCreated` /
+  `WM_SETTINGCHANGE` reach the bar) can be scripted with test windows of your own: start
+  `vitrobar.exe --debug-state`, read the `appbar` and `bars` rects from the `vitrobar-state`
+  lines, compare with a maximized window's `DWMWA_EXTENDED_FRAME_BOUNDS`, close Vitrobar with
+  `WM_CLOSE` on its `VitrobarNotify` window and check `ABM_GETSTATE`, the taskbar's visibility,
+  `restore.json` and the RunOnce value. Step 3 needs a window that can take the foreground,
+  which a script usually cannot: check it by hand.
