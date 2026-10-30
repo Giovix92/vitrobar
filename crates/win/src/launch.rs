@@ -22,28 +22,52 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SW_SHOWNORMAL, WM_CLOSE,
 };
 
-/// Starts a pinned app: through the shortcut it was imported from while that still exists
-/// (it keeps arguments such as a web app's id), else packaged apps by AUMID, else the
-/// executable through the shell. An AUMID that does not activate (a desktop app's explicit
-/// AUMID) falls back to the executable. Blocking; needs COM initialised on the calling thread.
-pub fn launch_pin(p: &Pin) -> Result<()> {
-    if let Some(link) = p
-        .link
-        .as_deref()
-        .filter(|l| std::path::Path::new(l).is_file())
-    {
-        return shell_open(&HSTRING::from(link));
+/// One way of starting a pin, in the order [`launch_plan`] tries them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LaunchStep {
+    /// Open the shortcut the pin was imported from.
+    Link(String),
+    /// Activate the packaged app.
+    Aumid(String),
+    /// Open the executable through the shell.
+    Exe(String),
+}
+
+/// The ways to start `p`, best first: the shortcut it was imported from while that still
+/// exists (`link_exists`; it keeps arguments such as a web app's id), then its AUMID, then
+/// its executable. Empty fields are skipped.
+pub fn launch_plan(p: &Pin, link_exists: impl Fn(&str) -> bool) -> Vec<LaunchStep> {
+    let some = |v: &Option<String>| v.as_deref().filter(|s| !s.is_empty()).map(str::to_owned);
+    let mut plan = Vec::new();
+    if let Some(l) = some(&p.link).filter(|l| link_exists(l)) {
+        plan.push(LaunchStep::Link(l));
     }
-    let path = p.path.as_deref().filter(|s| !s.is_empty());
-    if let Some(aumid) = p.aumid.as_deref().filter(|a| !a.is_empty()) {
-        match activate_aumid(aumid) {
+    if let Some(a) = some(&p.aumid) {
+        plan.push(LaunchStep::Aumid(a));
+    }
+    if let Some(e) = some(&p.path) {
+        plan.push(LaunchStep::Exe(e));
+    }
+    plan
+}
+
+/// Starts a pinned app, trying each step of [`launch_plan`] until one works: a shortcut that
+/// will not open, or an AUMID that does not activate (a desktop app's explicit AUMID), falls
+/// back to the next. Returns the last failure. Blocking; needs COM initialised on the calling
+/// thread.
+pub fn launch_pin(p: &Pin) -> Result<()> {
+    let mut last = Error::new(E_INVALIDARG, "pin has neither shortcut, AUMID nor path");
+    for step in launch_plan(p, |l| std::path::Path::new(l).is_file()) {
+        let r = match &step {
+            LaunchStep::Link(l) | LaunchStep::Exe(l) => shell_open(&HSTRING::from(l.as_str())),
+            LaunchStep::Aumid(a) => activate_aumid(a),
+        };
+        match r {
             Ok(()) => return Ok(()),
-            Err(e) if path.is_none() => return Err(e),
-            Err(_) => {}
+            Err(e) => last = e,
         }
     }
-    let path = path.ok_or_else(|| Error::new(E_INVALIDARG, "pin has neither AUMID nor path"))?;
-    shell_open(&HSTRING::from(path))
+    Err(last)
 }
 
 fn activate_aumid(aumid: &str) -> Result<()> {
@@ -137,4 +161,59 @@ pub fn open_stock_quick_settings() -> Result<()> {
 /// Notification centre and calendar. Blocking.
 pub fn open_stock_notifications() -> Result<()> {
     shell_open(&HSTRING::from("ms-actioncenter:"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pin(link: Option<&str>, aumid: Option<&str>, path: Option<&str>) -> Pin {
+        Pin {
+            link: link.map(Into::into),
+            aumid: aumid.map(Into::into),
+            path: path.map(Into::into),
+            name: "x".into(),
+        }
+    }
+
+    #[test]
+    fn link_then_aumid_then_exe() {
+        let p = pin(Some("a.lnk"), Some("App!Id"), Some("a.exe"));
+        assert_eq!(
+            launch_plan(&p, |_| true),
+            vec![
+                LaunchStep::Link("a.lnk".into()),
+                LaunchStep::Aumid("App!Id".into()),
+                LaunchStep::Exe("a.exe".into()),
+            ]
+        );
+        // A shortcut that is gone is not tried.
+        assert_eq!(
+            launch_plan(&p, |_| false),
+            vec![
+                LaunchStep::Aumid("App!Id".into()),
+                LaunchStep::Exe("a.exe".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_fields_are_skipped() {
+        let p = pin(Some(""), Some(""), Some("a.exe"));
+        assert_eq!(
+            launch_plan(&p, |_| true),
+            vec![LaunchStep::Exe("a.exe".into())]
+        );
+        assert!(launch_plan(&pin(None, None, None), |_| true).is_empty());
+        let only_link = pin(Some("a.lnk"), None, None);
+        assert_eq!(
+            launch_plan(&only_link, |_| true),
+            vec![LaunchStep::Link("a.lnk".into())]
+        );
+    }
+
+    #[test]
+    fn nothing_to_launch_is_an_error() {
+        assert!(launch_pin(&pin(None, None, None)).is_err());
+    }
 }

@@ -1268,8 +1268,9 @@ impl App {
                             self.context_menu(Some(i), dirty);
                         }
                     }
-                    // Anywhere else on the bar: the bar's own menu.
-                    _ => self.context_menu(None, dirty),
+                    // Anywhere else on the bar: the bar's own menu (pressed there too).
+                    _ if pressed == hit => self.context_menu(None, dirty),
+                    _ => {}
                 }
             }
             _ => return false,
