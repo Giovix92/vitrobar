@@ -109,6 +109,11 @@ impl WindowSet {
         changed
     }
 
+    /// Every window currently known.
+    pub fn hwnds(&self) -> Vec<Hwnd> {
+        self.infos.keys().copied().collect()
+    }
+
     pub fn infos(&self) -> Vec<WindowInfo> {
         self.infos.values().cloned().collect()
     }

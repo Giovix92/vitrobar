@@ -1,6 +1,7 @@
 //! A hidden top-level window that receives everything that is not mouse input: shell hook
-//! and WinEvent window events (Task 7 tracker), timers, icon results, and the system
-//! broadcasts for theme, time, locale and animation-setting changes.
+//! and WinEvent window events (Task 7 tracker), timers, icon results, the system broadcasts
+//! for theme, time, locale, animation-setting, display and work-area changes, and the
+//! session changes (unlock, remote / console connect) it registers for.
 //!
 //! The window procedure is authoritative: whatever reaches it, from the app's own loop or
 //! from a nested modal loop (COM, shell, menus), is recorded in a per-thread [`Inbox`] that
@@ -20,12 +21,16 @@ use vitro_win::window_tracker::{
 use windows::core::{w, Error, Result, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::RemoteDesktop::{
+    WTSRegisterSessionNotification, WTSUnRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
+};
 use windows::Win32::UI::Shell::{ABN_FULLSCREENAPP, ABN_POSCHANGED};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, PeekMessageW, PostQuitMessage,
-    RegisterClassExW, MSG, PM_REMOVE, SPI_SETCLIENTAREAANIMATION, WM_APP, WM_CLOSE,
-    WM_DISPLAYCHANGE, WM_DWMCOLORIZATIONCOLORCHANGED, WM_ENDSESSION, WM_SETTINGCHANGE,
-    WM_THEMECHANGED, WM_TIMECHANGE, WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
+    RegisterClassExW, MSG, PM_REMOVE, SPI_SETCLIENTAREAANIMATION, SPI_SETWORKAREA, WM_APP,
+    WM_CLOSE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_DWMCOLORIZATIONCOLORCHANGED, WM_ENDSESSION,
+    WM_SETTINGCHANGE, WM_THEMECHANGED, WM_TIMECHANGE, WM_TIMER, WM_WTSSESSION_CHANGE, WNDCLASSEXW,
+    WS_EX_TOOLWINDOW, WS_POPUP, WTS_CONSOLE_CONNECT, WTS_REMOTE_CONNECT, WTS_SESSION_UNLOCK,
 };
 
 /// An icon finished loading on the icon thread (posted by the worker).
@@ -59,8 +64,16 @@ pub struct Inbox {
     pub icons: bool,
     /// A system setting changed: Explorer may have shown its taskbar again.
     pub shell: bool,
-    /// The display configuration changed (also re-claims the appbar's strip).
+    /// The display configuration changed (`WM_DISPLAYCHANGE`): monitors are re-read, the
+    /// appbars claim their strips again.
     pub display: bool,
+    /// A monitor's DPI changed (`WM_DPICHANGED` on a bar window or this one).
+    pub dpi: bool,
+    /// The work area changed (`WM_SETTINGCHANGE` / `SPI_SETWORKAREA`; also caused by our own
+    /// appbars): monitors are re-read, nothing else happens unless they changed.
+    pub workarea: bool,
+    /// The session was unlocked or (re)connected locally or remotely: monitors may differ.
+    pub session: bool,
     /// Explorer (re)created its taskbar (`TaskbarCreated`).
     pub taskbar_created: bool,
     /// `ABN_POSCHANGED`: the appbar must claim its strip again.
@@ -93,8 +106,23 @@ pub fn record_appbar(code: u32) {
     }
 }
 
+/// A bar window got `WM_DPICHANGED`.
+pub fn record_dpi() {
+    with_inbox(|i| i.dpi = true);
+}
+
+/// The session changes (`WM_WTSSESSION_CHANGE` codes) after which the monitors are re-read.
+pub fn session_change_matters(code: u32) -> bool {
+    matches!(
+        code,
+        WTS_SESSION_UNLOCK | WTS_REMOTE_CONNECT | WTS_CONSOLE_CONNECT
+    )
+}
+
 pub struct NotifyWindow {
     pub hwnd: HWND,
+    /// `WTSRegisterSessionNotification` succeeded (undone on drop).
+    session_registered: bool,
 }
 
 fn setting_area(lparam: LPARAM) -> Option<String> {
@@ -149,8 +177,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             return LRESULT(0);
         }
         WM_DISPLAYCHANGE => with_inbox(|i| i.display = true),
+        WM_DPICHANGED => {
+            // The layout follows the monitor's new DPI; this window is never shown or sized.
+            record_dpi();
+            return LRESULT(0);
+        }
+        WM_WTSSESSION_CHANGE => {
+            if session_change_matters(wparam.0 as u32) {
+                with_inbox(|i| i.session = true);
+            }
+            return LRESULT(0);
+        }
         WM_SETTINGCHANGE => {
             with_inbox(|i| i.shell = true);
+            if wparam.0 as u32 == SPI_SETWORKAREA.0 {
+                with_inbox(|i| i.workarea = true);
+            }
             let animations = wparam.0 as u32 == SPI_SETCLIENTAREAANIMATION.0;
             match setting_area(lparam).as_deref() {
                 Some("ImmersiveColorSet") => with_inbox(|i| i.theme = true),
@@ -219,7 +261,17 @@ impl NotifyWindow {
                 None,
             )?
         };
-        Ok(Self { hwnd })
+        // Unlock and remote / console connect can come with other monitors. Without the
+        // registration the bar still follows WM_DISPLAYCHANGE.
+        // SAFETY: plain registration of our own window; undone in drop.
+        let session_registered =
+            unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) }
+                .inspect_err(|e| eprintln!("vitrobar: no session notifications: {e}"))
+                .is_ok();
+        Ok(Self {
+            hwnd,
+            session_registered,
+        })
     }
 }
 
@@ -253,6 +305,10 @@ impl Drop for NotifyWindow {
                     let _ = take_tray_message(msg.lParam);
                 }
             }
+            // Balances the registration in `create`, while the window still exists.
+            if self.session_registered {
+                let _ = WTSUnRegisterSessionNotification(self.hwnd);
+            }
             let _ = DestroyWindow(self.hwnd);
         }
         let _ = take_inbox();
@@ -274,6 +330,28 @@ mod tests {
                 DispatchMessageW(&msg);
             }
         }
+    }
+
+    #[test]
+    fn only_unlock_and_connects_reread_the_monitors() {
+        assert!(session_change_matters(WTS_SESSION_UNLOCK));
+        assert!(session_change_matters(WTS_REMOTE_CONNECT));
+        assert!(session_change_matters(WTS_CONSOLE_CONNECT));
+        // WTS_CONSOLE_DISCONNECT, WTS_REMOTE_DISCONNECT, WTS_SESSION_LOCK.
+        for code in [2, 4, 7] {
+            assert!(!session_change_matters(code), "{code}");
+        }
+    }
+
+    #[test]
+    fn a_session_change_we_do_not_follow_is_not_recorded() {
+        let n = NotifyWindow::create().unwrap();
+        let _ = take_inbox();
+        // SAFETY: plain message to our own window.
+        unsafe {
+            SendMessageW(n.hwnd, WM_WTSSESSION_CHANGE, Some(WPARAM(7)), None);
+        }
+        assert!(!take_inbox().session);
     }
 
     #[test]
@@ -351,6 +429,19 @@ mod tests {
             );
             SendMessageW(n.hwnd, taskbar_created_msg(), None, None);
             SendMessageW(n.hwnd, WM_DISPLAYCHANGE, None, None);
+            SendMessageW(n.hwnd, WM_DPICHANGED, None, None);
+            SendMessageW(
+                n.hwnd,
+                WM_SETTINGCHANGE,
+                Some(WPARAM(SPI_SETWORKAREA.0 as usize)),
+                Some(LPARAM(0)),
+            );
+            SendMessageW(
+                n.hwnd,
+                WM_WTSSESSION_CHANGE,
+                Some(WPARAM(WTS_SESSION_UNLOCK as usize)),
+                None,
+            );
             SendMessageW(
                 n.hwnd,
                 WM_VITRO_APPBAR,
@@ -374,6 +465,7 @@ mod tests {
         );
         assert!(inbox.icons && inbox.clock && inbox.theme);
         assert!(inbox.shell && inbox.display && inbox.taskbar_created);
+        assert!(inbox.dpi && inbox.workarea && inbox.session);
         assert!(inbox.fullscreen && inbox.appbar_pos);
         assert!(inbox.timers.contains(&TIMER_CLOCK));
         assert_eq!(inbox.tray.len(), 1);

@@ -1,6 +1,8 @@
 //! Reserving the bar's strip of the screen (the work area that maximized windows respect)
 //! through the shell's AppBar interface, and telling when a full-screen app covers a monitor.
 
+use std::cell::Cell;
+
 use vitro_core::settings::Position;
 use windows::core::{Error, Result};
 use windows::Win32::Foundation::{E_FAIL, HWND, RECT};
@@ -41,6 +43,10 @@ pub fn reserved_rect(edge: Position, monitor: PxRect, reserved_px: i32) -> PxRec
     }
 }
 
+fn rect_tuple(r: &RECT) -> PxRect {
+    (r.left, r.top, r.right, r.bottom)
+}
+
 fn data(hwnd: HWND) -> APPBARDATA {
     APPBARDATA {
         cbSize: size_of::<APPBARDATA>() as u32,
@@ -69,6 +75,8 @@ pub struct AppBar {
     edge: Position,
     monitor: PxRect,
     reserved: i32,
+    /// The strip last set with `ABM_SETPOS`.
+    last_set: Cell<Option<PxRect>>,
 }
 
 impl AppBar {
@@ -87,6 +95,7 @@ impl AppBar {
             edge,
             monitor: monitor_rect_px,
             reserved: reserved_px,
+            last_set: Cell::new(None),
         };
         bar.set_pos();
         Ok(bar)
@@ -112,9 +121,28 @@ impl AppBar {
         self.set_pos();
     }
 
-    /// (Re)claims the strip: `ABM_QUERYPOS` then `ABM_SETPOS`. Also the answer to
-    /// `ABN_POSCHANGED`. The window itself is not moved: the bar layout places it.
+    /// (Re)claims the strip: `ABM_QUERYPOS` then `ABM_SETPOS`. The window itself is not
+    /// moved: the bar layout places it.
     pub fn set_pos(&self) {
+        let rc = self.query_pos();
+        self.commit(rc);
+    }
+
+    /// The answer to `ABN_POSCHANGED`: claims the strip again only if the shell now offers
+    /// a different one. With several of our appbars, each `ABM_SETPOS` notifies the others;
+    /// setting an unchanged strip again would bounce that notification between them forever.
+    pub fn on_pos_changed(&self) -> bool {
+        let rc = self.query_pos();
+        if self.last_set.get() == Some(rect_tuple(&rc)) {
+            return false;
+        }
+        self.commit(rc);
+        true
+    }
+
+    /// `ABM_QUERYPOS` for the wanted strip; the shell may move its edge (other appbars),
+    /// the thickness is kept.
+    fn query_pos(&self) -> RECT {
         let mut abd = data(self.hwnd);
         abd.uEdge = edge_of(self.edge);
         let (l, t, r, b) = reserved_rect(self.edge, self.monitor, self.reserved);
@@ -125,12 +153,19 @@ impl AppBar {
             bottom: b,
         };
         message(ABM_QUERYPOS, &mut abd);
-        // The shell may have moved the proposed edge (other appbars); keep the thickness.
         match self.edge {
             Position::Bottom => abd.rc.top = abd.rc.bottom - (b - t),
             Position::Top => abd.rc.bottom = abd.rc.top + (b - t),
         }
+        abd.rc
+    }
+
+    fn commit(&self, rc: RECT) {
+        let mut abd = data(self.hwnd);
+        abd.uEdge = edge_of(self.edge);
+        abd.rc = rc;
         message(ABM_SETPOS, &mut abd);
+        self.last_set.set(Some(rect_tuple(&rc)));
     }
 
     /// After Explorer restarted (`TaskbarCreated`): the new shell knows nothing of us.
@@ -224,12 +259,17 @@ pub fn foreground_info(hwnd: HWND) -> Option<Foreground> {
 ///
 /// [`MonitorInfo::id`]: crate::monitors::MonitorInfo::id
 pub fn is_fullscreen_on(monitor: u64) -> bool {
-    let Some(mon) = list_monitors().into_iter().find(|m| m.id == monitor) else {
-        return false;
-    };
+    list_monitors()
+        .into_iter()
+        .find(|m| m.id == monitor)
+        .is_some_and(|m| is_fullscreen_on_rect(m.rect_px))
+}
+
+/// [`is_fullscreen_on`] for a monitor rectangle already at hand (physical px).
+pub fn is_fullscreen_on_rect(monitor: PxRect) -> bool {
     // SAFETY: plain query.
     let fg = unsafe { GetForegroundWindow() };
-    foreground_info(fg).is_some_and(|f| covers_as_fullscreen(&f, mon.rect_px))
+    foreground_info(fg).is_some_and(|f| covers_as_fullscreen(&f, monitor))
 }
 
 #[cfg(test)]

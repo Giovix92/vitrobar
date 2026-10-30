@@ -1006,8 +1006,9 @@ impl BarVisual {
         let text = style.text;
         let plate_inset = px(PLATE_INSET_DIP);
         let plate_radius = px(PLATE_RADIUS_DIP);
+        // A zero-width slot (no tray area on a secondary monitor's bar) draws nothing.
         let glyph = |r: &Rect, ch: char| -> Option<CellSpec> {
-            owns(&surface, r).then(|| {
+            (owns(&surface, r) && r.w > 0.0).then(|| {
                 let rect = cell_rect(r);
                 CellSpec {
                     rect,

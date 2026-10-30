@@ -28,6 +28,7 @@ fn layout(shape: Shape, apps: usize) -> BarLayout {
         tray_count: 0,
         clock_w: 72.0,
         reserve_floating: true,
+        tray_area: true,
     })
 }
 
@@ -321,6 +322,7 @@ fn tray_icons_and_chevron_draw_once() {
         tray_count: 2,
         clock_w: 72.0,
         reserve_floating: true,
+        tray_area: true,
     };
     let l = compute_layout(&input);
     let img = Arc::new(icon(16));
@@ -360,4 +362,64 @@ fn tray_icons_and_chevron_draw_once() {
     bar.update(&l, &[], "12:34", &style, &hover).unwrap();
     assert_eq!(bar.tray_cells(), 1);
     assert!(!bar.chevron_shown());
+}
+
+#[test]
+fn bar_without_tray_area_draws_start_and_clock_only() {
+    let comp = init_compositor().unwrap();
+    let gpu = create_gpu_device(&comp).unwrap();
+    let mut bar = BarVisual::new(&comp, &gpu, 0).unwrap();
+    bar.set_env(VisualEnv {
+        animations: false,
+        ..Default::default()
+    });
+    let style = material_style(Material::Frosted, Theme::Dark, true);
+    let hover = hover_style(HoverEffect::Plate);
+    let l = compute_layout(&LayoutInput {
+        monitor: Rect {
+            x: 1536.0,
+            y: 0.0,
+            w: 1536.0,
+            h: 864.0,
+        },
+        shape: Shape::Pill,
+        position: Position::Bottom,
+        icon_size: IconSize::Medium,
+        app_count: 0,
+        tray_count: 3,
+        clock_w: 72.0,
+        reserve_floating: true,
+        tray_area: false,
+    });
+    // Even if the app handed tray items over, a bar without the tray area shows none.
+    bar.set_tray(vec![TrayItemState::default(); 3], ChevronState::default());
+    bar.update(&l, &[], "12:34", &style, &hover).unwrap();
+    assert_eq!(bar.tray_cells(), 0);
+    assert!(!bar.chevron_shown());
+    // Start and clock: no quick-settings glyph.
+    assert_eq!(bar.surfaces_drawn(), 2);
+}
+
+#[test]
+fn a_dpi_change_redraws_every_cell_at_the_new_scale() {
+    let comp = init_compositor().unwrap();
+    let gpu = create_gpu_device(&comp).unwrap();
+    let mut bar = BarVisual::new(&comp, &gpu, 0).unwrap();
+    let env = VisualEnv {
+        animations: false,
+        ..Default::default()
+    };
+    bar.set_env(env);
+    let style = material_style(Material::Frosted, Theme::Dark, true);
+    let hover = hover_style(HoverEffect::Plate);
+    let l = layout(Shape::Pill, 0);
+    bar.update(&l, &[], "12:34", &style, &hover).unwrap();
+    let first = bar.surfaces_drawn();
+    assert_eq!(first, 3, "start, quick, clock");
+    bar.update(&l, &[], "12:34", &style, &hover).unwrap();
+    assert_eq!(bar.surfaces_drawn(), first, "nothing changed");
+    // 150 %: same layout in DIPs, every cell is redrawn at 1.5x.
+    bar.set_env(VisualEnv { dpi: 144, ..env });
+    bar.update(&l, &[], "12:34", &style, &hover).unwrap();
+    assert_eq!(bar.surfaces_drawn(), 2 * first);
 }

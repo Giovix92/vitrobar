@@ -16,7 +16,7 @@ use vitro_render::compositor::{window_target, Comp};
 use vitro_render::{Vector2, Vector3};
 use vitro_win::appbar::WM_VITRO_APPBAR;
 use windows::core::{w, Error, Interface, Result, BOOL, HSTRING, PCWSTR};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_TRANSITIONS_FORCEDISABLED, DWMWA_USE_HOSTBACKDROPBRUSH,
     DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
@@ -27,11 +27,11 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW, IsWindow, LoadCursorW,
-    PostQuitMessage, RegisterClassExW, SetWindowLongPtrW, SetWindowPos, ShowWindow, GWLP_USERDATA,
-    HWND_TOPMOST, IDC_ARROW, MA_NOACTIVATE, SWP_NOACTIVATE, SW_HIDE, SW_SHOWNOACTIVATE, WM_DESTROY,
-    WM_MOUSEACTIVATE, WM_NCHITTEST, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW, GetWindowRect, IsWindow,
+    LoadCursorW, PostQuitMessage, RegisterClassExW, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    GWLP_USERDATA, HWND_TOPMOST, IDC_ARROW, MA_NOACTIVATE, SWP_NOACTIVATE, SW_HIDE,
+    SW_SHOWNOACTIVATE, WM_DESTROY, WM_DPICHANGED, WM_MOUSEACTIVATE, WM_NCHITTEST, WNDCLASSEXW,
+    WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::UI::Composition::Desktop::DesktopWindowTarget;
 use windows::UI::Composition::{ContainerVisual, Visual};
@@ -183,8 +183,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
         }
+        WM_DPICHANGED => {
+            // The suggested rectangle is not applied: the app re-reads the monitors and lays
+            // out this monitor's bar (only it) at the new DPI, which places this window.
+            crate::notify::record_dpi();
+            LRESULT(0)
+        }
         WM_VITRO_APPBAR => {
-            // The main bar window is the appbar; its notifications go to the inbox.
+            // Each monitor's main bar window is an appbar; its notifications go to the inbox.
             crate::notify::record_appbar(wparam.0 as u32);
             LRESULT(0)
         }
@@ -411,11 +417,50 @@ impl BarWindow {
 
     /// Client-area pixel position -> absolute DIP position.
     pub fn client_to_dip(&self, x: i32, y: i32, scale: f32) -> (f32, f32) {
-        (
-            (self.rect_px.0 + x) as f32 / scale,
-            (self.rect_px.1 - self.margin.0 + y) as f32 / scale,
-        )
+        client_to_dip(self.rect_px, self.margin, x, y, scale)
     }
+
+    /// Puts the window back where it belongs if something else moved it (the system moves
+    /// windows around while monitors come and go). True if it had to be moved.
+    pub fn resync(&mut self) -> bool {
+        let want = window_rect(self.rect_px, self.margin);
+        let mut r = RECT::default();
+        // SAFETY: plain query on our own window into a local.
+        if unsafe { GetWindowRect(self.hwnd, &mut r) }.is_err()
+            || (r.left, r.top, r.right, r.bottom) == want
+        {
+            return false;
+        }
+        let (l, t, rr, b) = want;
+        // SAFETY: plain call on our own window.
+        unsafe {
+            let _ = SetWindowPos(
+                self.hwnd,
+                Some(HWND_TOPMOST),
+                l,
+                t,
+                rr - l,
+                b - t,
+                SWP_NOACTIVATE,
+            );
+        }
+        true
+    }
+}
+
+/// Client px `(x, y)` of a window showing bar `rect_px` with `margin` (above, below) ->
+/// absolute DIPs at `scale` (DPI / 96).
+pub fn client_to_dip(
+    rect_px: PxRect,
+    margin: (i32, i32),
+    x: i32,
+    y: i32,
+    scale: f32,
+) -> (f32, f32) {
+    (
+        (rect_px.0 + x) as f32 / scale,
+        (rect_px.1 - margin.0 + y) as f32 / scale,
+    )
 }
 
 /// Asks for one `WM_MOUSELEAVE` when the cursor leaves `hwnd` (one of our windows).
@@ -529,6 +574,7 @@ mod tests {
             tray_count: 0,
             clock_w: 70.0,
             reserve_floating: true,
+            tray_area: true,
         }
     }
 
@@ -624,6 +670,83 @@ mod tests {
         assert!(in_margin(p, 0) && in_margin(p, 29));
         assert!(!in_margin(p, 30) && !in_margin(p, 77));
         assert!(in_margin(p, 78));
+    }
+
+    #[test]
+    fn client_to_dip_at_125_and_150_percent() {
+        // 125 %: a bar at DIP (100, 800) is px (125, 1000); client (10, 5) -> DIP (108, 804).
+        assert_eq!(
+            client_to_dip((125, 1000, 1125, 1060), (0, 0), 10, 5, 1.25),
+            (108.0, 804.0)
+        );
+        // 150 % on a monitor right of a 1920 px one, with a 30 px Magnify margin above:
+        // client y 30 is the bar's top edge.
+        let (x, y) = client_to_dip((2880, 1530, 3600, 1602), (30, 0), 15, 30, 1.5);
+        assert_eq!((x, y), (1930.0, 1020.0));
+        // The far corner of the bar maps to its DIP right / bottom edge.
+        let (x, y) = client_to_dip((2880, 1530, 3600, 1602), (30, 0), 720, 30 + 72, 1.5);
+        assert_eq!((x, y), (2400.0, 1068.0));
+        // Monitors left of / above the primary have negative coordinates.
+        assert_eq!(
+            client_to_dip((-375, -72, 2825, 0), (0, 0), 0, 0, 1.25),
+            (-300.0, -57.6)
+        );
+    }
+
+    #[test]
+    fn dpi_change_is_recorded_and_the_suggested_rect_ignored() {
+        use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
+        let comp = vitro_render::compositor::init_compositor().unwrap();
+        let rect = (100, 700, 600, 760);
+        let mut w = create_bar_window(&comp, rect, (0, 0)).unwrap();
+        let _ = crate::notify::take_inbox();
+        let suggested = RECT {
+            left: 0,
+            top: 0,
+            right: 50,
+            bottom: 50,
+        };
+        // SAFETY: in-process send to our own window; the RECT outlives the call.
+        unsafe {
+            SendMessageW(
+                w.hwnd,
+                WM_DPICHANGED,
+                Some(WPARAM(144 | (144 << 16))),
+                Some(LPARAM(&suggested as *const RECT as isize)),
+            );
+        }
+        assert!(crate::notify::take_inbox().dpi);
+        // Not moved to the suggested rectangle: the layout places the window.
+        let mut r = RECT::default();
+        // SAFETY: plain query on our own window.
+        unsafe { GetWindowRect(w.hwnd, &mut r).unwrap() };
+        assert_eq!((r.left, r.top, r.right, r.bottom), rect);
+        assert!(!w.resync(), "already where it belongs");
+        // SAFETY: moving our own test window away, as the system does on a display change.
+        unsafe { SetWindowPos(w.hwnd, None, 5, 5, 10, 10, SWP_NOACTIVATE).unwrap() };
+        assert!(w.resync());
+        // SAFETY: plain query on our own window.
+        unsafe { GetWindowRect(w.hwnd, &mut r).unwrap() };
+        assert_eq!((r.left, r.top, r.right, r.bottom), rect);
+        drop(w);
+        // Dropping a bar window does not end the app (carry 1): no WM_QUIT queued.
+        let mut msg = windows::Win32::UI::WindowsAndMessaging::MSG::default();
+        // SAFETY: draining this test thread's own queue.
+        let mut quit = false;
+        unsafe {
+            while windows::Win32::UI::WindowsAndMessaging::PeekMessageW(
+                &mut msg,
+                None,
+                0,
+                0,
+                windows::Win32::UI::WindowsAndMessaging::PM_REMOVE,
+            )
+            .as_bool()
+            {
+                quit |= msg.message == windows::Win32::UI::WindowsAndMessaging::WM_QUIT;
+            }
+        }
+        assert!(!quit);
     }
 
     #[test]

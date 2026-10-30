@@ -178,3 +178,43 @@ the import would read on this machine (read-only). The menus and their effects w
 with keyboard input to Vitrobar's own menu, against `vitrobar.exe --debug-state` with
 `VITROBAR_SETTINGS` pointing at a temporary file (`settings`, `pins`, `bars` and `appbar` in
 the `vitrobar-state` lines; `vitrobar-menu` lines name each choice).
+
+## Monitors and desktops
+
+Introduced by stage 1, Task 14. Every monitor has its own bar with its own windows; pins are
+on every bar. Only the primary monitor's bar has the tray area (overflow chevron, tray icons,
+quick settings); the other bars show Start, their apps and the clock. Each bar reserves its
+own strip of its own monitor. Best tried with two monitors at different scales.
+
+1. Start Vitrobar with two monitors: a bar on each, each with only the windows on its
+   monitor; the stock taskbar is gone from both (no sliver of an auto-hidden one at the
+   bottom of either monitor, also 5 s later). Maximize a window on each monitor: it stops
+   above that monitor's bar.
+2. Drag a window from one monitor to the other: its icon moves from one bar to the other
+   when it lands (within a fraction of a second).
+3. Plug in another monitor: a bar appears on it within 1 s, with only its windows; the
+   stock taskbar does not show up on it. Unplug it: its bar goes away and no Vitrobar window
+   is left behind (`Get-Process vitrobar` is still running; Spy++ shows no orphan
+   `VitrobarBar` window); the other bars do not flicker.
+4. Set one monitor to 150 % (Settings > System > Display > Scale): its bar is crisp and sized
+   for 150 % (72 px high for a 48 DIP bar); the other bar does not change. Set it back.
+5. Win+Ctrl+D (new virtual desktop): every bar shows only that desktop's windows, the pins
+   stay. Win+Ctrl+Left / Right: the bars follow. Close the extra desktop.
+6. Change which monitor is the main display: the tray area moves to the new primary's bar.
+7. Connect to the PC with Remote Desktop and disconnect again, and lock and unlock the PC:
+   afterwards the bars are on the right monitors, at the right size, and maximized windows
+   stop above them.
+8. Full screen (F11 in a browser) on one monitor hides only that monitor's bar.
+
+Automated where safe: run `vitrobar.exe --debug-state` with `VITROBAR_SETTINGS` pointing at a
+temporary file; each `vitrobar-state` line has a `monitors` array (id, rect, DPI, tray area,
+appbar strip, bar windows, groups with their windows) and `vitrobar-monitors` lines name each
+reconcile. Steps 1 and 2 can be scripted with test windows of your own moved with
+`SetWindowPos` (run the script Per-Monitor-V2 aware: a system-aware script sees monitors at
+another scale in scaled coordinates). Steps 3 and 4 can be simulated on any machine: set
+`VITROBAR_FAKE_MONITOR` to a file path before starting; writing `left,top,right,bottom,dpi`
+into that file and posting `WM_DISPLAYCHANGE` to Vitrobar's `VitrobarNotify` window adds a
+made-up monitor (deleting the file and posting again removes it; changing its DPI and posting
+again re-lays it out). A virtual desktop switch can be simulated by posting `WM_TIMER` with id
+`0x5602` to the same window (a `vitrobar-desktop-switched` line follows). Steps 5 to 8 need a
+person.

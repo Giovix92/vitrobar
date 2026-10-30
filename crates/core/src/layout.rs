@@ -57,6 +57,10 @@ pub struct LayoutInput {
     pub tray_count: usize,
     pub clock_w: f32,
     pub reserve_floating: bool,
+    /// The bar carries the tray area (overflow chevron, tray icons, quick-settings button).
+    /// Only the primary monitor's bar does; the others show Start, their apps and the clock.
+    /// Without it `overflow_chevron` and `quick` are zero-width and `tray_count` is ignored.
+    pub tray_area: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -81,6 +85,14 @@ const PAD: f32 = 6.0;
 const GAP: f32 = 8.0;
 const SHOW_DESKTOP_W: f32 = 6.0;
 const EPS: f32 = 0.01;
+
+/// Monitors that appeared and that went away between two lists of monitor ids, each in the
+/// order of the list it comes from. A changed order alone is no change.
+pub fn diff_monitors(old: &[u64], new: &[u64]) -> (Vec<u64>, Vec<u64>) {
+    let added = new.iter().filter(|id| !old.contains(id)).copied().collect();
+    let removed = old.iter().filter(|id| !new.contains(id)).copied().collect();
+    (added, removed)
+}
 
 /// App slot sizing: (slot width, apps shown, whether the last slot is `more`).
 fn fit_apps(n: usize, avail: f32, m: Metrics) -> (f32, usize, bool) {
@@ -118,8 +130,11 @@ pub fn compute_layout(i: &LayoutInput) -> BarLayout {
         h: m.slot,
     };
 
-    // chevron + tray icons + quick button (one slot each) + clock
-    let right_w = m.slot * (i.tray_count as f32 + 2.0) + i.clock_w;
+    // chevron + tray icons + quick button (one slot each) + clock; the clock alone without
+    // the tray area.
+    let tray_count = if i.tray_area { i.tray_count } else { 0 };
+    let tray_slot = if i.tray_area { m.slot } else { 0.0 };
+    let right_w = m.slot * tray_count as f32 + 2.0 * tray_slot + i.clock_w;
     // right group with its inner padding on both sides, then the show-desktop strip
     let right_surface_w = PAD + right_w + PAD + SHOW_DESKTOP_W;
 
@@ -198,13 +213,13 @@ pub fn compute_layout(i: &LayoutInput) -> BarLayout {
     let apps: Vec<Rect> = (0..shown).map(|k| item(apps_x + k as f32 * s, s)).collect();
     let more = has_more.then(|| item(apps_x + shown as f32 * s, s));
 
-    let overflow_chevron = item(right_x, m.slot);
-    let tray: Vec<Rect> = (0..i.tray_count)
-        .map(|k| item(right_x + (1 + k) as f32 * m.slot, m.slot))
+    let overflow_chevron = item(right_x, tray_slot);
+    let tray: Vec<Rect> = (0..tray_count)
+        .map(|k| item(right_x + tray_slot + k as f32 * m.slot, m.slot))
         .collect();
-    let quick_x = right_x + (1 + i.tray_count) as f32 * m.slot;
-    let quick = item(quick_x, m.slot);
-    let clock = item(quick_x + m.slot, i.clock_w);
+    let quick_x = right_x + tray_slot + tray_count as f32 * m.slot;
+    let quick = item(quick_x, tray_slot);
+    let clock = item(quick_x + tray_slot, i.clock_w);
 
     let last = surfaces.last().copied().expect("at least one surface");
     let show_desktop = Rect {
@@ -259,6 +274,7 @@ mod tests {
             tray_count: 3,
             clock_w: 64.0,
             reserve_floating: reserve,
+            tray_area: true,
         }
     }
     fn lay(shape: Shape, n: usize) -> BarLayout {
@@ -403,6 +419,64 @@ mod tests {
             assert_eq!(l.show_desktop.h, 48.0);
             assert!((l.show_desktop.right() - last.right()).abs() < EPS);
         }
+    }
+    #[test]
+    fn secondary_bar_has_no_tray_area() {
+        for shape in ALL_SHAPES {
+            let with = lay(shape, 5);
+            let without = compute_layout(&LayoutInput {
+                tray_area: false,
+                ..input(MON, shape, Position::Bottom, 5, true)
+            });
+            assert!(without.tray.is_empty(), "{shape:?}");
+            assert_eq!(without.quick.w, 0.0);
+            assert_eq!(without.overflow_chevron.w, 0.0);
+            assert_eq!(without.clock.w, 64.0);
+            // The clock still ends where the show-desktop strip begins.
+            assert!(
+                (without.clock.right() + PAD + SHOW_DESKTOP_W - without.show_desktop.right()).abs()
+                    < EPS
+            );
+            let last = |l: &BarLayout| l.surfaces.last().unwrap().w;
+            assert!(
+                last(&without) < last(&with) || shape == Shape::Full,
+                "{shape:?}"
+            );
+            assert_eq!(without.apps.len(), 5);
+            assert_eq!(without.reserved, with.reserved);
+            for r in all_items(&without) {
+                assert!(
+                    without.surfaces.iter().any(|s| contains(s, &r)),
+                    "{shape:?}: {r:?}"
+                );
+            }
+            assert_no_overlap(
+                &all_items(&without)
+                    .into_iter()
+                    .filter(|r| r.w > 0.0)
+                    .collect::<Vec<_>>(),
+            );
+        }
+    }
+    #[test]
+    fn diff_monitors_added_and_removed() {
+        assert_eq!(diff_monitors(&[1, 2], &[2, 3]), (vec![3], vec![1]));
+        assert_eq!(diff_monitors(&[1, 2], &[1, 2]), (vec![], vec![]));
+        assert_eq!(
+            diff_monitors(&[2, 1], &[1, 2]),
+            (vec![], vec![]),
+            "order is no change"
+        );
+        assert_eq!(
+            diff_monitors(&[], &[5, 4]),
+            (vec![5, 4], vec![]),
+            "new order kept"
+        );
+        assert_eq!(
+            diff_monitors(&[7, 8], &[]),
+            (vec![], vec![7, 8]),
+            "old order kept"
+        );
     }
     #[test]
     fn full_apps_centred_when_room() {

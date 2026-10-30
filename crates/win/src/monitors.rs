@@ -70,6 +70,34 @@ pub fn monitor_id(hmon: HMONITOR) -> Option<u64> {
     info(hmon).map(|m| m.id)
 }
 
+/// Device name of the monitor [`parse_monitor_spec`] makes up (never a real GDI name).
+const FAKE_DEVICE: &str = r"\\.\VITROBAR-FAKE";
+
+/// A made-up monitor from `left,top,right,bottom,dpi` (physical px; spaces allowed), for
+/// exercising multi-monitor paths on a machine with fewer monitors. Not primary; its id
+/// never collides with a real monitor's. `None` if the text is not such a spec or the
+/// rectangle is empty.
+pub fn parse_monitor_spec(spec: &str) -> Option<MonitorInfo> {
+    let v: Vec<i32> = spec
+        .trim()
+        .split(',')
+        .map(|p| p.trim().parse().ok())
+        .collect::<Option<_>>()?;
+    let [l, t, r, b, dpi] = v[..] else {
+        return None;
+    };
+    if r <= l || b <= t || !(48..=960).contains(&dpi) {
+        return None;
+    }
+    let name: Vec<u16> = FAKE_DEVICE.encode_utf16().collect();
+    Some(MonitorInfo {
+        id: fnv1a(&name),
+        rect_px: (l, t, r, b),
+        dpi: dpi as u32,
+        primary: false,
+    })
+}
+
 /// All attached monitors, primary first.
 pub fn list_monitors() -> Vec<MonitorInfo> {
     let mut handles: Vec<HMONITOR> = Vec::new();
@@ -84,4 +112,48 @@ pub fn list_monitors() -> Vec<MonitorInfo> {
     let mut out: Vec<MonitorInfo> = handles.into_iter().filter_map(info).collect();
     out.sort_by_key(|m| !m.primary);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn monitor_spec_parses_and_rejects() {
+        let m = parse_monitor_spec(
+            " 1920, 0, 3840 ,1080,144
+",
+        )
+        .unwrap();
+        assert_eq!(m.rect_px, (1920, 0, 3840, 1080));
+        assert_eq!(m.dpi, 144);
+        assert!(!m.primary);
+        assert_eq!(
+            parse_monitor_spec("0,0,10,10,96").unwrap().id,
+            m.id,
+            "one fake id"
+        );
+        for bad in [
+            "",
+            "1,2,3,4",
+            "0,0,10,10,96,1",
+            "0,0,0,10,96",
+            "0,0,10,10,0",
+            "a,0,10,10,96",
+        ] {
+            assert_eq!(parse_monitor_spec(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn fake_id_differs_from_real_monitors() {
+        let fake = parse_monitor_spec("0,0,10,10,96").unwrap().id;
+        let real = list_monitors();
+        assert!(!real.is_empty());
+        assert!(real.iter().all(|m| m.id != fake));
+        assert!(real[0].primary, "primary first");
+        for m in &real {
+            assert!(m.dpi >= 96 && m.rect_px.2 > m.rect_px.0);
+        }
+    }
 }

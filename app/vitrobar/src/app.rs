@@ -10,8 +10,16 @@
 //! opened by the chevron. Clicks are handed to the icon's owner as the stock taskbar does.
 //!
 //! The stock taskbar is taken over before the bar appears and given back on every way out
-//! ([`StockGuard`]); the main bar window is an appbar that reserves the bar's strip; the bar
-//! hides while a full-screen app covers its monitor.
+//! ([`StockGuard`]).
+//!
+//! Every monitor has its own bar ([`MonitorBar`]): its windows, layout, scale (the monitor's
+//! DPI / 96), app groups (pins, then the windows on that monitor and the current virtual
+//! desktop) and appbar (the main bar window reserves the bar's strip of that monitor). A bar
+//! hides while a full-screen app covers its monitor. Only the primary monitor's bar has the
+//! tray area (chevron, tray icons, quick settings); the others show Start, their apps and
+//! the clock. Display, DPI, work-area and session changes re-read the monitors; bars are
+//! created, destroyed or laid out again only for monitors that actually changed
+//! ([`App::reconcile_monitors`]).
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
@@ -22,7 +30,7 @@ use std::time::{Duration, Instant};
 use vitro_core::clock::ms_until_next_minute;
 use vitro_core::i18n::{lang_from_tag, Lang};
 use vitro_core::image::BgraImage;
-use vitro_core::layout::{compute_layout, metrics, BarLayout, LayoutInput, Rect};
+use vitro_core::layout::{compute_layout, diff_monitors, metrics, BarLayout, LayoutInput, Rect};
 use vitro_core::settings::{self, Pin, Position, Settings, ThemeChoice};
 use vitro_core::style::{hover_style, material_style, HoverStyle, MaterialStyle, Rgba, Theme};
 use vitro_core::tray_model::{split_promoted, TrayIcon};
@@ -37,10 +45,10 @@ use vitro_render::device::{create_gpu_device, GpuDevice};
 use vitro_render::flyout::{live_thumbnails, take_deactivated, Flyout, ThumbnailStrip};
 use vitro_render::surfaces::{FontKind, Painter};
 use vitro_render::tray_flyout::{grid_layout, Tooltip, TrayGrid};
-use vitro_win::appbar::{is_fullscreen_on, reserved_rect, AppBar};
+use vitro_win::appbar::{is_fullscreen_on_rect, reserved_rect, AppBar};
 use vitro_win::desktops::Desktops;
 use vitro_win::launch::{activate_window, close_window, minimize_window, open_stock_start};
-use vitro_win::monitors::{list_monitors, MonitorInfo};
+use vitro_win::monitors::{list_monitors, parse_monitor_spec, MonitorInfo};
 use vitro_win::pins_import::{import_promoted_tray, import_windows_pins};
 use vitro_win::system_theme::{read_system_theme, user_ui_language_tag, SystemTheme};
 use vitro_win::time_format::clock_now;
@@ -100,6 +108,81 @@ const SPRING_PEAK: f32 = 1.12;
 const REASSERT_MS: u32 = 1000;
 /// Resting on a tray icon shows its tooltip after this long.
 const TRAY_TIP_MS: u32 = 500;
+
+/// Debug hook for live tests of the multi-monitor paths: names a file that, while it exists
+/// and holds `left,top,right,bottom,dpi`, adds one made-up monitor to the real ones. It is
+/// read on every display check (post `WM_DISPLAYCHANGE` to the notify window after editing
+/// it). Unset in normal use.
+const FAKE_MONITOR_ENV: &str = "VITROBAR_FAKE_MONITOR";
+
+/// The monitors bars belong on: the real ones (primary first), plus the debug hook's.
+fn current_monitors() -> Vec<MonitorInfo> {
+    let mut list = list_monitors();
+    if let Some(path) = std::env::var_os(FAKE_MONITOR_ENV).filter(|p| !p.is_empty()) {
+        if let Some(m) = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| parse_monitor_spec(&s))
+        {
+            list.push(m);
+        }
+    }
+    list
+}
+
+/// What changes between the bars of `old` and `new` (both in bar order: the first one
+/// carries the tray area).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ReconcilePlan {
+    /// Monitors that get a new bar.
+    added: Vec<u64>,
+    /// Monitors whose bar goes away.
+    removed: Vec<u64>,
+    /// Monitors kept whose rectangle, DPI, primary flag or tray area changed: laid out anew.
+    changed: Vec<u64>,
+}
+
+impl ReconcilePlan {
+    fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty() && self.changed.is_empty()
+    }
+}
+
+fn plan_reconcile(old: &[MonitorInfo], new: &[MonitorInfo]) -> ReconcilePlan {
+    let ids = |l: &[MonitorInfo]| l.iter().map(|m| m.id).collect::<Vec<_>>();
+    let (added, removed) = diff_monitors(&ids(old), &ids(new));
+    let changed = new
+        .iter()
+        .enumerate()
+        .filter_map(|(k, m)| {
+            let (j, was) = old.iter().enumerate().find(|(_, o)| o.id == m.id)?;
+            (was != m || (j == 0) != (k == 0)).then_some(m.id)
+        })
+        .collect();
+    ReconcilePlan {
+        added,
+        removed,
+        changed,
+    }
+}
+
+fn empty_layout() -> BarLayout {
+    compute_layout(&LayoutInput {
+        monitor: Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 0.0,
+            h: 0.0,
+        },
+        shape: Default::default(),
+        position: Default::default(),
+        icon_size: Default::default(),
+        app_count: 0,
+        tray_count: 0,
+        clock_w: CLOCK_MIN_DIP,
+        reserve_floating: false,
+        tray_area: false,
+    })
+}
 
 /// A tray icon's identity in the model: (owner window, uid, guid).
 type TrayId = (u32, u32, Option<[u8; 16]>);
@@ -250,6 +333,14 @@ fn json_str(s: &str) -> String {
     out
 }
 
+fn group_key_text(k: &GroupKey) -> String {
+    match k {
+        GroupKey::Aumid(a) => format!("aumid:{a}"),
+        GroupKey::Path(p) => format!("path:{p}"),
+        GroupKey::Window(h) => format!("hwnd:{h}"),
+    }
+}
+
 fn json_rect(r: PxRect) -> String {
     format!("[{},{},{},{}]", r.0, r.1, r.2, r.3)
 }
@@ -259,6 +350,8 @@ struct Strip {
     // Field order = drop order: the thumbnails are unregistered before their window goes.
     thumbs: ThumbnailStrip,
     flyout: Flyout,
+    /// The monitor whose bar it opened from.
+    monitor: u64,
     group: GroupKey,
     windows: Vec<Hwnd>,
     anchor: PxRect,
@@ -293,6 +386,67 @@ struct Bar {
     shown: bool,
 }
 
+/// One monitor's bar.
+struct MonitorBar {
+    // Field order = drop order: the appbar is unregistered before its window goes; each
+    // bar's visual tree goes before its window. Dropping the bar windows never ends the app
+    // (`BarWindow`'s drop marks the destruction as ours).
+    appbar: Option<AppBar>,
+    bars: Vec<Bar>,
+    info: MonitorInfo,
+    groups: Vec<AppGroup>,
+    layout: BarLayout,
+    /// A full-screen app covers this monitor: the bar windows are hidden.
+    fullscreen: bool,
+    /// Carries the tray area (the first bar, the primary monitor's).
+    tray: bool,
+}
+
+impl MonitorBar {
+    fn new(info: MonitorInfo, tray: bool) -> Self {
+        Self {
+            appbar: None,
+            bars: Vec::new(),
+            info,
+            groups: Vec::new(),
+            layout: empty_layout(),
+            fullscreen: false,
+            tray,
+        }
+    }
+
+    fn id(&self) -> u64 {
+        self.info.id
+    }
+
+    fn scale(&self) -> f32 {
+        self.info.dpi as f32 / 96.0
+    }
+
+    fn monitor_dip(&self) -> Rect {
+        let (l, t, r, b) = self.info.rect_px;
+        let s = self.scale();
+        Rect {
+            x: l as f32 / s,
+            y: t as f32 / s,
+            w: (r - l) as f32 / s,
+            h: (b - t) as f32 / s,
+        }
+    }
+
+    fn drop_appbar(&mut self) {
+        if let Some(ab) = self.appbar.take() {
+            shell::remove_appbar_hwnd(ab.hwnd());
+        }
+    }
+}
+
+impl Drop for MonitorBar {
+    fn drop(&mut self) {
+        self.drop_appbar();
+    }
+}
+
 /// Changes collected while draining the message queue, applied once afterwards.
 #[derive(Default)]
 struct Dirty {
@@ -301,24 +455,34 @@ struct Dirty {
     theme: bool,
     clock: bool,
     icons: bool,
+    /// Every bar must be redrawn (settings, menus, GPU recovery).
     visuals: bool,
-    /// Check whether a full-screen app covers the bar's monitor.
+    /// Only these monitors' bars must be redrawn (hover, presses, the tray).
+    bars: BTreeSet<u64>,
+    /// Check whether a full-screen app covers a bar's monitor.
     fullscreen: bool,
+    /// Re-read the monitors and reconcile the bars with them.
+    monitors: bool,
+    /// The display configuration changed or the session came back: put the bar windows
+    /// back in place and let every appbar claim its strip again.
+    display: bool,
+    /// Explorer may be showing one of its taskbars again: hide it.
+    stock: bool,
 }
 
 struct App {
     // Field order = drop order: the tray host first (its Shell_TrayWnd goes and every app is
     // asked to register its icons with Explorer again; later shell calls go straight to
-    // Explorer), the appbar (unregistered before its window goes), the flyouts, the bars,
-    // then the tracker (before its notify window), then the notify window (drains queued
-    // events), then the GPU objects, the compositor, and last the stock taskbar guard (the
-    // shell is restored after the appbar is gone).
+    // Explorer), the flyouts, the monitors' bars (each appbar unregistered before its window
+    // goes), then the tracker (before its notify window), then the notify window (drains
+    // queued events), then the GPU objects, the compositor, and last the stock taskbar guard
+    // (the shell is restored after the appbars are gone).
     tray: Option<TrayHost>,
-    appbar: Option<AppBar>,
     tooltip: Option<Tooltip>,
     overflow: Option<Overflow>,
     strip: Option<Strip>,
-    bars: Vec<Bar>,
+    /// One per monitor, in [`current_monitors`] order: the first carries the tray area.
+    monitors: Vec<MonitorBar>,
     tracker: WindowTracker,
     icons: IconLoader,
     launcher: Launcher,
@@ -333,17 +497,16 @@ struct App {
     settings: Settings,
     /// Where settings changes are saved (`None`: nowhere, `APPDATA` is not set).
     settings_path: Option<PathBuf>,
-    monitor: MonitorInfo,
-    scale: f32,
+    /// The monitor whose bar the cursor was last on: `hover`, `pressed`, `rpressed`,
+    /// `tracking` and `show_pending` refer to its bar (app indices into its groups).
+    cur: u64,
     sys: SystemTheme,
     style: MaterialStyle,
     hover_style: HoverStyle,
     windows: WindowSet,
     foreground: Option<Hwnd>,
-    groups: Vec<AppGroup>,
     clock_text: String,
     clock_w: f32,
-    layout: BarLayout,
     hover: Option<Hit>,
     pressed: Option<Hit>,
     /// Bar window currently tracked for WM_MOUSELEAVE.
@@ -361,8 +524,6 @@ struct App {
     /// A click on the hovered app: no strip opens until the cursor moves to another item.
     show_suppressed: bool,
     gpu_lost: bool,
-    /// A full-screen app covers the bar's monitor: the bar windows are hidden.
-    fullscreen: bool,
     /// The minute timer could not be armed; retried on the next flush.
     clock_unarmed: bool,
     /// The tray icons as last read from the host (dead owners swept).
@@ -396,12 +557,15 @@ impl App {
         let comp = init_compositor()?;
         let gpu = create_gpu_device(&comp)?;
         let painter = Painter::new(&gpu)?;
-        // Primary monitor only in this stage (multi-monitor is Task 14).
-        let monitor = list_monitors()
+        let monitors: Vec<MonitorBar> = current_monitors()
             .into_iter()
-            .find(|m| m.primary)
-            .ok_or_else(|| Error::new(E_FAIL, "no primary monitor"))?;
-        let scale = monitor.dpi as f32 / 96.0;
+            .enumerate()
+            .map(|(k, m)| MonitorBar::new(m, k == 0))
+            .collect();
+        let cur = monitors
+            .first()
+            .ok_or_else(|| Error::new(E_FAIL, "no monitor"))?
+            .id();
         let sys = read_system_theme();
         let notify = NotifyWindow::create()?;
         // Carry 10: after the UI thread's own CoInitializeEx.
@@ -417,11 +581,10 @@ impl App {
             .ok();
         let mut app = Self {
             tray,
-            appbar: None,
             tooltip: None,
             overflow: None,
             strip: None,
-            bars: Vec::new(),
+            monitors,
             tracker,
             icons,
             launcher,
@@ -436,29 +599,12 @@ impl App {
             hover_style: hover_style(settings.hover),
             settings,
             settings_path,
-            monitor,
-            scale,
+            cur,
             sys,
             windows: WindowSet::new(),
             foreground: foreground(),
-            groups: Vec::new(),
             clock_text: String::new(),
             clock_w: CLOCK_MIN_DIP,
-            layout: compute_layout(&LayoutInput {
-                monitor: Rect {
-                    x: 0.0,
-                    y: 0.0,
-                    w: 0.0,
-                    h: 0.0,
-                },
-                shape: Default::default(),
-                position: Default::default(),
-                icon_size: Default::default(),
-                app_count: 0,
-                tray_count: 0,
-                clock_w: CLOCK_MIN_DIP,
-                reserve_floating: false,
-            }),
             hover: None,
             pressed: None,
             tracking: None,
@@ -469,7 +615,6 @@ impl App {
             flyout_pressed: None,
             show_suppressed: false,
             gpu_lost: false,
-            fullscreen: false,
             clock_unarmed: false,
             tray_entries: Vec::new(),
             tray_keys: HashMap::new(),
@@ -482,46 +627,64 @@ impl App {
             last_dump: String::new(),
         };
         app.tick_clock();
-        // Show the bar before the (slower) first window enumeration.
+        // Show the bars before the (slower) first window enumeration.
         app.refresh()?;
         let all = app.tracker.enumerate();
         app.windows.load(&all, &app.desktops);
         app.regroup();
-        app.set_fullscreen(is_fullscreen_on(app.monitor.id));
+        for k in 0..app.monitors.len() {
+            let on = is_fullscreen_on_rect(app.monitors[k].info.rect_px);
+            app.set_fullscreen(k, on);
+        }
         app.refresh()?;
         // Every app registers its tray icons again, now with us (and, forwarded, Explorer).
         if let Some(t) = &app.tray {
             t.announce();
         }
+        // Explorer applies the auto-hide change of the takeover asynchronously and can show
+        // a secondary taskbar again meanwhile: hide once more a little later.
+        app.arm_reassert();
         Ok(app)
     }
 
-    fn monitor_dip(&self) -> Rect {
-        let (l, t, r, b) = self.monitor.rect_px;
-        Rect {
-            x: l as f32 / self.scale,
-            y: t as f32 / self.scale,
-            w: (r - l) as f32 / self.scale,
-            h: (b - t) as f32 / self.scale,
-        }
+    /// Index of the bar of monitor `id`.
+    fn mon_index(&self, id: u64) -> Option<usize> {
+        self.monitors.iter().position(|m| m.id() == id)
     }
 
-    fn compute_layout(&self) -> BarLayout {
+    /// The bar the cursor was last on.
+    fn cur_bar(&self) -> Option<&MonitorBar> {
+        self.monitors.iter().find(|m| m.id() == self.cur)
+    }
+
+    /// The groups of the bar the cursor was last on (what `Hit::App` indices refer to).
+    fn cur_groups(&self) -> &[AppGroup] {
+        self.cur_bar().map_or(&[], |m| &m.groups)
+    }
+
+    /// The bar with the tray area.
+    fn tray_monitor(&self) -> Option<&MonitorBar> {
+        self.monitors.iter().find(|m| m.tray)
+    }
+
+    fn compute_layout(&self, k: usize) -> BarLayout {
+        let mb = &self.monitors[k];
         compute_layout(&LayoutInput {
-            monitor: self.monitor_dip(),
+            monitor: mb.monitor_dip(),
             shape: self.settings.shape,
             position: self.settings.position,
             icon_size: self.settings.icon_size,
-            app_count: self.groups.len(),
-            tray_count: self.tray_bar.len(),
+            app_count: mb.groups.len(),
+            tray_count: if mb.tray { self.tray_bar.len() } else { 0 },
             clock_w: self.clock_w,
             reserve_floating: self.settings.reserve_space_floating,
+            tray_area: mb.tray,
         })
     }
 
-    fn env(&self) -> VisualEnv {
+    fn env(&self, k: usize) -> VisualEnv {
         VisualEnv {
-            dpi: self.monitor.dpi,
+            dpi: self.monitors[k].info.dpi,
             accent: rgb(self.settings.accent.unwrap_or(self.sys.accent)),
             animations: self.sys.animations,
             position: self.settings.position,
@@ -529,8 +692,8 @@ impl App {
     }
 
     /// Extra px beyond the bar's outer edge, (above, below), that a magnified icon can reach
-    /// (spring overshoot included). Only Magnify grows icons past the edge.
-    fn hover_margin(&self) -> (i32, i32) {
+    /// (spring overshoot included) at `scale`. Only Magnify grows icons past the edge.
+    fn hover_margin(&self, scale: f32) -> (i32, i32) {
         let h = &self.hover_style;
         if h.neighbour_scale <= 1.0 {
             return (0, 0);
@@ -549,33 +712,39 @@ impl App {
         if over <= 0.0 {
             return (0, 0);
         }
-        let px = ((over + 1.0) * self.scale).ceil() as i32;
+        let px = ((over + 1.0) * scale).ceil() as i32;
         match self.settings.position {
             Position::Bottom => (px, 0),
             Position::Top => (0, px),
         }
     }
 
-    /// Rebuilds the groups from the window set; true if they changed.
-    fn regroup(&mut self) -> bool {
-        let groups = build_groups(
-            &self.settings.pins,
-            &self.windows.infos(),
-            self.monitor.id,
-            self.foreground,
-        );
-        if groups == self.groups {
-            return false;
+    /// Rebuilds every bar's groups from the window set (pins on every bar, windows on the
+    /// bar of their monitor); returns the monitors whose groups changed. A window that moved
+    /// to another monitor changes exactly the two bars involved.
+    fn regroup(&mut self) -> Vec<u64> {
+        let infos = self.windows.infos();
+        let mut changed = Vec::new();
+        for mb in &mut self.monitors {
+            let groups = build_groups(&self.settings.pins, &infos, mb.id(), self.foreground);
+            if groups != mb.groups {
+                mb.groups = groups;
+                changed.push(mb.id());
+            }
         }
-        self.groups = groups;
-        // Hover/press indices may now point at a different app.
-        if matches!(self.hover, Some(Hit::App(_))) {
-            self.hover = None;
+        if changed.contains(&self.cur) {
+            // Hover/press indices may now point at a different app.
+            if matches!(self.hover, Some(Hit::App(_))) {
+                self.hover = None;
+            }
+            if matches!(self.pressed, Some(Hit::App(_))) {
+                self.pressed = None;
+            }
+            if matches!(self.rpressed, Some(Some(Hit::App(_)))) {
+                self.rpressed = None;
+            }
         }
-        if matches!(self.pressed, Some(Hit::App(_))) {
-            self.pressed = None;
-        }
-        true
+        changed
     }
 
     /// Re-reads the clock, re-measures its width and re-arms the one-shot minute timer.
@@ -601,11 +770,18 @@ impl App {
         true
     }
 
-    fn items(&mut self, shown: usize) -> Vec<ItemState> {
-        let icon_px = ((metrics(self.settings.icon_size).icon * self.scale).round() as u32)
+    /// The first `shown` app items of bar `k` (hover and press only on the cursor's bar).
+    fn items(&mut self, k: usize, shown: usize) -> Vec<ItemState> {
+        let mb = &self.monitors[k];
+        let icon_px = ((metrics(self.settings.icon_size).icon * mb.scale()).round() as u32)
             .clamp(1, MAX_ICON_PX);
+        let (hover, pressed) = if mb.id() == self.cur {
+            (self.hover, self.pressed)
+        } else {
+            (None, None)
+        };
         let mut items = Vec::with_capacity(shown);
-        for (i, g) in self.groups.iter().take(shown).enumerate() {
+        for (i, g) in mb.groups.iter().take(shown).enumerate() {
             let mut icon = None;
             for src in icon_sources(g) {
                 match self.icons.get(&src, icon_px) {
@@ -623,19 +799,37 @@ impl App {
                 dots: g.windows.len().min(3) as u8,
                 active: g.active,
                 attention: g.attention,
-                hovered: self.hover == Some(Hit::App(i)),
-                pressed: self.pressed == Some(Hit::App(i)),
+                hovered: hover == Some(Hit::App(i)),
+                pressed: pressed == Some(Hit::App(i)),
             });
         }
-        let groups = &self.groups;
-        self.icons
-            .trim(|src| groups.iter().any(|g| icon_sources(g).contains(src)));
         items
+    }
+
+    /// Keeps the icon cache bounded to what some bar (or the tray) still shows.
+    fn trim_icons(&mut self) {
+        let monitors = &self.monitors;
+        self.icons.trim(|src| {
+            matches!(src, IconSrc::Tray(_))
+                || monitors
+                    .iter()
+                    .any(|m| m.groups.iter().any(|g| icon_sources(g).contains(src)))
+        });
+    }
+
+    /// The tray bar's scale (1.0 if there is none).
+    fn tray_scale(&self) -> f32 {
+        self.tray_monitor().map_or(1.0, |m| m.scale())
+    }
+
+    /// DPI of the tray bar's monitor (for the overflow and the tooltip).
+    fn tray_dpi(&self) -> u32 {
+        self.tray_monitor().map_or(96, |m| m.info.dpi)
     }
 
     /// Tray icons are drawn at this many px.
     fn tray_px(&self) -> u32 {
-        ((TRAY_ICON_DIP * self.scale).round() as u32).clamp(1, MAX_ICON_PX)
+        ((TRAY_ICON_DIP * self.tray_scale()).round() as u32).clamp(1, MAX_ICON_PX)
     }
 
     /// Re-reads the tray from the host, first dropping icons whose owner died (so this runs
@@ -716,82 +910,53 @@ impl App {
         }
     }
 
-    /// Lays out and redraws (only what changed). Windows are created/moved as needed.
+    /// Lays out and redraws every bar (only what changed in each). Windows are created and
+    /// moved as needed.
     fn refresh(&mut self) -> Result<()> {
-        self.refresh_once(true)
+        self.refresh_once(None, true)
     }
 
-    /// `retry`: after a lost device is recovered mid-draw, draw once more (only once).
-    fn refresh_once(&mut self, retry: bool) -> Result<()> {
+    /// Lays out and redraws the bars of the monitors in `only` (`None`: all of them).
+    /// `retry`: after a lost device is recovered mid-draw, draw once more (only once, and
+    /// every bar, since all surfaces were lost).
+    fn refresh_once(&mut self, only: Option<&BTreeSet<u64>>, retry: bool) -> Result<()> {
         if self.gpu_lost {
             // Recovery is driven by the removal event and the one-shot retry timer only.
             return Ok(());
         }
-        self.reload_tray();
-        let layout = self.compute_layout();
-        let moved = layout.surfaces != self.layout.surfaces;
-        while self.bars.len() > layout.surfaces.len() {
-            self.bars.pop();
+        let wanted = |id: u64| only.is_none_or(|s| s.contains(&id));
+        let tray_touched = self.tray_monitor().is_some_and(|m| wanted(m.id()));
+        if tray_touched {
+            self.reload_tray();
         }
-        for i in self.bars.len()..layout.surfaces.len() {
-            let window = create_bar_window(
-                &self.comp,
-                to_px(layout.surfaces[i], self.scale),
-                self.hover_margin(),
-            )?;
-            let visual = BarVisual::new(&self.comp, &self.gpu, i)?;
-            window.set_content(visual.root())?;
-            self.bars.push(Bar {
-                visual,
-                window,
-                shown: false,
-            });
-        }
-        let items = self.items(layout.apps.len());
-        let tray_items = self.tray_items();
-        let chevron = self.chevron_state();
-        let env = self.env();
-        let margin = self.hover_margin();
         let mut draw_failed = None;
-        let mut raised = moved;
-        for (i, bar) in self.bars.iter_mut().enumerate() {
-            bar.window
-                .set_rect(to_px(layout.surfaces[i], self.scale), margin)?;
-            bar.visual.set_env(env);
-            bar.visual.set_tray(tray_items.clone(), chevron);
-            if let Err(e) = bar.visual.update(
-                &layout,
-                &items,
-                &self.clock_text,
-                &self.style,
-                &self.hover_style,
-            ) {
-                draw_failed = Some(e);
-                break;
-            }
-            if !bar.shown && !self.fullscreen {
-                bar.window.show();
-                bar.shown = true;
-                raised = true;
+        let mut raised = false;
+        for k in 0..self.monitors.len() {
+            if wanted(self.monitors[k].id()) {
+                raised |= self.refresh_monitor(k, &mut draw_failed)?;
+                if draw_failed.is_some() {
+                    break;
+                }
             }
         }
-        self.layout = layout;
+        self.trim_icons();
         if raised {
-            // The bar windows just went (back) to the top of the topmost band: keep our
+            // Bar windows just went (back) to the top of the topmost band: keep our
             // Shell_TrayWnd above Explorer's there.
             if let Some(t) = &self.tray {
                 t.reassert_topmost();
             }
         }
-        self.sync_appbar();
-        self.sync_overflow();
-        self.sync_tooltip();
+        if tray_touched {
+            self.sync_overflow();
+            self.sync_tooltip();
+        }
         if let Some(e) = draw_failed {
             // Carry 2: a failed draw is usually a lost device; recover (or retry later).
             if self.gpu.is_lost() {
                 self.gpu_lost = true;
                 if self.recover_gpu() && retry {
-                    return self.refresh_once(false);
+                    return self.refresh_once(None, false);
                 }
             } else {
                 eprintln!("vitrobar: drawing failed: {e}");
@@ -803,24 +968,81 @@ impl App {
         Ok(())
     }
 
-    /// Keeps the main bar window registered as the appbar reserving the bar's strip.
-    fn sync_appbar(&mut self) {
-        let Some(bar) = self.bars.first() else {
-            self.drop_appbar();
+    /// Lays out and redraws bar `k`; true if a window was moved or shown (raised to the top
+    /// of the topmost band). A draw error lands in `draw_failed`; window errors return.
+    fn refresh_monitor(&mut self, k: usize, draw_failed: &mut Option<Error>) -> Result<bool> {
+        let layout = self.compute_layout(k);
+        let scale = self.monitors[k].scale();
+        let margin = self.hover_margin(scale);
+        let items = self.items(k, layout.apps.len());
+        let (tray_items, chevron) = if self.monitors[k].tray {
+            (self.tray_items(), self.chevron_state())
+        } else {
+            (Vec::new(), ChevronState::default())
+        };
+        let env = self.env(k);
+        let mb = &mut self.monitors[k];
+        let mut raised = layout.surfaces != mb.layout.surfaces;
+        while mb.bars.len() > layout.surfaces.len() {
+            mb.bars.pop();
+        }
+        for i in mb.bars.len()..layout.surfaces.len() {
+            let window = create_bar_window(&self.comp, to_px(layout.surfaces[i], scale), margin)?;
+            let visual = BarVisual::new(&self.comp, &self.gpu, i)?;
+            window.set_content(visual.root())?;
+            mb.bars.push(Bar {
+                visual,
+                window,
+                shown: false,
+            });
+        }
+        for (i, bar) in mb.bars.iter_mut().enumerate() {
+            bar.window
+                .set_rect(to_px(layout.surfaces[i], scale), margin)?;
+            bar.visual.set_env(env);
+            bar.visual.set_tray(tray_items.clone(), chevron);
+            if let Err(e) = bar.visual.update(
+                &layout,
+                &items,
+                &self.clock_text,
+                &self.style,
+                &self.hover_style,
+            ) {
+                *draw_failed = Some(e);
+                break;
+            }
+            if !bar.shown && !mb.fullscreen {
+                bar.window.show();
+                bar.shown = true;
+                raised = true;
+            }
+        }
+        mb.layout = layout;
+        self.sync_appbar(k);
+        Ok(raised)
+    }
+
+    /// Keeps bar `k`'s main window registered as the appbar reserving its strip of its
+    /// monitor.
+    fn sync_appbar(&mut self, k: usize) {
+        let edge = self.settings.position;
+        let mb = &mut self.monitors[k];
+        let Some(bar) = mb.bars.first() else {
+            mb.drop_appbar();
             return;
         };
         let hwnd = bar.window.hwnd;
-        let reserved = (self.layout.reserved * self.scale).round() as i32;
-        let (edge, mon) = (self.settings.position, self.monitor.rect_px);
-        match &mut self.appbar {
+        let reserved = (mb.layout.reserved * mb.scale()).round() as i32;
+        let mon = mb.info.rect_px;
+        match &mut mb.appbar {
             // A new edge registers afresh, so the shell drops the old strip entirely.
             Some(ab) if ab.hwnd() == hwnd && ab.edge() == edge => ab.update(edge, mon, reserved),
             _ => {
-                self.drop_appbar();
+                mb.drop_appbar();
                 match AppBar::register(hwnd, edge, mon, reserved) {
                     Ok(ab) => {
-                        shell::set_appbar_hwnd(Some(hwnd));
-                        self.appbar = Some(ab);
+                        shell::add_appbar_hwnd(hwnd);
+                        mb.appbar = Some(ab);
                     }
                     Err(e) => eprintln!("vitrobar: could not reserve the bar's space: {e}"),
                 }
@@ -828,40 +1050,59 @@ impl App {
         }
     }
 
-    fn drop_appbar(&mut self) {
-        if self.appbar.take().is_some() {
-            shell::set_appbar_hwnd(None);
-        }
-    }
-
-    /// Explorer restarted: hide its new taskbar and register the appbar with the new shell.
+    /// Explorer restarted: hide its new taskbar and register the appbars with the new shell.
     fn on_taskbar_created(&mut self) {
         self.stock.on_taskbar_created();
-        if let Some(ab) = &mut self.appbar {
-            if let Err(e) = ab.reregister() {
-                eprintln!("vitrobar: could not reserve the bar's space again: {e}");
+        for mb in &mut self.monitors {
+            if let Some(ab) = &mut mb.appbar {
+                if let Err(e) = ab.reregister() {
+                    eprintln!("vitrobar: could not reserve the bar's space again: {e}");
+                }
             }
         }
-        // SAFETY: one-shot timer on our own window (killed when it fires).
+        self.arm_reassert();
+    }
+
+    /// One-shot: hide the stock taskbars once more a little later (Explorer can show its
+    /// taskbar after `TaskbarCreated`, and creates a new monitor's `Shell_SecondaryTrayWnd`
+    /// some time after `WM_DISPLAYCHANGE`). Event-driven, never a poll.
+    fn arm_reassert(&self) {
+        // SAFETY: one-shot timer on our own window (killed when it fires); re-setting the id
+        // restarts it.
         unsafe { SetTimer(Some(self.notify.hwnd), TIMER_REASSERT, REASSERT_MS, None) };
     }
 
-    /// Hides the bar (at once, no animation) while a full-screen app covers its monitor, and
+    /// Hides bar `k` (at once, no animation) while a full-screen app covers its monitor, and
     /// lets `refresh` show it again afterwards. True if the state changed.
-    fn set_fullscreen(&mut self, on: bool) -> bool {
-        if on == self.fullscreen {
+    fn set_fullscreen(&mut self, k: usize, on: bool) -> bool {
+        let Some(mb) = self.monitors.get(k) else {
+            return false;
+        };
+        if on == mb.fullscreen {
             return false;
         }
-        self.fullscreen = on;
+        let (id, tray) = (mb.id(), mb.tray);
         if on {
-            self.close_strip();
-            self.close_overflow();
-            self.set_tip_target(None);
-            self.cancel_show();
-            self.hover = None;
-            self.pressed = None;
-            self.tracking = None;
-            for b in &mut self.bars {
+            // Whatever is open from this bar goes with it.
+            if self.strip.as_ref().is_some_and(|s| s.monitor == id) {
+                self.close_strip();
+            }
+            if tray {
+                self.close_overflow();
+                self.set_tip_target(None);
+            }
+            if self.cur == id {
+                self.cancel_show();
+                self.hover = None;
+                self.pressed = None;
+                self.rpressed = None;
+                self.tracking = None;
+            }
+        }
+        let mb = &mut self.monitors[k];
+        mb.fullscreen = on;
+        if on {
+            for b in &mut mb.bars {
                 b.window.hide();
                 b.shown = false;
             }
@@ -873,12 +1114,56 @@ impl App {
         true
     }
 
+    /// Brings the bars in line with `monitors` (in [`current_monitors`] order): a bar for
+    /// each new monitor, none for the ones that went away, a new layout for those whose
+    /// rectangle, DPI or tray area changed. Nothing happens when nothing changed, so the
+    /// work-area broadcasts our own appbars cause end here. An empty list (a transient state
+    /// while displays reconfigure) is ignored. True if anything changed; the caller redraws.
+    fn reconcile_monitors(&mut self, monitors: Vec<MonitorInfo>) -> bool {
+        if monitors.is_empty() {
+            return false;
+        }
+        let old: Vec<MonitorInfo> = self.monitors.iter().map(|m| m.info).collect();
+        let plan = plan_reconcile(&old, &monitors);
+        if plan.is_empty() {
+            return false;
+        }
+        // The strip, the overflow and the tooltip are placed for the old geometry.
+        self.reset_interaction();
+        let mut old_bars = std::mem::take(&mut self.monitors);
+        for (k, info) in monitors.into_iter().enumerate() {
+            let mb = match old_bars.iter().position(|m| m.id() == info.id) {
+                Some(p) => {
+                    let mut mb = old_bars.remove(p);
+                    mb.info = info;
+                    mb.tray = k == 0;
+                    mb
+                }
+                None => MonitorBar::new(info, k == 0),
+            };
+            self.monitors.push(mb);
+        }
+        // The bars of removed monitors: appbars unregistered, windows destroyed. Never ends
+        // the app (carry 1: `BarWindow`'s drop marks the destruction as ours).
+        drop(old_bars);
+        if self.mon_index(self.cur).is_none() {
+            self.cur = self.monitors[0].id();
+        }
+        if self.opts.debug_state {
+            eprintln!(
+                "vitrobar-monitors added={:?} removed={:?} changed={:?}",
+                plan.added, plan.removed, plan.changed
+            );
+        }
+        true
+    }
+
     /// Recreates the GPU device; on failure arms a one-shot retry. True when usable again.
     fn recover_gpu(&mut self) -> bool {
         match self.gpu.recreate() {
             Ok(()) => {
                 self.gpu_lost = false;
-                for bar in &mut self.bars {
+                for bar in self.monitors.iter_mut().flat_map(|m| &mut m.bars) {
                     bar.visual.invalidate();
                 }
                 true
@@ -893,19 +1178,75 @@ impl App {
         }
     }
 
+    /// One monitor's bar for the state dump.
+    fn dump_monitor(&self, mb: &MonitorBar) -> String {
+        let s = mb.scale();
+        let keys: Vec<String> = mb
+            .groups
+            .iter()
+            .map(|g| {
+                let hwnds: Vec<String> = g.windows.iter().map(|h| h.to_string()).collect();
+                format!(
+                    "{{\"key\":{},\"windows\":[{}]}}",
+                    json_str(&group_key_text(&g.key)),
+                    hwnds.join(",")
+                )
+            })
+            .collect();
+        let bars: Vec<String> = mb
+            .bars
+            .iter()
+            .map(|b| {
+                format!(
+                    "{{\"hwnd\":{},\"rect\":{},\"shown\":{}}}",
+                    b.window.hwnd.0 as usize,
+                    json_rect(b.window.rect_px()),
+                    b.shown
+                )
+            })
+            .collect();
+        let appbar = match &mb.appbar {
+            Some(_) => json_rect(reserved_rect(
+                self.settings.position,
+                mb.info.rect_px,
+                (mb.layout.reserved * s).round() as i32,
+            )),
+            None => "null".to_string(),
+        };
+        let l = &mb.layout;
+        format!(
+            "{{\"id\":{},\"rect\":{},\"dpi\":{},\"primary\":{},\"tray\":{},\"fullscreen\":{},\"appbar\":{},\"bars\":[{}],\"start\":{},\"quick\":{},\"chevron\":{},\"clock\":{},\"tray_slots\":{},\"shown\":{},\"groups\":[{}]}}",
+            mb.id(),
+            json_rect(mb.info.rect_px),
+            mb.info.dpi,
+            mb.info.primary,
+            mb.tray,
+            mb.fullscreen,
+            appbar,
+            bars.join(","),
+            json_rect(to_px(l.start, s)),
+            json_rect(to_px(l.quick, s)),
+            json_rect(to_px(l.overflow_chevron, s)),
+            json_rect(to_px(l.clock, s)),
+            l.tray.len(),
+            l.apps.len(),
+            keys.join(","),
+        )
+    }
+
     fn dump_state(&mut self) {
-        let l = &self.layout;
-        let s = self.scale;
-        let apps: Vec<String> = self
+        let Some(mb) = self.monitors.first() else {
+            return;
+        };
+        let monitors: Vec<String> = self.monitors.iter().map(|m| self.dump_monitor(m)).collect();
+        let l = &mb.layout;
+        let s = mb.scale();
+        let apps: Vec<String> = mb
             .groups
             .iter()
             .zip(&l.apps)
             .map(|(g, r)| {
-                let key = match &g.key {
-                    GroupKey::Aumid(a) => format!("aumid:{a}"),
-                    GroupKey::Path(p) => format!("path:{p}"),
-                    GroupKey::Window(h) => format!("hwnd:{h}"),
-                };
+                let key = group_key_text(&g.key);
                 let titles: Vec<String> = g
                     .windows
                     .iter()
@@ -924,7 +1265,7 @@ impl App {
                 )
             })
             .collect();
-        let bars: Vec<String> = self
+        let bars: Vec<String> = mb
             .bars
             .iter()
             .map(|b| {
@@ -961,13 +1302,13 @@ impl App {
             }
         };
         let hover = match self.hover {
-            Some(Hit::App(i)) => i.to_string(),
+            Some(Hit::App(i)) if self.cur == mb.id() => i.to_string(),
             _ => "null".to_string(),
         };
-        let appbar = match &self.appbar {
+        let appbar = match &mb.appbar {
             Some(_) => json_rect(reserved_rect(
                 self.settings.position,
-                self.monitor.rect_px,
+                mb.info.rect_px,
                 (l.reserved * s).round() as i32,
             )),
             None => "null".to_string(),
@@ -1037,7 +1378,7 @@ impl App {
         );
         let pins: Vec<String> = st.pins.iter().map(|p| json_str(&p.name)).collect();
         let dump = format!(
-            "{{\"settings\":{},\"pins\":[{}],\"tray_host\":{},\"chevron\":{},\"tray\":[{}],\"overflow\":{},\"tooltip\":{},\"fullscreen\":{},\"stock_taken\":{},\"appbar\":{},\"hover\":{},\"strip\":{},\"live_thumbnails\":{},\"bars\":[{}],\"groups\":{},\"shown\":{},\"start\":{},\"quick\":{},\"clock\":{},\"clock_text\":{},\"more\":{},\"apps\":[{}]}}",
+            "{{\"settings\":{},\"pins\":[{}],\"tray_host\":{},\"chevron\":{},\"tray\":[{}],\"overflow\":{},\"tooltip\":{},\"fullscreen\":{},\"stock_taken\":{},\"appbar\":{},\"hover\":{},\"strip\":{},\"live_thumbnails\":{},\"bars\":[{}],\"groups\":{},\"shown\":{},\"start\":{},\"quick\":{},\"clock\":{},\"clock_text\":{},\"more\":{},\"apps\":[{}],\"cur\":{},\"monitors\":[{}]}}",
             settings,
             pins.join(","),
             tray_host,
@@ -1045,14 +1386,14 @@ impl App {
             tray.join(","),
             overflow,
             tooltip,
-            self.fullscreen,
+            mb.fullscreen,
             self.stock.active(),
             appbar,
             hover,
             strip,
             live_thumbnails(),
             bars.join(","),
-            self.groups.len(),
+            mb.groups.len(),
             l.apps.len(),
             json_rect(to_px(l.start, s)),
             json_rect(to_px(l.quick, s)),
@@ -1060,6 +1401,8 @@ impl App {
             json_str(&self.clock_text),
             l.more.is_some(),
             apps.join(","),
+            self.cur,
+            monitors.join(","),
         );
         if dump != self.last_dump {
             eprintln!("vitrobar-state {dump}");
@@ -1069,7 +1412,14 @@ impl App {
 
     fn on_window_event(&mut self, ev: WindowEvent, dirty: &mut Dirty) {
         match ev {
+            WindowEvent::Changed(h) if self.stock.watches(h) => {
+                // Explorer moved one of its (hidden) taskbars: it is showing it again.
+                dirty.stock = true;
+            }
             WindowEvent::Created(h) | WindowEvent::Changed(h) => {
+                // Changed also covers a window moving to another monitor (LOCATIONCHANGE,
+                // HSHELL_MONITORCHANGED): the re-read finds its new monitor and the regroup
+                // touches only the two bars involved.
                 dirty.windows.insert(h);
                 // The foreground window moved or resized: it may have gone full screen.
                 dirty.fullscreen |= self.foreground == Some(h);
@@ -1077,7 +1427,7 @@ impl App {
             WindowEvent::Destroyed(h) => {
                 dirty.windows.remove(&h);
                 dirty.regroup |= self.windows.remove(h);
-                dirty.fullscreen |= self.fullscreen;
+                dirty.fullscreen |= self.monitors.iter().any(|m| m.fullscreen);
             }
             WindowEvent::Activated(h) => {
                 // Carry 7: activation ends a window's attention request.
@@ -1111,7 +1461,12 @@ impl App {
                 dirty.fullscreen = true;
             }
             WindowEvent::DesktopSwitched => {
-                dirty.regroup |= self.windows.refresh_desktops(&self.desktops);
+                // Every bar shows only the current desktop's windows; pins stay.
+                let changed = self.windows.refresh_desktops(&self.desktops);
+                dirty.regroup |= changed;
+                if self.opts.debug_state {
+                    eprintln!("vitrobar-desktop-switched changed={changed}");
+                }
             }
         }
     }
@@ -1150,7 +1505,7 @@ impl App {
             TIMER_MARGIN_COLLAPSE => {
                 self.kill_timer(TIMER_MARGIN_COLLAPSE);
                 self.collapse_pending = false;
-                for b in &mut self.bars {
+                for b in self.all_bars_mut() {
                     b.window.finish_linger();
                 }
             }
@@ -1165,12 +1520,51 @@ impl App {
         }
     }
 
-    fn bar_index(&self, hwnd: HWND) -> Option<usize> {
-        self.bars.iter().position(|b| b.window.hwnd == hwnd)
+    /// Every bar window of every monitor.
+    fn all_bars_mut(&mut self) -> impl Iterator<Item = &mut Bar> {
+        self.monitors.iter_mut().flat_map(|m| m.bars.iter_mut())
+    }
+
+    /// (monitor index, surface index) of bar window `hwnd`.
+    fn bar_index(&self, hwnd: HWND) -> Option<(usize, usize)> {
+        self.monitors.iter().enumerate().find_map(|(k, m)| {
+            m.bars
+                .iter()
+                .position(|b| b.window.hwnd == hwnd)
+                .map(|i| (k, i))
+        })
+    }
+
+    /// The cursor came onto the bar of monitor `id`: the hover and presses on the bar it was
+    /// on before end (that bar is redrawn), and app indices now refer to the new bar.
+    fn switch_cur(&mut self, id: u64, dirty: &mut Dirty) {
+        if id == self.cur {
+            return;
+        }
+        dirty.bars.insert(self.cur);
+        dirty.bars.insert(id);
+        self.cancel_show();
+        self.hover = None;
+        self.pressed = None;
+        self.rpressed = None;
+        self.show_suppressed = false;
+        self.set_tip_target(None);
+        self.cur = id;
     }
 
     /// Mouse input on a bar window or a flyout; returns true if the message was handled.
     fn on_mouse(&mut self, msg: &MSG, dirty: &mut Dirty) -> bool {
+        let had_overflow = self.overflow.is_some();
+        let handled = self.on_mouse_inner(msg, dirty);
+        if had_overflow != self.overflow.is_some() {
+            if let Some(m) = self.tray_monitor() {
+                dirty.bars.insert(m.id());
+            }
+        }
+        handled
+    }
+
+    fn on_mouse_inner(&mut self, msg: &MSG, dirty: &mut Dirty) -> bool {
         self.msg_pt = message_pos();
         if self
             .strip
@@ -1186,26 +1580,35 @@ impl App {
         {
             return self.on_overflow_mouse(msg);
         }
-        let Some(i) = self.bar_index(msg.hwnd) else {
+        let Some((k, i)) = self.bar_index(msg.hwnd) else {
             return false;
         };
+        let id = self.monitors[k].id();
+        if id != self.cur {
+            if msg.message == WM_MOUSELEAVE {
+                // The late leave of a bar the cursor has already left for another monitor's.
+                return true;
+            }
+            self.switch_cur(id, dirty);
+        }
+        let mb = &self.monitors[k];
         let (cx, cy) = mouse_pos(msg.lParam);
-        let (x, y) = self.bars[i].window.client_to_dip(cx, cy, self.scale);
-        let mut hit = hit_test(&self.layout, x, y);
-        if hit == Some(Hit::Chevron) && self.tray_over.is_empty() {
+        let (x, y) = mb.bars[i].window.client_to_dip(cx, cy, mb.scale());
+        let mut hit = hit_test(&mb.layout, x, y);
+        if hit == Some(Hit::Chevron) && (self.tray_over.is_empty() || !mb.tray) {
             // No overflow, no chevron.
             hit = None;
         }
         match msg.message {
             WM_MOUSEMOVE => {
                 if self.tracking != Some(msg.hwnd) {
-                    self.bars[i].window.track_leave();
+                    self.monitors[k].bars[i].window.track_leave();
                     self.tracking = Some(msg.hwnd);
                 }
                 if self.hover != hit {
                     self.hover = hit;
                     self.show_suppressed = false;
-                    dirty.visuals = true;
+                    dirty.bars.insert(self.cur);
                     let target = match hit {
                         Some(Hit::Tray(k)) => self.bar_tray_target(k),
                         _ => None,
@@ -1222,7 +1625,7 @@ impl App {
                         self.hover = None;
                         self.pressed = None;
                         self.rpressed = None;
-                        dirty.visuals = true;
+                        dirty.bars.insert(self.cur);
                     }
                     if self.overflow.as_ref().is_none_or(|o| !o.over) {
                         self.set_tip_target(None);
@@ -1240,11 +1643,11 @@ impl App {
                 if hit != Some(Hit::Chevron) {
                     self.close_overflow();
                 }
-                dirty.visuals = true;
+                dirty.bars.insert(self.cur);
             }
             WM_LBUTTONUP => {
                 let pressed = self.pressed.take();
-                dirty.visuals = true;
+                dirty.bars.insert(self.cur);
                 if pressed.is_some() && pressed == hit {
                     if let Some(h) = hit {
                         self.click(h);
@@ -1254,11 +1657,11 @@ impl App {
             WM_RBUTTONDOWN => {
                 self.rpressed = Some(hit);
                 self.hide_tooltip();
-                dirty.visuals = true;
+                dirty.bars.insert(self.cur);
             }
             WM_RBUTTONUP => {
                 let pressed = self.rpressed.take();
-                dirty.visuals = true;
+                dirty.bars.insert(self.cur);
                 match hit {
                     Some(Hit::Tray(k)) => {
                         if pressed == Some(hit) {
@@ -1286,9 +1689,10 @@ impl App {
 
     /// Screen px of promoted tray slot `k`, spanning the bar's height (a tooltip anchor).
     fn bar_tray_target(&self, k: usize) -> Option<TipTarget> {
+        let mb = self.tray_monitor()?;
         let idx = *self.tray_bar.get(k)?;
-        let r = self.layout.tray.get(k)?;
-        let s = self
+        let r = mb.layout.tray.get(k)?;
+        let s = mb
             .layout
             .surfaces
             .iter()
@@ -1302,7 +1706,7 @@ impl App {
                     w: r.w,
                     h: s.h,
                 },
-                self.scale,
+                mb.scale(),
             ),
         })
     }
@@ -1352,7 +1756,7 @@ impl App {
             &self.painter,
             t.anchor,
             self.settings.position,
-            self.monitor.dpi,
+            self.tray_dpi(),
             &self.style,
             &tip,
         ) {
@@ -1413,8 +1817,9 @@ impl App {
 
     /// Screen px of the chevron's slot, spanning the bar's height.
     fn chevron_anchor(&self) -> Option<PxRect> {
-        let r = self.layout.overflow_chevron;
-        let s = self
+        let mb = self.tray_monitor()?;
+        let r = mb.layout.overflow_chevron;
+        let s = mb
             .layout
             .surfaces
             .iter()
@@ -1426,7 +1831,7 @@ impl App {
                 w: r.w,
                 h: s.h,
             },
-            self.scale,
+            mb.scale(),
         ))
     }
 
@@ -1462,7 +1867,7 @@ impl App {
             anchor,
             self.settings.position,
             size,
-            self.monitor.dpi,
+            self.tray_dpi(),
             &self.style,
         )
         .and_then(|flyout| {
@@ -1671,12 +2076,13 @@ impl App {
         let tracking = self.tracking;
         let mut lingering = false;
         let mut began = false;
-        for b in &mut self.bars {
+        let animations = self.sys.animations;
+        for b in self.monitors.iter_mut().flat_map(|m| m.bars.iter_mut()) {
             if on_app && tracking == Some(b.window.hwnd) {
                 b.window.set_expanded(true);
             } else {
                 if b.window.mode() == MarginMode::Active {
-                    if self.sys.animations {
+                    if animations {
                         b.window.begin_linger();
                         began = true;
                     } else {
@@ -1711,7 +2117,7 @@ impl App {
         self.collapse_pending = id != 0;
         if id == 0 {
             // No timer available: collapse now rather than leave the margin lingering.
-            for b in &mut self.bars {
+            for b in self.all_bars_mut() {
                 b.window.finish_linger();
             }
         }
@@ -1720,7 +2126,12 @@ impl App {
     /// The hovered app, if it has windows (and so a strip).
     fn hovered_strip_app(&self) -> Option<usize> {
         match self.hover {
-            Some(Hit::App(i)) if self.groups.get(i).is_some_and(|g| !g.windows.is_empty()) => {
+            Some(Hit::App(i))
+                if self
+                    .cur_groups()
+                    .get(i)
+                    .is_some_and(|g| !g.windows.is_empty()) =>
+            {
                 Some(i)
             }
             _ => None,
@@ -1731,7 +2142,8 @@ impl App {
     fn update_strip(&mut self) {
         let hovered = self.hovered_strip_app();
         if let Some(s) = &self.strip {
-            let own = hovered.is_some_and(|i| self.groups[i].key == s.group);
+            let own = s.monitor == self.cur
+                && hovered.is_some_and(|i| self.cur_groups()[i].key == s.group);
             self.cancel_show();
             if self.over_flyout || own {
                 self.cancel_hide();
@@ -1807,11 +2219,12 @@ impl App {
         }
     }
 
-    /// Screen px of app `i`'s slot, spanning the full height of its bar surface.
-    fn anchor_px(&self, i: usize) -> Option<PxRect> {
-        let r = self.layout.apps.get(i)?;
+    /// Screen px of app `i`'s slot on bar `k`, spanning the full height of its surface.
+    fn anchor_px(&self, k: usize, i: usize) -> Option<PxRect> {
+        let mb = self.monitors.get(k)?;
+        let r = mb.layout.apps.get(i)?;
         let (cx, cy) = (r.x + r.w / 2.0, r.y + r.h / 2.0);
-        let s = self
+        let s = mb
             .layout
             .surfaces
             .iter()
@@ -1823,34 +2236,38 @@ impl App {
                 w: r.w,
                 h: s.h,
             },
-            self.scale,
+            mb.scale(),
         ))
     }
 
-    /// Opens the strip of app `i` now (replacing any other strip).
+    /// Opens the strip of app `i` of the cursor's bar now (replacing any other strip).
     fn open_strip(&mut self, i: usize) {
         self.cancel_show();
         self.cancel_hide();
-        self.build_strip(i);
+        if let Some(k) = self.mon_index(self.cur) {
+            self.build_strip(k, i);
+        }
     }
 
-    /// (Re)builds the strip of app `i` unless it already shows exactly that; the hover
-    /// timers are left alone.
-    fn build_strip(&mut self, i: usize) {
-        let Some(g) = self.groups.get(i) else { return };
+    /// (Re)builds the strip of app `i` of bar `k` unless it already shows exactly that; the
+    /// hover timers are left alone.
+    fn build_strip(&mut self, k: usize, i: usize) {
+        let Some(mb) = self.monitors.get(k) else {
+            return;
+        };
+        let (monitor, dpi) = (mb.id(), mb.info.dpi);
+        let Some(g) = mb.groups.get(i) else { return };
         if g.windows.is_empty() {
             self.close_strip();
             return;
         }
-        let Some(anchor) = self.anchor_px(i) else {
+        let Some(anchor) = self.anchor_px(k, i) else {
             self.close_strip();
             return;
         };
-        if self
-            .strip
-            .as_ref()
-            .is_some_and(|s| s.group == g.key && s.windows == g.windows && s.anchor == anchor)
-        {
+        if self.strip.as_ref().is_some_and(|s| {
+            s.monitor == monitor && s.group == g.key && s.windows == g.windows && s.anchor == anchor
+        }) {
             return;
         }
         let (key, hwnds) = (g.key.clone(), g.windows.clone());
@@ -1865,7 +2282,7 @@ impl App {
             anchor,
             self.settings.position,
             size,
-            self.monitor.dpi,
+            dpi,
             &self.style,
         )
         .and_then(|flyout| {
@@ -1873,6 +2290,7 @@ impl App {
             Ok(Strip {
                 thumbs,
                 flyout,
+                monitor,
                 group: key,
                 windows: hwnds,
                 anchor,
@@ -1907,9 +2325,14 @@ impl App {
     /// After the groups or the layout changed: follow the strip's group, or close it.
     fn sync_strip(&mut self) {
         let Some(s) = &self.strip else { return };
-        match self.groups.iter().position(|g| g.key == s.group) {
-            Some(i) if i < self.layout.apps.len() => self.build_strip(i),
-            _ => self.close_strip(),
+        let found = self.mon_index(s.monitor).and_then(|k| {
+            let mb = &self.monitors[k];
+            let i = mb.groups.iter().position(|g| g.key == s.group)?;
+            (i < mb.layout.apps.len()).then_some((k, i))
+        });
+        match found {
+            Some((k, i)) => self.build_strip(k, i),
+            None => self.close_strip(),
         }
     }
 
@@ -1934,7 +2357,9 @@ impl App {
             Hit::Quick => self.launcher.launch(Job::QuickSettings),
             Hit::Clock => self.launcher.launch(Job::Notifications),
             Hit::App(i) => {
-                let Some(g) = self.groups.get(i) else { return };
+                let Some(g) = self.cur_groups().get(i) else {
+                    return;
+                };
                 // The bar never takes focus, so the foreground window is the user's app.
                 let action = click_action(g, foreground());
                 if self.opts.debug_state {
@@ -1980,7 +2405,7 @@ impl App {
         self.show_suppressed = false;
         self.kill_timer(TIMER_MARGIN_COLLAPSE);
         self.collapse_pending = false;
-        for b in &mut self.bars {
+        for b in self.all_bars_mut() {
             b.window.set_expanded(false);
         }
     }
@@ -1993,7 +2418,7 @@ impl App {
         let (owner, pt) = (self.notify.hwnd, self.msg_pt);
         match app {
             Some(i) => {
-                let Some(g) = self.groups.get(i).cloned() else {
+                let Some(g) = self.cur_groups().get(i).cloned() else {
                     return;
                 };
                 let choice = app_menu(owner, pt, g.pin.is_some(), !g.windows.is_empty(), lang);
@@ -2061,7 +2486,7 @@ impl App {
 
     fn pins_changed(&mut self, dirty: &mut Dirty) {
         self.save_settings();
-        // Group indices (and so hover and press) refer to the old pins.
+        // Group indices (and so hover and press) refer to the old pins; pins are on every bar.
         self.regroup();
         dirty.visuals = true;
     }
@@ -2130,8 +2555,18 @@ impl App {
         dirty.clock |= inbox.clock;
         dirty.icons |= inbox.icons;
         dirty.fullscreen |= inbox.fullscreen;
-        // The model is shared with the host; the messages only say it changed.
-        dirty.visuals |= !inbox.tray.is_empty();
+        // The model is shared with the host; the messages only say it changed. Only the
+        // tray bar shows it.
+        if !inbox.tray.is_empty() {
+            if let Some(m) = self.tray_monitor() {
+                dirty.bars.insert(m.id());
+            }
+        }
+        // Monitors may have come, gone, moved or changed DPI. Our own appbars cause the
+        // work-area broadcasts too: re-reading the monitors is all those do unless something
+        // really changed.
+        dirty.monitors |= inbox.display || inbox.dpi || inbox.workarea || inbox.session;
+        dirty.display |= inbox.display || inbox.session;
         let deactivated = take_deactivated();
         if self
             .overflow
@@ -2154,26 +2589,56 @@ impl App {
         } else if inbox.shell || inbox.display {
             self.stock.reassert();
         }
-        if inbox.appbar_pos || inbox.display {
-            if let Some(ab) = &self.appbar {
-                ab.set_pos();
+        if inbox.display {
+            // Carry 6: a new monitor's Shell_SecondaryTrayWnd may only appear after this.
+            self.arm_reassert();
+        }
+        if inbox.appbar_pos {
+            // Display changes claim the strips in `flush`, after the monitors were re-read.
+            let mut moved = 0;
+            for mb in &self.monitors {
+                if let Some(ab) = &mb.appbar {
+                    moved += usize::from(ab.on_pos_changed());
+                }
+            }
+            if self.opts.debug_state {
+                eprintln!("vitrobar-appbar-pos reclaimed={moved}");
             }
         }
     }
 
     /// Applies everything collected from one drain of the queue.
     fn flush(&mut self, mut d: Dirty) -> Result<()> {
+        if d.monitors && self.reconcile_monitors(current_monitors()) {
+            // New bars, new geometry: everything is laid out and drawn again, and every
+            // window's monitor is read again (windows on a removed monitor were moved).
+            d.visuals = true;
+            d.fullscreen = true;
+            d.windows.extend(self.windows.hwnds());
+        }
+        if d.display {
+            // Carry 5: the system may have moved our windows while monitors changed.
+            for b in self.all_bars_mut() {
+                b.window.resync();
+            }
+        }
         if !d.windows.is_empty() {
             for h in std::mem::take(&mut d.windows) {
                 d.regroup |= self.windows.refresh(h, &self.desktops);
             }
         }
         let mut redraw = d.visuals;
+        let mut some = std::mem::take(&mut d.bars);
         if d.fullscreen {
-            redraw |= self.set_fullscreen(is_fullscreen_on(self.monitor.id));
+            for k in 0..self.monitors.len() {
+                let on = is_fullscreen_on_rect(self.monitors[k].info.rect_px);
+                if self.set_fullscreen(k, on) {
+                    some.insert(self.monitors[k].id());
+                }
+            }
         }
         if d.regroup {
-            redraw |= self.regroup();
+            some.extend(self.regroup());
         }
         if d.theme {
             let sys = read_system_theme();
@@ -2192,7 +2657,24 @@ impl App {
         }
         if redraw {
             self.refresh()?;
+        } else if !some.is_empty() {
+            // Carry 3: only the bars whose content changed.
+            self.refresh_once(Some(&some), true)?;
+        }
+        if redraw || !some.is_empty() {
             self.sync_strip();
+        }
+        if d.display {
+            // Carry 5: every appbar claims its strip of its monitor again, with the monitor
+            // rectangle just read (changed rectangles were already set by the layout).
+            for mb in &self.monitors {
+                if let Some(ab) = &mb.appbar {
+                    ab.set_pos();
+                }
+            }
+        }
+        if d.stock {
+            self.stock.reassert();
         }
         if self.clock_unarmed {
             self.tick_clock();
@@ -2281,4 +2763,88 @@ pub fn run(opts: Options) -> Result<()> {
     }
     drop(app);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mon(id: u64, x: i32, dpi: u32, primary: bool) -> MonitorInfo {
+        MonitorInfo {
+            id,
+            rect_px: (x, 0, x + 1920, 1080),
+            dpi,
+            primary,
+        }
+    }
+
+    #[test]
+    fn same_monitors_need_nothing() {
+        let a = [mon(1, 0, 120, true), mon(2, 1920, 96, false)];
+        assert!(plan_reconcile(&a, &a).is_empty());
+    }
+
+    #[test]
+    fn plug_and_unplug() {
+        let one = [mon(1, 0, 120, true)];
+        let two = [mon(1, 0, 120, true), mon(2, 1920, 96, false)];
+        let plug = plan_reconcile(&one, &two);
+        assert_eq!(plug.added, vec![2]);
+        assert!(plug.removed.is_empty() && plug.changed.is_empty());
+        let unplug = plan_reconcile(&two, &one);
+        assert_eq!(unplug.removed, vec![2]);
+        assert!(unplug.added.is_empty() && unplug.changed.is_empty());
+    }
+
+    #[test]
+    fn dpi_or_rect_change_touches_only_that_monitor() {
+        let old = [mon(1, 0, 120, true), mon(2, 1920, 96, false)];
+        let dpi = [mon(1, 0, 120, true), mon(2, 1920, 144, false)];
+        assert_eq!(
+            plan_reconcile(&old, &dpi),
+            ReconcilePlan {
+                changed: vec![2],
+                ..Default::default()
+            }
+        );
+        let moved = [mon(1, 0, 120, true), mon(2, -1920, 96, false)];
+        assert_eq!(plan_reconcile(&old, &moved).changed, vec![2]);
+    }
+
+    #[test]
+    fn a_new_primary_moves_the_tray_area() {
+        let old = [mon(1, 0, 120, true), mon(2, 1920, 96, false)];
+        let new = [mon(2, 1920, 96, true), mon(1, 0, 120, false)];
+        let p = plan_reconcile(&old, &new);
+        assert!(p.added.is_empty() && p.removed.is_empty());
+        assert_eq!(p.changed, vec![2, 1]);
+    }
+
+    #[test]
+    fn primary_unplugged_promotes_the_other() {
+        let old = [mon(1, 0, 120, true), mon(2, 1920, 96, false)];
+        let new = [mon(2, 1920, 96, true)];
+        let p = plan_reconcile(&old, &new);
+        assert_eq!(p.removed, vec![1]);
+        assert_eq!(p.changed, vec![2]);
+    }
+
+    #[test]
+    fn fake_monitor_comes_from_the_hook_file() {
+        let dir = std::env::temp_dir().join(format!("vitrobar-fake-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("mon.txt");
+        std::fs::write(&f, "1920,0,3840,1080,144").unwrap();
+        // No other test reads this variable.
+        std::env::set_var(FAKE_MONITOR_ENV, &f);
+        let with = current_monitors();
+        std::fs::remove_file(&f).unwrap();
+        let without = current_monitors();
+        std::env::remove_var(FAKE_MONITOR_ENV);
+        let _ = std::fs::remove_dir(&dir);
+        assert_eq!(with.len(), without.len() + 1);
+        let fake = with.last().unwrap();
+        assert_eq!((fake.dpi, fake.primary), (144, false));
+        assert!(with[0].primary, "a real primary stays first: the tray bar");
+    }
 }

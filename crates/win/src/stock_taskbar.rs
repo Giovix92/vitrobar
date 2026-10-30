@@ -177,6 +177,11 @@ fn tray_windows() -> Vec<HWND> {
     list
 }
 
+/// Explorer's taskbar windows now: its `Shell_TrayWnd` and every `Shell_SecondaryTrayWnd`.
+pub fn stock_taskbar_windows() -> Vec<HWND> {
+    tray_windows()
+}
+
 /// Explorer is running and has its taskbar window.
 pub fn stock_taskbar_present() -> bool {
     primary_tray().is_some()
