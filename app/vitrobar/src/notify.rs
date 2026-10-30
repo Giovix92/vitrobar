@@ -103,6 +103,11 @@ pub fn take_inbox() -> Inbox {
     INBOX.with(|i| std::mem::take(&mut *i.borrow_mut()))
 }
 
+/// Something arrived since the last [`take_inbox`] (on this thread).
+pub fn inbox_pending() -> bool {
+    INBOX.with(|i| *i.borrow() != Inbox::default())
+}
+
 fn with_inbox(f: impl FnOnce(&mut Inbox)) {
     INBOX.with(|i| f(&mut i.borrow_mut()));
 }
@@ -477,6 +482,17 @@ mod tests {
         assert!(inbox.timers.contains(&TIMER_CLOCK));
         assert_eq!(inbox.tray.len(), 1);
         assert_eq!(inbox.tray[0].id.uid, 2);
+        assert!(!inbox_pending());
         assert_eq!(take_inbox(), Inbox::default());
+    }
+
+    #[test]
+    fn pending_until_taken() {
+        let _ = take_inbox();
+        assert!(!inbox_pending());
+        record_dpi();
+        assert!(inbox_pending());
+        assert!(take_inbox().dpi);
+        assert!(!inbox_pending());
     }
 }

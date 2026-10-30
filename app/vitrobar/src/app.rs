@@ -70,7 +70,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetForegroundWindow, GetMessagePos, IsWindow, KillTimer,
     MsgWaitForMultipleObjectsEx, PeekMessageW, PostMessageW, PostQuitMessage, PostThreadMessageW,
     SetTimer, TranslateMessage, MSG, MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT, WM_KEYDOWN,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NULL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
 };
 
 use crate::bar_window::{
@@ -80,7 +80,7 @@ use crate::icon_loader::{IconLoader, IconSrc, Lookup, TrayImage, MAX_ICON_PX};
 use crate::launcher::{Job, Launcher};
 use crate::menus::{app_menu, bar_menu, MenuChoice};
 use crate::notify::{
-    take_inbox, Inbox, NotifyWindow, TIMER_CLOCK, TIMER_GPU_RETRY, TIMER_HOVER_HIDE,
+    inbox_pending, take_inbox, Inbox, NotifyWindow, TIMER_CLOCK, TIMER_GPU_RETRY, TIMER_HOVER_HIDE,
     TIMER_HOVER_SHOW, TIMER_MARGIN_COLLAPSE, TIMER_REASSERT, TIMER_TRAY_TIP, WM_APP_TAKE_OVER,
 };
 use crate::shell::{self, StockGuard};
@@ -2744,6 +2744,31 @@ fn apply_autostart(enabled: bool) {
     }
 }
 
+/// Immediate passes allowed in a row before the loop waits again.
+const MAX_IMMEDIATE_PASSES: u32 = 8;
+
+/// What the event loop does after a flush.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Next {
+    /// The inbox is empty: block until the next message or handle.
+    Wait,
+    /// The inbox is not empty: run another pass without blocking.
+    Again,
+    /// Still not empty after [`MAX_IMMEDIATE_PASSES`]: post `WM_NULL` to ourselves and wait
+    /// (the wait ends at once), so a pathological loop cannot spin without yielding.
+    WakeLater,
+}
+
+fn after_flush(pending: bool, spins: u32) -> Next {
+    if !pending {
+        Next::Wait
+    } else if spins < MAX_IMMEDIATE_PASSES {
+        Next::Again
+    } else {
+        Next::WakeLater
+    }
+}
+
 pub fn run(opts: Options) -> Result<()> {
     // SAFETY: plain apartment initialisation of the UI thread; balanced by ComGuard.
     unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()? };
@@ -2793,6 +2818,8 @@ pub fn run(opts: Options) -> Result<()> {
     }
     let mut app = App::new(opts, settings, path, stock)?;
     let mut msg = MSG::default();
+    // Immediate passes in a row because the inbox still held something after a flush.
+    let mut spins = 0u32;
     'event: loop {
         let removed = app.gpu.removed_event();
         let mut handles = [removed, HANDLE::default()];
@@ -2801,11 +2828,14 @@ pub fn run(opts: Options) -> Result<()> {
             handles[1] = h;
             count = 2;
         }
+        // An inbox left non-empty by the last pass must not wait for the next message: poll
+        // the handles without blocking instead.
+        let timeout = if spins > 0 { 0 } else { parent.timeout_ms() };
         // SAFETY: the handles stay valid while `app.gpu` and `parent` live.
         let wait = unsafe {
             MsgWaitForMultipleObjectsEx(
                 Some(&handles[..count]),
-                parent.timeout_ms(),
+                timeout,
                 QS_ALLINPUT,
                 MWMO_INPUTAVAILABLE,
             )
@@ -2840,6 +2870,22 @@ pub fn run(opts: Options) -> Result<()> {
         }
         app.absorb(take_inbox(), &mut dirty);
         app.flush(dirty)?;
+        // Nested message loops inside absorb / flush (the COM modal loop of the virtual
+        // desktop calls, sent SHAppBarMessage calls) dispatch to the notify window, so the
+        // inbox may hold events again that no queued message will announce.
+        match after_flush(inbox_pending(), spins) {
+            Next::Wait => spins = 0,
+            Next::Again => spins += 1,
+            Next::WakeLater => {
+                // Bounded: give the rest of the system a turn, then come back through the
+                // ordinary wait, which this message ends at once.
+                spins = 0;
+                // SAFETY: a payload-free post to our own window.
+                unsafe {
+                    let _ = PostMessageW(Some(app.notify.hwnd), WM_NULL, WPARAM(0), LPARAM(0));
+                }
+            }
+        }
     }
     drop(app);
     Ok(())
@@ -2856,6 +2902,26 @@ mod tests {
             dpi,
             primary,
         }
+    }
+
+    #[test]
+    fn a_non_empty_inbox_runs_again_then_yields() {
+        assert_eq!(after_flush(false, 0), Next::Wait);
+        assert_eq!(after_flush(false, MAX_IMMEDIATE_PASSES), Next::Wait);
+        let mut spins = 0;
+        let mut passes = 0;
+        // An inbox that never empties: bounded immediate passes, then a posted wake-up.
+        loop {
+            match after_flush(true, spins) {
+                Next::Again => {
+                    spins += 1;
+                    passes += 1;
+                }
+                Next::WakeLater => break,
+                Next::Wait => unreachable!(),
+            }
+        }
+        assert_eq!(passes, MAX_IMMEDIATE_PASSES);
     }
 
     #[test]
