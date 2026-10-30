@@ -50,6 +50,7 @@ No existing open-source project does true refraction on Windows.
 - **Rust**, using the `windows` crate. Native Win32 windows, **Direct3D 11 + DirectComposition** for rendering, DWM for backdrops/thumbnails.
 - **No webview, no .NET, no runtime dependency.** Single `.exe`.
 - GPU device created on the **minimum-power adapter** (`DXGI_GPU_PREFERENCE_MINIMUM_POWER`); never the discrete GPU.
+- *(owner's decision, 2026-10-30, after measurement)* Bar content (icons, text, glyphs) is drawn with the **WARP software rasterizer** instead of a hardware D3D device: the AMD driver alone cost ~24.5 MB private inside `D3D11CreateDevice`, leaving 0.1 MB of the 40 MB budget; WARP measured 14.5 MB total with pixel-identical output. Blur/composition of the glass stays on the GPU inside DWM, so look and idle cost are unchanged. A hardware device on the minimum-power adapter is created **only while liquid glass is enabled** (stage 4) and released when it is turned off.
 
 ### Performance budgets (verified before every release, with 10 apps open)
 | Metric | Budget |
