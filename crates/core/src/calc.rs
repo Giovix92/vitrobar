@@ -181,11 +181,22 @@ pub fn eval(s: &str) -> Option<f64> {
     finite(v)
 }
 
-/// Up to 10 significant digits, trailing zeros trimmed, decimal comma in Italian.
+/// Up to 10 significant digits, trailing zeros trimmed, decimal comma in Italian. Very large
+/// (|v| >= 1e15) and very small (0 < |v| < 1e-6) values use scientific notation ("1e300",
+/// "1,5e-12").
 pub fn format_result(v: f64, lang: Lang) -> String {
-    let rounded: f64 = format!("{:.9e}", v).parse().unwrap_or(v);
+    let sci = format!("{:.9e}", v);
+    let rounded: f64 = sci.parse().unwrap_or(v);
     let rounded = if rounded == 0.0 { 0.0 } else { rounded };
-    let s = rounded.to_string();
+    let a = rounded.abs();
+    let s = if a >= 1e15 || (a > 0.0 && a < 1e-6) {
+        // "1.500000000e-12" -> "1.5e-12".
+        let (mantissa, exp) = sci.split_once('e').unwrap_or((&sci, "0"));
+        let mantissa = mantissa.trim_end_matches('0').trim_end_matches('.');
+        format!("{mantissa}e{exp}")
+    } else {
+        rounded.to_string()
+    };
     match lang {
         Lang::En => s,
         Lang::It => s.replace('.', ","),
@@ -221,5 +232,18 @@ mod tests {
         assert_eq!(format_result(2.5, Lang::It), "2,5");
         assert_eq!(format_result(1.0 / 3.0, Lang::En), "0.3333333333");
         assert_eq!(format_result(8.0, Lang::En), "8");
+    }
+    #[test]
+    fn huge_and_tiny_use_scientific_notation() {
+        assert_eq!(format_result(1e300, Lang::En), "1e300");
+        assert_eq!(format_result(1.5e-12, Lang::En), "1.5e-12");
+        assert_eq!(format_result(1.5e-12, Lang::It), "1,5e-12");
+        assert_eq!(format_result(-2.5e20, Lang::It), "-2,5e20");
+        assert_eq!(format_result(1e15, Lang::En), "1e15");
+        assert_eq!(format_result(999_999_999_999_999.0, Lang::En), "1e15");
+        assert_eq!(format_result(123_456_789_012.0, Lang::En), "123456789000");
+        assert_eq!(format_result(0.000_001, Lang::En), "0.000001");
+        assert_eq!(format_result(0.0, Lang::En), "0");
+        assert!(format_result(eval("10^300").unwrap(), Lang::En).len() < 20);
     }
 }

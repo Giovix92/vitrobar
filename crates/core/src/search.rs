@@ -115,6 +115,10 @@ pub struct SearchResults {
 const MAX_APPS: usize = 6;
 const MAX_SETTINGS: usize = 3;
 const MAX_FILES: usize = 6;
+/// Below this many characters, settings pages and files need at least a substring match
+/// (score 300): a one- or two-letter subsequence matches almost every long name.
+const SHORT_QUERY_CHARS: usize = 3;
+const SHORT_QUERY_MIN_SCORE: u32 = 300;
 
 fn fold_char(c: char) -> Option<char> {
     Some(match c {
@@ -192,13 +196,20 @@ fn score_folded(q: &str, c: &str) -> Option<u32> {
 /// Scores each candidate and returns up to `cap` indices, best first. A candidate may offer
 /// several strings (a page title plus keywords); its score is the best of them, and ties go
 /// to the shorter then alphabetically-first primary name.
-fn rank<'a>(q: &str, cands: impl Iterator<Item = (usize, Vec<&'a str>)>, cap: usize) -> Vec<usize> {
+/// Candidates scoring below `min_score` are dropped.
+fn rank<'a>(
+    q: &str,
+    cands: impl Iterator<Item = (usize, Vec<&'a str>)>,
+    cap: usize,
+    min_score: u32,
+) -> Vec<usize> {
     let mut scored: Vec<(u32, usize, String, usize)> = cands
         .filter_map(|(idx, names)| {
             let best = names
                 .iter()
                 .filter_map(|n| score_folded(q, &fold(n)))
-                .max()?;
+                .max()
+                .filter(|&s| s >= min_score)?;
             let primary = fold(names[0]);
             Some((best, primary.chars().count(), primary, idx))
         })
@@ -224,6 +235,11 @@ pub fn search(query: &str, apps: &[Pin], files: &[FileHit], lang: Lang) -> Searc
         }
     }
     let q = fold(trimmed);
+    let floor = if q.chars().count() < SHORT_QUERY_CHARS {
+        SHORT_QUERY_MIN_SCORE
+    } else {
+        0
+    };
     items.extend(
         rank(
             &q,
@@ -231,6 +247,7 @@ pub fn search(query: &str, apps: &[Pin], files: &[FileHit], lang: Lang) -> Searc
                 .enumerate()
                 .map(|(i, p)| (i, vec![p.name.as_str()])),
             MAX_APPS,
+            0,
         )
         .into_iter()
         .map(ResultKind::App),
@@ -244,6 +261,7 @@ pub fn search(query: &str, apps: &[Pin], files: &[FileHit], lang: Lang) -> Searc
                 (i, names)
             }),
             MAX_SETTINGS,
+            floor,
         )
         .into_iter()
         .map(ResultKind::Setting),
@@ -256,6 +274,7 @@ pub fn search(query: &str, apps: &[Pin], files: &[FileHit], lang: Lang) -> Searc
                 .enumerate()
                 .map(|(i, f)| (i, vec![f.name.as_str()])),
             MAX_FILES,
+            floor,
         )
         .into_iter()
         .map(ResultKind::File),
@@ -326,6 +345,26 @@ mod tests {
         assert!(SETTINGS_PAGES
             .iter()
             .all(|p| p.uri.starts_with("ms-settings:")));
+    }
+    #[test]
+    fn short_queries_need_a_substring_for_settings_and_files() {
+        let files = [FileHit {
+            name: "quarterly report.xlsx".into(),
+            path: r"C:\Users\a\quarterly report.xlsx".into(),
+        }];
+        // "qy" is only a subsequence of the file name and of no settings page title.
+        let r = search("qy", &[pin("Quarterly")], &files, Lang::En);
+        assert!(r.items.iter().all(|k| !matches!(k, ResultKind::File(_))));
+        assert!(r.items.iter().all(|k| !matches!(k, ResultKind::Setting(_))));
+        // Apps keep subsequence matches.
+        assert!(r.items.contains(&ResultKind::App(0)));
+        // A substring is enough even when short; three characters lift the floor.
+        assert!(search("rt", &[], &files, Lang::En)
+            .items
+            .contains(&ResultKind::File(0)));
+        assert!(search("qrt", &[], &files, Lang::En)
+            .items
+            .contains(&ResultKind::File(0)));
     }
     #[test]
     fn long_query_no_panic() {
