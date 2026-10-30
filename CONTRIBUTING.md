@@ -7,6 +7,6 @@ Build and test:
     cargo build --workspace
     cargo test --workspace
     cargo fmt --check
-    cargo clippy --workspace -- -D warnings
+    cargo clippy --workspace --all-targets -- -D warnings
 
 Commit style: `type: summary`, for example `feat: add clock widget` or `fix: restore taskbar on panic`. Common types: feat, fix, chore, docs, test, refactor.
