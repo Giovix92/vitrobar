@@ -3,6 +3,8 @@
 //! Every surface is drawn once and then reused by the visual tree until its content changes.
 //! All sizes here are in the surface's physical pixels.
 
+use std::cell::RefCell;
+
 use vitro_core::image::BgraImage;
 use vitro_core::style::Rgba;
 use windows::core::{Interface, Result, HSTRING};
@@ -20,9 +22,10 @@ use windows::Win32::Graphics::Direct2D::{
 use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteTextLayout, DWRITE_FACTORY_TYPE_SHARED,
     DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_NORMAL,
-    DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING,
-    DWRITE_TEXT_METRICS, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
-    DWRITE_WORD_WRAPPING_NO_WRAP,
+    DWRITE_HIT_TEST_METRICS, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
+    DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_METRICS,
+    DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER, DWRITE_WORD_WRAPPING_NO_WRAP,
+    DWRITE_WORD_WRAPPING_WRAP,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::System::WinRT::Composition::ICompositionDrawingSurfaceInterop;
@@ -49,6 +52,8 @@ pub struct Painter {
     graphics: CompositionGraphicsDevice,
     text_family: HSTRING,
     glyph_family: HSTRING,
+    /// BCP-47 tag handed to DirectWrite (digits, shaping, line breaking).
+    locale: RefCell<HSTRING>,
 }
 
 fn d2d_color(c: Rgba) -> D2D1_COLOR_F {
@@ -89,7 +94,17 @@ impl Painter {
             glyph_family: pick_family(&dwrite, GLYPH_FAMILIES),
             dwrite,
             graphics: gpu.graphics.clone(),
+            locale: RefCell::new(HSTRING::from("en-us")),
         })
+    }
+
+    /// Sets the locale of the text laid out from now on (the user's UI language tag, e.g.
+    /// `it-IT`; the app passes it, this crate does not read system settings). An empty tag
+    /// is ignored.
+    pub fn set_locale(&self, tag: &str) {
+        if !tag.is_empty() {
+            *self.locale.borrow_mut() = HSTRING::from(tag);
+        }
     }
 
     /// The glyph font actually in use (for diagnostics).
@@ -110,6 +125,7 @@ impl Painter {
             FontKind::Glyph => &self.glyph_family,
         };
         let wide: Vec<u16> = text.encode_utf16().collect();
+        let locale = self.locale.borrow().clone();
         // SAFETY: plain DirectWrite object creation; every argument outlives the calls.
         unsafe {
             let format = self.dwrite.CreateTextFormat(
@@ -119,7 +135,7 @@ impl Painter {
                 DWRITE_FONT_STYLE_NORMAL,
                 DWRITE_FONT_STRETCH_NORMAL,
                 size,
-                &HSTRING::from("en-us"),
+                &locale,
             )?;
             format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
             format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
@@ -222,6 +238,107 @@ impl Painter {
         Ok(surface)
     }
 
+    /// Sets leading alignment and an ellipsis trimming sign (character granularity).
+    fn ellipsize(&self, layout: &IDWriteTextLayout) -> Result<()> {
+        // SAFETY: plain DirectWrite calls on objects we own; the trimming options are a
+        // local that outlives the call (DirectWrite copies them).
+        unsafe {
+            layout.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)?;
+            let trimming = DWRITE_TRIMMING {
+                granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER,
+                delimiter: 0,
+                delimiterCount: 0,
+            };
+            let sign = self.dwrite.CreateEllipsisTrimmingSign(layout)?;
+            layout.SetTrimming(&trimming, &sign)
+        }
+    }
+
+    /// `s` left-aligned and vertically centred in a `w_px` x `h_px` surface, cut with an
+    /// ellipsis when it does not fit.
+    pub fn text_left(
+        &self,
+        s: &str,
+        kind: FontKind,
+        size_px: f32,
+        color: Rgba,
+        w_px: u32,
+        h_px: u32,
+    ) -> Result<CompositionDrawingSurface> {
+        let surface = self.new_surface(w_px, h_px)?;
+        let layout = self.layout(s, kind, size_px, w_px.max(1) as f32, h_px.max(1) as f32)?;
+        self.ellipsize(&layout)?;
+        draw_layout(&surface, &layout, color)?;
+        Ok(surface)
+    }
+
+    /// Horizontal position (px from the text's left edge) of the caret before the
+    /// `char_index`-th char of `s` (an index into `s.chars()`); an index at or past the end
+    /// gives the trailing edge of the last char, 0 for empty text.
+    pub fn caret_x(&self, s: &str, kind: FontKind, size_px: f32, char_index: usize) -> Result<f32> {
+        if s.is_empty() {
+            return Ok(0.0);
+        }
+        let layout = self.layout(s, kind, size_px, 100_000.0, 10_000.0)?;
+        // SAFETY: plain DirectWrite call.
+        unsafe { layout.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)? };
+        let total = s.chars().count();
+        let (pos, trailing) = if char_index >= total {
+            // Start of the last char, trailing edge.
+            let last = s.chars().next_back().map_or(0, char::len_utf16);
+            let all: usize = s.chars().map(char::len_utf16).sum();
+            (all - last, true)
+        } else {
+            (s.chars().take(char_index).map(char::len_utf16).sum(), false)
+        };
+        let (mut x, mut y) = (0f32, 0f32);
+        let mut m = DWRITE_HIT_TEST_METRICS::default();
+        // SAFETY: out-pointers to locals.
+        unsafe { layout.HitTestTextPosition(pos as u32, trailing, &mut x, &mut y, &mut m)? };
+        Ok(x)
+    }
+
+    /// `s` word-wrapped to `w_px`, at most `max_lines` lines (the last one ends in an
+    /// ellipsis when the text is longer). Returns the surface and its height in px.
+    pub fn text_wrapped(
+        &self,
+        s: &str,
+        kind: FontKind,
+        size_px: f32,
+        color: Rgba,
+        w_px: u32,
+        max_lines: u32,
+    ) -> Result<(CompositionDrawingSurface, u32)> {
+        let max_lines = max_lines.max(1);
+        let layout = self.layout(s, kind, size_px, w_px.max(1) as f32, 100_000.0)?;
+        let metrics = |l: &IDWriteTextLayout| -> Result<DWRITE_TEXT_METRICS> {
+            let mut m = DWRITE_TEXT_METRICS::default();
+            // SAFETY: out-pointer to a local.
+            unsafe { l.GetMetrics(&mut m)? };
+            Ok(m)
+        };
+        // SAFETY: plain DirectWrite calls on an object we own.
+        unsafe {
+            layout.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)?;
+            layout.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR)?;
+            layout.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP)?;
+        }
+        let m = metrics(&layout)?;
+        let lines = m.lineCount.max(1);
+        let line_h = m.height / lines as f32;
+        let shown = lines.min(max_lines);
+        let h = (line_h * shown as f32).ceil().max(1.0);
+        if lines > max_lines {
+            self.ellipsize(&layout)?;
+            // SAFETY: plain DirectWrite call; the max height makes the last line trim.
+            unsafe { layout.SetMaxHeight(line_h * max_lines as f32)? };
+        }
+        let h = h as u32;
+        let surface = self.new_surface(w_px, h)?;
+        draw_layout(&surface, &layout, color)?;
+        Ok((surface, h))
+    }
+
     /// The image at its own pixel size.
     pub fn image(&self, img: &BgraImage) -> Result<CompositionDrawingSurface> {
         if !img.is_valid() || img.width == 0 || img.height == 0 {
@@ -291,4 +408,24 @@ fn draw(
         let ended = interop.EndDraw();
         drawn.and(ended)
     }
+}
+
+/// Draws one layout at the surface's origin.
+fn draw_layout(
+    surface: &CompositionDrawingSurface,
+    layout: &IDWriteTextLayout,
+    color: Rgba,
+) -> Result<()> {
+    draw(surface, |dc| unsafe {
+        // SAFETY: `dc` is the context returned by BeginDraw, valid until EndDraw.
+        let brush = dc.CreateSolidColorBrush(&d2d_color(color), None)?;
+        dc.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+        dc.DrawTextLayout(
+            Vector2::new(0.0, 0.0),
+            layout,
+            &brush,
+            D2D1_DRAW_TEXT_OPTIONS_NONE,
+        );
+        Ok(())
+    })
 }

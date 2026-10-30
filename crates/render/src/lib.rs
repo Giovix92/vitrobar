@@ -5,6 +5,7 @@ pub mod compositor;
 pub mod device;
 pub mod flyout;
 pub mod material;
+pub mod panel;
 pub mod surfaces;
 pub mod tray_flyout;
 
