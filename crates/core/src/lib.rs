@@ -7,6 +7,7 @@ pub mod i18n;
 pub mod image;
 pub mod layout;
 pub mod restart;
+pub mod search;
 pub mod settings;
 pub mod style;
 pub mod text_input;

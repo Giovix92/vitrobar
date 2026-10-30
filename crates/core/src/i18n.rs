@@ -46,6 +46,25 @@ pub enum Key {
     Top,
     StartWithWindows,
     ExitVitrobar,
+    Display,
+    Sound,
+    Bluetooth,
+    WiFi,
+    Personalization,
+    AppsSettings,
+    WindowsUpdate,
+    Power,
+    Mouse,
+    Keyboard,
+    Notifications,
+    DefaultApps,
+    Storage,
+    Privacy,
+    DateTime,
+    Region,
+    Accounts,
+    Printers,
+    NightLight,
 }
 
 pub const ALL_KEYS: &[Key] = &[
@@ -77,6 +96,25 @@ pub const ALL_KEYS: &[Key] = &[
     Key::Top,
     Key::StartWithWindows,
     Key::ExitVitrobar,
+    Key::Display,
+    Key::Sound,
+    Key::Bluetooth,
+    Key::WiFi,
+    Key::Personalization,
+    Key::AppsSettings,
+    Key::WindowsUpdate,
+    Key::Power,
+    Key::Mouse,
+    Key::Keyboard,
+    Key::Notifications,
+    Key::DefaultApps,
+    Key::Storage,
+    Key::Privacy,
+    Key::DateTime,
+    Key::Region,
+    Key::Accounts,
+    Key::Printers,
+    Key::NightLight,
 ];
 
 pub fn tr(lang: Lang, key: Key) -> &'static str {
@@ -137,6 +175,44 @@ pub fn tr(lang: Lang, key: Key) -> &'static str {
         (Lang::It, Key::StartWithWindows) => "Avvia con Windows",
         (Lang::En, Key::ExitVitrobar) => "Exit Vitrobar",
         (Lang::It, Key::ExitVitrobar) => "Esci da Vitrobar",
+        (Lang::En, Key::Display) => "Display",
+        (Lang::It, Key::Display) => "Schermo",
+        (Lang::En, Key::Sound) => "Sound",
+        (Lang::It, Key::Sound) => "Suono",
+        (Lang::En, Key::Bluetooth) => "Bluetooth & devices",
+        (Lang::It, Key::Bluetooth) => "Bluetooth e dispositivi",
+        (Lang::En, Key::WiFi) => "Wi-Fi",
+        (Lang::It, Key::WiFi) => "Wi-Fi",
+        (Lang::En, Key::Personalization) => "Personalization",
+        (Lang::It, Key::Personalization) => "Personalizzazione",
+        (Lang::En, Key::AppsSettings) => "Installed apps",
+        (Lang::It, Key::AppsSettings) => "App installate",
+        (Lang::En, Key::WindowsUpdate) => "Windows Update",
+        (Lang::It, Key::WindowsUpdate) => "Windows Update",
+        (Lang::En, Key::Power) => "Power & battery",
+        (Lang::It, Key::Power) => "Alimentazione e batteria",
+        (Lang::En, Key::Mouse) => "Mouse",
+        (Lang::It, Key::Mouse) => "Mouse",
+        (Lang::En, Key::Keyboard) => "Typing",
+        (Lang::It, Key::Keyboard) => "Digitazione",
+        (Lang::En, Key::Notifications) => "Notifications",
+        (Lang::It, Key::Notifications) => "Notifiche",
+        (Lang::En, Key::DefaultApps) => "Default apps",
+        (Lang::It, Key::DefaultApps) => "App predefinite",
+        (Lang::En, Key::Storage) => "Storage",
+        (Lang::It, Key::Storage) => "Archiviazione",
+        (Lang::En, Key::Privacy) => "Privacy & security",
+        (Lang::It, Key::Privacy) => "Privacy e sicurezza",
+        (Lang::En, Key::DateTime) => "Date & time",
+        (Lang::It, Key::DateTime) => "Data e ora",
+        (Lang::En, Key::Region) => "Language & region",
+        (Lang::It, Key::Region) => "Lingua e area geografica",
+        (Lang::En, Key::Accounts) => "Your info",
+        (Lang::It, Key::Accounts) => "Le tue informazioni",
+        (Lang::En, Key::Printers) => "Printers & scanners",
+        (Lang::It, Key::Printers) => "Stampanti e scanner",
+        (Lang::En, Key::NightLight) => "Night light",
+        (Lang::It, Key::NightLight) => "Luce notturna",
     }
 }
 
@@ -157,7 +233,7 @@ mod tests {
             assert!(!tr(Lang::En, k).is_empty());
             assert!(!tr(Lang::It, k).is_empty());
         }
-        assert_eq!(ALL_KEYS.len(), 28);
+        assert_eq!(ALL_KEYS.len(), 47);
     }
     #[test]
     fn spot_checks() {
