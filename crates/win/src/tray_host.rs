@@ -272,7 +272,10 @@ unsafe fn deliver(target: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Opt
 /// # Safety
 /// `data` and `wparam` are those of the `WM_COPYDATA` being handled.
 unsafe fn forward_appbar(own: HWND, wparam: WPARAM, data: &[u8]) -> Option<LRESULT> {
-    let call = parse_appbar_copydata(data).filter(|c| c.shared != 0)?;
+    // Only a block allocated for this process (as shell32 does for a caller that found our
+    // window) is opened: any other process id is left alone, so a sender cannot make us open
+    // a process of its choosing. Such a copy is forwarded verbatim.
+    let call = parse_appbar_copydata(data).filter(|c| c.shared != 0 && c.proc_id == own_pid())?;
     let Some(target) = explorer_target(own) else {
         return Some(LRESULT(0));
     };

@@ -287,6 +287,12 @@ fn eventually_wa(want: impl Fn((i32, i32, i32, i32)) -> bool) -> (i32, i32, i32,
     }
 }
 
+/// An appbar registered while the host is the `Shell_TrayWnd` that `FindWindow` finds takes
+/// exactly its reserved px off `SPI_GETWORKAREA`, and gives them back when removed.
+///
+/// Assumes the stock layout: Explorer's taskbar at the bottom of the primary monitor, visible
+/// (not auto-hidden), and no other appbar changing meanwhile. Our bottom strip then stacks
+/// above Explorer's, so the work area's bottom moves up by exactly the reserved px.
 #[test]
 #[ignore = "takes over the Shell_TrayWnd name for the whole desktop"]
 fn appbar_reserves_the_work_area_while_the_host_runs() {
@@ -341,7 +347,9 @@ fn appbar_reserves_the_work_area_while_the_host_runs() {
         let mut ab = AppBar::register(bar.0, Position::Top, mon, 64).unwrap();
         let wa = eventually_wa(|w| w.1 == before.1 + 64);
         assert_eq!(wa.1, before.1 + 64, "top edge through the host");
-        ab.update(Position::Top, mon, 64);
+        ab.update(Position::Top, mon, 96);
+        let wa = eventually_wa(|w| w.1 == before.1 + 96);
+        assert_eq!(wa.1, before.1 + 96, "a thicker top strip through the host");
     }
     eventually_wa(|w| w == before);
     drop(host);

@@ -374,8 +374,10 @@ struct App {
     tray_over: Vec<usize>,
     /// The tray icon under the cursor; TIMER_TRAY_TIP is armed for it while no tooltip shows.
     tip_target: Option<TipTarget>,
-    /// Bar item under a right-button press.
-    rpressed: Option<Hit>,
+    /// A right-button press on a bar window, and the item under it (`Some(None)`: pressed on
+    /// the empty bar). `None` when no right press started on the bar, so a right-up arriving
+    /// from a drag that began elsewhere does nothing.
+    rpressed: Option<Option<Hit>>,
     /// Screen px of the mouse message being handled (forwarded with clicks and hovers).
     msg_pt: (i32, i32),
     /// Last left click on a tray icon, to tell a double click.
@@ -694,7 +696,8 @@ impl App {
             .map(|(i, &idx)| TrayItemState {
                 icon: self.tray_image(idx),
                 hovered: self.hover == Some(Hit::Tray(i)),
-                pressed: self.pressed == Some(Hit::Tray(i)) || self.rpressed == Some(Hit::Tray(i)),
+                pressed: self.pressed == Some(Hit::Tray(i))
+                    || self.rpressed == Some(Some(Hit::Tray(i))),
             })
             .collect();
         // Overflow icons load ahead, so the overflow opens with its images.
@@ -1249,7 +1252,7 @@ impl App {
                 }
             }
             WM_RBUTTONDOWN => {
-                self.rpressed = hit;
+                self.rpressed = Some(hit);
                 self.hide_tooltip();
                 dirty.visuals = true;
             }
@@ -1258,18 +1261,19 @@ impl App {
                 dirty.visuals = true;
                 match hit {
                     Some(Hit::Tray(k)) => {
-                        if pressed == hit {
+                        if pressed == Some(hit) {
                             self.close_overflow();
                             self.tray_click(self.tray_bar.get(k).copied(), TrayClick::Right);
                         }
                     }
                     Some(Hit::App(i)) => {
-                        if pressed == hit {
+                        if pressed == Some(hit) {
                             self.context_menu(Some(i), dirty);
                         }
                     }
-                    // Anywhere else on the bar: the bar's own menu (pressed there too).
-                    _ if pressed == hit => self.context_menu(None, dirty),
+                    // Anywhere else on the bar: the bar's own menu, when the right press started
+                    // on the bar at the same place (the empty bar counts only if pressed there).
+                    _ if pressed == Some(hit) => self.context_menu(None, dirty),
                     _ => {}
                 }
             }

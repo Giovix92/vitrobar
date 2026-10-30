@@ -7,7 +7,7 @@
 
 use vitro_core::settings::Pin;
 use windows::core::{w, Error, Result, HSTRING, PCWSTR};
-use windows::Win32::Foundation::{E_INVALIDARG, HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{ERROR_CANCELLED, E_INVALIDARG, HWND, LPARAM, WPARAM};
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_LOCAL_SERVER};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
@@ -53,7 +53,8 @@ pub fn launch_plan(p: &Pin, link_exists: impl Fn(&str) -> bool) -> Vec<LaunchSte
 
 /// Starts a pinned app, trying each step of [`launch_plan`] until one works: a shortcut that
 /// will not open, or an AUMID that does not activate (a desktop app's explicit AUMID), falls
-/// back to the next. Returns the last failure. Blocking; needs COM initialised on the calling
+/// back to the next. The user declining (`ERROR_CANCELLED`, e.g. a UAC prompt) ends it there.
+/// Returns the last failure. Blocking; needs COM initialised on the calling
 /// thread.
 pub fn launch_pin(p: &Pin) -> Result<()> {
     let mut last = Error::new(E_INVALIDARG, "pin has neither shortcut, AUMID nor path");
@@ -64,6 +65,7 @@ pub fn launch_pin(p: &Pin) -> Result<()> {
         };
         match r {
             Ok(()) => return Ok(()),
+            Err(e) if e.code() == ERROR_CANCELLED.to_hresult() => return Err(e),
             Err(e) => last = e,
         }
     }
@@ -210,6 +212,12 @@ mod tests {
             launch_plan(&only_link, |_| true),
             vec![LaunchStep::Link("a.lnk".into())]
         );
+    }
+
+    #[test]
+    fn cancelled_is_the_hresult_shell_execute_reports() {
+        // ShellExecuteEx fails with HRESULT_FROM_WIN32(ERROR_CANCELLED) when UAC is declined.
+        assert_eq!(ERROR_CANCELLED.to_hresult().0 as u32, 0x8007_04C7);
     }
 
     #[test]

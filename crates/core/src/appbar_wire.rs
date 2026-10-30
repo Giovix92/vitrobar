@@ -13,6 +13,10 @@
 //! taskbar reads the request from the shared block and writes its answer back into it. The
 //! block is allocated for the process that owns the `Shell_TrayWnd` the caller found, so
 //! `dwProcId` names the receiver, not the sender.
+//!
+//! The layout above was captured live from 64-bit callers only (shell32 on x64). A payload
+//! that does not match it (shorter than 64 bytes, or a shared block whose `cbSize` is not 40)
+//! is forwarded verbatim by the tray host, as before this relay existed.
 
 /// `COPYDATASTRUCT.dwData` value used by `SHAppBarMessage`.
 pub const APPBAR_COPYDATA_ID: usize = 0;
