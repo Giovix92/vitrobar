@@ -9,8 +9,8 @@ use std::sync::Mutex;
 use vitro_core::settings::StockTaskbar;
 use vitro_win::appbar::unregister;
 use vitro_win::stock_taskbar::{
-    default_record_path, reassert_hidden, restore_stock_taskbar, show_stock_taskbar,
-    stock_taskbar_windows, take_over_stock_taskbar,
+    default_record_path, reassert_hidden, restore_stock_taskbar_within, show_stock_taskbar,
+    stock_taskbar_windows, take_over_stock_taskbar, ShellLock, SHELL_LOCK_TIMEOUT_MS,
 };
 use windows::Win32::Foundation::HWND;
 
@@ -52,31 +52,38 @@ pub fn remove_appbar_hwnd(hwnd: HWND) {
 /// from any thread and any number of times.
 pub fn restore_now() {
     let _lock = RESTORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    restore_locked();
+    restore_locked(SHELL_LOCK_TIMEOUT_MS);
 }
+
+/// The panic hook waits this long at most for another process's take-over or restore.
+const PANIC_SHELL_LOCK_MS: u32 = 2_000;
 
 /// The panic hook's restore: like [`restore_now`], but if the panic happened inside a
 /// restore (the lock is held by this very thread) it only does the parts that cannot
 /// deadlock.
 pub fn restore_after_panic() {
     match RESTORE_LOCK.try_lock() {
-        Ok(_lock) => restore_locked(),
+        Ok(_lock) => restore_locked(PANIC_SHELL_LOCK_MS),
         Err(std::sync::TryLockError::Poisoned(e)) => {
             let _lock = e.into_inner();
-            restore_locked();
+            restore_locked(PANIC_SHELL_LOCK_MS);
         }
         Err(std::sync::TryLockError::WouldBlock) => {
             RESTORED.store(true, Ordering::SeqCst);
+            let _shell = ShellLock::acquire(PANIC_SHELL_LOCK_MS);
             if let Some(p) = record_path() {
-                let _ = restore_stock_taskbar(&p);
+                let _ = restore_stock_taskbar_within(&p, 0);
             }
             show_stock_taskbar();
         }
     }
 }
 
-fn restore_locked() {
+/// Holds the cross-process [`ShellLock`] (waiting at most `lock_ms`; on a timeout it restores
+/// anyway: giving the taskbar back is always safe).
+fn restore_locked(lock_ms: u32) {
     RESTORED.store(true, Ordering::SeqCst);
+    let _shell = ShellLock::acquire(lock_ms);
     // First: while our tray window lives, the appbar and auto-hide calls below pass through
     // it (it forwards them); afterwards they go straight to Explorer.
     vitro_win::tray_host::shutdown_global();
@@ -85,7 +92,8 @@ fn restore_locked() {
         unregister(HWND(h as *mut _));
     }
     if let Some(p) = record_path() {
-        if let Err(e) = restore_stock_taskbar(&p) {
+        // Already holding the lock (or given up on it): no second wait.
+        if let Err(e) = restore_stock_taskbar_within(&p, 0) {
             eprintln!("vitrobar: could not restore the stock taskbar: {e}");
         }
     }
@@ -121,6 +129,14 @@ impl StockGuard {
             eprintln!("vitrobar: LOCALAPPDATA is not set; the stock taskbar stays");
             return;
         };
+        // Held across the take-over and its undo: a RunOnce `--restore` or a watchdog's
+        // restore in another process cannot interleave with them.
+        let Some(_shell) = ShellLock::acquire(SHELL_LOCK_TIMEOUT_MS) else {
+            eprintln!(
+                "vitrobar: another Vitrobar process holds the shell; the stock taskbar stays"
+            );
+            return;
+        };
         if self.mode == StockTaskbar::Hidden {
             // Before the windows are hidden, so no way out can miss showing them.
             HID_TASKBAR.store(true, Ordering::SeqCst);
@@ -132,8 +148,8 @@ impl StockGuard {
             }
             Err(e) => {
                 eprintln!("vitrobar: could not take over the stock taskbar: {e}");
-                // Undo whatever part of it happened.
-                if let Err(e) = restore_stock_taskbar(&p) {
+                // Undo whatever part of it happened (the lock is already held).
+                if let Err(e) = restore_stock_taskbar_within(&p, 0) {
                     eprintln!("vitrobar: could not restore the stock taskbar: {e}");
                 }
             }

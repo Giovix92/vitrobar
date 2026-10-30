@@ -144,8 +144,11 @@ pub fn spawn_adopter(extra: &[String]) -> std::io::Result<OwnedHandle> {
 /// The bar died without cleaning up: give the stock taskbar back from here.
 fn restore_after_crash() {
     use vitro_win::stock_taskbar::{
-        default_record_path, restore_stock_taskbar, show_stock_taskbar, stock_taskbar_present,
+        default_record_path, restore_stock_taskbar_within, show_stock_taskbar,
+        stock_taskbar_present, ShellLock, SHELL_LOCK_TIMEOUT_MS,
     };
+    // Serialized with every other take-over and restore; on a timeout restore anyway.
+    let _shell = ShellLock::acquire(SHELL_LOCK_TIMEOUT_MS);
     if mutex_exists(BAR_MUTEX) {
         // Another live bar owns the shell (the one that died never got that far).
         return;
@@ -153,9 +156,11 @@ fn restore_after_crash() {
     // Show first and let Explorer handle it before the auto-hide change: that change keeps
     // Explorer busy for most of a second, and a posted show would wait behind it.
     show_stock_taskbar();
-    wait_until_shown();
+    if stock_taskbar_present() {
+        wait_until_shown();
+    }
     if let Some(p) = default_record_path() {
-        if let Err(e) = restore_stock_taskbar(&p) {
+        if let Err(e) = restore_stock_taskbar_within(&p, 0) {
             eprintln!("vitrobar-watchdog: could not restore the stock taskbar: {e}");
         }
     }
@@ -170,8 +175,31 @@ fn restore_after_crash() {
     }
 }
 
+/// After a deliberate exit: a record still on disk means the bar's own restore did not
+/// finish. Restore (idempotent) unless another live bar owns the shell.
+fn restore_leftover() {
+    use vitro_win::stock_taskbar::{
+        default_record_path, restore_stock_taskbar_within, ShellLock, SHELL_LOCK_TIMEOUT_MS,
+    };
+    let Some(p) = default_record_path() else {
+        return;
+    };
+    if !p.exists() {
+        return;
+    }
+    let _shell = ShellLock::acquire(SHELL_LOCK_TIMEOUT_MS);
+    if mutex_exists(BAR_MUTEX) {
+        return;
+    }
+    if let Err(e) = restore_stock_taskbar_within(&p, 0) {
+        eprintln!("vitrobar-watchdog: could not restore the stock taskbar: {e}");
+    }
+}
+
 /// Waits (bounded, only after a crash) for Explorer to show its taskbar, posting the show
-/// again now and then in case a hide from the dead bar landed after it.
+/// again now and then in case a hide from the dead bar landed after it. Deliberately a
+/// bounded busy-wait (20 ms sleeps, 1.5 s at most): Explorer's window visibility has no
+/// event to wait on, and this runs only right after a crash, never while idle.
 fn wait_until_shown() {
     const STEP: Duration = Duration::from_millis(20);
     const REPOST_EVERY: u32 = 10;
@@ -207,7 +235,9 @@ fn watch(mut bar: OwnedHandle, extra: &[String]) -> ExitCode {
     loop {
         let code = wait_exit(&bar);
         if code == 0 {
-            // The bar ended on purpose and restored the shell itself.
+            // The bar ended on purpose and restored the shell itself; if its restore did not
+            // finish (the record is still there), finish it. Never a restart.
+            restore_leftover();
             return ExitCode::SUCCESS;
         }
         eprintln!("vitrobar-watchdog: the bar ended with code {code:#x}");
@@ -272,7 +302,13 @@ pub struct ParentWatch {
     policy: RestartPolicy,
     start: Instant,
     extra: Vec<String>,
+    /// Failed adopter launches in a row (each retry waits twice as long).
+    spawn_failures: u32,
+    spawn: fn(&[String]) -> std::io::Result<OwnedHandle>,
 }
+
+/// Adopter launches tried after a failure before the bar runs without a watchdog.
+const MAX_SPAWN_RETRIES: u32 = 4;
 
 impl ParentWatch {
     /// `parent` is the watchdog's pid from `--parent`; `None` (a bare `--bar` run) watches
@@ -284,6 +320,8 @@ impl ParentWatch {
             policy: RestartPolicy::new(),
             start: Instant::now(),
             extra,
+            spawn_failures: 0,
+            spawn: spawn_adopter,
         };
         if let Some(pid) = parent {
             match open_process(pid) {
@@ -326,9 +364,20 @@ impl ParentWatch {
     pub fn tick(&mut self) {
         if self.adopt_at.is_some_and(|at| Instant::now() >= at) {
             self.adopt_at = None;
-            match spawn_adopter(&self.extra) {
-                Ok(h) => self.handle = Some(h),
-                Err(e) => eprintln!("vitrobar: could not start a new watchdog: {e}"),
+            match (self.spawn)(&self.extra) {
+                Ok(h) => {
+                    self.handle = Some(h);
+                    self.spawn_failures = 0;
+                }
+                Err(e) => {
+                    eprintln!("vitrobar: could not start a new watchdog: {e}");
+                    if self.spawn_failures < MAX_SPAWN_RETRIES {
+                        // One more try later, as the wait's timeout (1 s, 2 s, 4 s, 8 s).
+                        self.adopt_at =
+                            Some(Instant::now() + ADOPT_DELAY * (1u32 << self.spawn_failures));
+                        self.spawn_failures += 1;
+                    }
+                }
             }
         }
     }
@@ -365,6 +414,31 @@ mod tests {
         let w = ParentWatch::new(Some(0), Vec::new());
         assert!(w.handle().is_none());
         assert_eq!(w.timeout_ms(), 0);
+    }
+
+    #[test]
+    fn failed_adopter_launch_retries_with_backoff_then_stops() {
+        fn fail(_: &[String]) -> std::io::Result<OwnedHandle> {
+            Err(std::io::Error::other("no"))
+        }
+        let mut w = ParentWatch::new(Some(0), Vec::new());
+        w.spawn = fail;
+        let mut waits = Vec::new();
+        for _ in 0..=MAX_SPAWN_RETRIES {
+            // Due now.
+            w.adopt_at = w.adopt_at.map(|_| Instant::now());
+            w.tick();
+            waits.push(w.timeout_ms());
+        }
+        let last = waits.pop().unwrap();
+        assert_eq!(last, INFINITE, "gives up after {MAX_SPAWN_RETRIES} retries");
+        for (i, t) in waits.iter().enumerate() {
+            let want = ADOPT_DELAY.as_millis() as u32 * (1 << i);
+            assert!(
+                *t <= want && *t + 100 >= want,
+                "retry {i}: {t} ms, want {want}"
+            );
+        }
     }
 
     #[test]

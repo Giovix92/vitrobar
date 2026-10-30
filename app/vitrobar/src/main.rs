@@ -19,6 +19,8 @@ mod window_set;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+use vitro_win::stock_taskbar::{ShellLock, SHELL_LOCK_TIMEOUT_MS};
+
 const USAGE: &str =
     "usage: vitrobar [--debug-state] [--console]   (the watchdog, which starts the bar)\n\
        vitrobar --bar [--parent <pid>] [--debug-state] [--console]\n\
@@ -46,11 +48,15 @@ fn restore_mode() -> ExitCode {
             std::thread::sleep(Duration::from_millis(250));
         }
     }
+    // The check and the restore under one cross-process lock, which a bar's take-over also
+    // holds: an autostarted bar starting right now either finishes its take-over first (and
+    // is seen here) or starts after this restore is complete. On a timeout: restore anyway.
+    let _shell = ShellLock::acquire(SHELL_LOCK_TIMEOUT_MS);
     if bar_running() {
         // An autostarted bar came up while we waited for Explorer.
         return ExitCode::SUCCESS;
     }
-    let restored = vitro_win::stock_taskbar::restore_stock_taskbar(&path);
+    let restored = vitro_win::stock_taskbar::restore_stock_taskbar_within(&path, 0);
     if vitro_win::stock_taskbar::stock_taskbar_present() {
         // A Vitrobar that ended without cleaning up may have hidden the taskbar and held the
         // tray icons: show it, and ask every app to register its icons with Explorer again.
@@ -112,27 +118,34 @@ fn parse_pid(v: Option<String>) -> Option<u32> {
     v.and_then(|s| s.parse().ok())
 }
 
+fn usage_error(msg: &str) -> ExitCode {
+    eprintln!("vitrobar: {msg}\n{USAGE}");
+    ExitCode::from(2)
+}
+
 fn main() -> ExitCode {
     let mut mode = Mode::Watchdog;
+    // Only one of --bar, --adopt, --restore.
+    let mut mode_flag: Option<String> = None;
     let mut opts = app::Options::default();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
+        if matches!(arg.as_str(), "--bar" | "--adopt" | "--restore") {
+            if let Some(prev) = &mode_flag {
+                return usage_error(&format!("{prev} and {arg} cannot be combined"));
+            }
+            mode_flag = Some(arg.clone());
+        }
         match arg.as_str() {
             "--bar" => mode = Mode::Bar,
             "--restore" => mode = Mode::Restore,
             "--adopt" => match parse_pid(args.next()) {
                 Some(pid) => mode = Mode::Adopt(pid),
-                None => {
-                    eprintln!("vitrobar: --adopt needs a process id\n{USAGE}");
-                    return ExitCode::from(2);
-                }
+                None => return usage_error("--adopt needs a process id"),
             },
             "--parent" => match parse_pid(args.next()) {
                 Some(pid) => opts.parent = Some(pid),
-                None => {
-                    eprintln!("vitrobar: --parent needs a process id\n{USAGE}");
-                    return ExitCode::from(2);
-                }
+                None => return usage_error("--parent needs a process id"),
             },
             "--debug-state" => {
                 opts.debug_state = true;
@@ -142,11 +155,11 @@ fn main() -> ExitCode {
                 attach_console();
                 opts.pass_on.push(arg);
             }
-            other => {
-                eprintln!("vitrobar: unknown argument {other:?}\n{USAGE}");
-                return ExitCode::from(2);
-            }
+            other => return usage_error(&format!("unknown argument {other:?}")),
         }
+    }
+    if opts.parent.is_some() && !matches!(mode, Mode::Bar) {
+        return usage_error("--parent goes only with --bar");
     }
     match mode {
         Mode::Watchdog => watchdog::run(&opts.pass_on),

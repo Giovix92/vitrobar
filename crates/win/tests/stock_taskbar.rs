@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use vitro_core::settings::StockTaskbar;
 use vitro_win::stock_taskbar::{
     autohide_now, restore_stock_taskbar, runonce_exists, show_stock_taskbar, stock_taskbar_visible,
-    take_over_stock_taskbar, RestoreRecord,
+    take_over_stock_taskbar, RestoreRecord, ShellLock,
 };
 
 fn temp_record(name: &str) -> PathBuf {
@@ -168,4 +168,54 @@ fn show_works_without_a_record() {
     restore_stock_taskbar(&p).unwrap();
     assert_eq!(autohide_now(), original);
     assert!(!runonce_exists());
+}
+
+/// The sign-in race: RunOnce `--restore` and an autostarted bar's take-over running at once.
+/// Every take-over and restore holds `Local\Vitrobar.Shell`, so whenever nobody holds it the
+/// record exists exactly when the RunOnce value does, and with no record auto-hide is back
+/// at the original.
+#[test]
+#[ignore = "changes the real stock taskbar"]
+fn concurrent_take_over_and_restore_keep_the_invariant() {
+    const ROUNDS: usize = 25;
+    let original = autohide_now();
+    assert!(!runonce_exists(), "a VitrobarRestore value is already set");
+    let p = temp_record("race");
+    let _c = Cleanup(p.clone());
+    let check = |who: &str, i: usize| {
+        let _lock = ShellLock::acquire(10_000).expect("shell lock");
+        let record = p.exists();
+        let runonce = runonce_exists();
+        assert_eq!(
+            record, runonce,
+            "{who} round {i}: record {record}, RunOnce {runonce}"
+        );
+        if !record {
+            assert_eq!(
+                autohide_now(),
+                original,
+                "{who} round {i}: auto-hide left changed"
+            );
+        }
+    };
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            for i in 0..ROUNDS {
+                take_over_stock_taskbar(StockTaskbar::AutoHide, &p).unwrap();
+                check("take-over", i);
+            }
+        });
+        s.spawn(|| {
+            for i in 0..ROUNDS {
+                restore_stock_taskbar(&p).unwrap();
+                check("restore", i);
+                std::thread::sleep(Duration::from_millis(3 * (i as u64 % 4)));
+            }
+        });
+    });
+    restore_stock_taskbar(&p).unwrap();
+    assert!(!p.exists());
+    assert!(!runonce_exists());
+    assert_eq!(autohide_now(), original);
+    assert!(eventually(stock_taskbar_visible));
 }

@@ -14,11 +14,16 @@ use std::path::{Path, PathBuf};
 
 use vitro_core::settings::StockTaskbar;
 use windows::core::{w, Error, Result, BOOL, HSTRING, PCWSTR};
-use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, E_FAIL, HWND, LPARAM};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, E_FAIL, HANDLE, HWND, LPARAM, WAIT_ABANDONED,
+    WAIT_OBJECT_0,
+};
 use windows::Win32::System::Registry::{
     RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ,
 };
-use windows::Win32::System::Threading::GetCurrentProcessId;
+use windows::Win32::System::Threading::{
+    CreateMutexW, GetCurrentProcessId, ReleaseMutex, WaitForSingleObject,
+};
 use windows::Win32::UI::Shell::{
     SHAppBarMessage, ABM_GETSTATE, ABM_SETSTATE, ABS_AUTOHIDE, APPBARDATA,
 };
@@ -31,6 +36,46 @@ use crate::window_props::class_name;
 
 const RUNONCE_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce");
 const RUNONCE_VALUE: PCWSTR = w!("VitrobarRestore");
+
+/// How long a take-over or a restore waits for another process's one to finish.
+pub const SHELL_LOCK_TIMEOUT_MS: u32 = 10_000;
+
+/// `Local\Vitrobar.Shell`: serializes take-overs and restores across every Vitrobar process
+/// (the bar, its watchdog, a RunOnce `--restore`), so that the record, the RunOnce value and
+/// the auto-hide state always change together. A Win32 mutex is recursive for its owning
+/// thread: a caller that must check something under the lock (is a bar running?) holds it
+/// around the call, and the call takes it again without blocking. Released when dropped, on
+/// the thread that took it.
+pub struct ShellLock(HANDLE);
+
+impl ShellLock {
+    /// `None` when another process held it for longer than `timeout_ms` (or the mutex could
+    /// not be created). A mutex left by a process that died owning it is taken over.
+    pub fn acquire(timeout_ms: u32) -> Option<Self> {
+        // SAFETY: plain calls with a static name; the handle is owned by the guard (or
+        // closed here when the wait fails).
+        unsafe {
+            let h = CreateMutexW(None, false, w!(r"Local\Vitrobar.Shell")).ok()?;
+            let r = WaitForSingleObject(h, timeout_ms);
+            if r == WAIT_OBJECT_0 || r == WAIT_ABANDONED {
+                Some(Self(h))
+            } else {
+                let _ = CloseHandle(h);
+                None
+            }
+        }
+    }
+}
+
+impl Drop for ShellLock {
+    fn drop(&mut self) {
+        // SAFETY: the mutex is owned by this thread (taken in `acquire`), released once.
+        unsafe {
+            let _ = ReleaseMutex(self.0);
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
 
 /// What the stock taskbar looked like before Vitrobar took it over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,7 +312,16 @@ pub fn runonce_exists() -> bool {
 /// run that never restored is kept: it holds the real original), (2) sets the RunOnce
 /// safety net, (3) turns auto-hide on, (4) in `Hidden` mode hides every taskbar window (in
 /// `AutoHide` mode shows them, in case a `Hidden` run that crashed left them hidden).
+///
+/// Holds [`ShellLock`]; gives up (changing nothing) if it cannot be had in
+/// [`SHELL_LOCK_TIMEOUT_MS`].
 pub fn take_over_stock_taskbar(mode: StockTaskbar, record_path: &Path) -> Result<()> {
+    let Some(_lock) = ShellLock::acquire(SHELL_LOCK_TIMEOUT_MS) else {
+        return Err(Error::new(
+            E_FAIL,
+            "another Vitrobar process is changing the stock taskbar",
+        ));
+    };
     if !stock_taskbar_present() {
         return Err(Error::new(E_FAIL, "the stock taskbar is not running"));
     }
@@ -303,7 +357,16 @@ pub fn reassert_hidden(mode: StockTaskbar) {
 /// back, deletes the RunOnce value, deletes the record. Idempotent: nothing to do without a
 /// record. If auto-hide cannot be put back (Explorer not running), the record and the
 /// RunOnce value stay so the next sign-in finishes the job.
+///
+/// Holds [`ShellLock`]; restores anyway if it cannot be had in [`SHELL_LOCK_TIMEOUT_MS`]
+/// (giving the taskbar back is always the safe direction).
 pub fn restore_stock_taskbar(record_path: &Path) -> Result<()> {
+    restore_stock_taskbar_within(record_path, SHELL_LOCK_TIMEOUT_MS)
+}
+
+/// [`restore_stock_taskbar`] with a shorter wait for the lock (the panic hook).
+pub fn restore_stock_taskbar_within(record_path: &Path, lock_timeout_ms: u32) -> Result<()> {
+    let _lock = ShellLock::acquire(lock_timeout_ms);
     let record = match RestoreRecord::read(record_path) {
         Ok(None) => return Ok(()),
         Ok(Some(r)) => Some(r),

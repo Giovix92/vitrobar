@@ -2698,6 +2698,7 @@ impl Drop for ComGuard {
 }
 
 /// Writes (or removes) the `Run\Vitrobar` value to match the setting.
+/// Used by the menu toggle and the first run only.
 fn apply_autostart(enabled: bool) {
     if let Err(e) = vitro_win::autostart::set_autostart(enabled) {
         eprintln!("vitrobar: could not update \"Start with Windows\": {e}");
@@ -2718,7 +2719,8 @@ pub fn run(opts: Options) -> Result<()> {
 
     let path = settings_path();
     let mut settings = path.as_deref().map(settings::load).unwrap_or_default();
-    if !settings.first_run_done {
+    let first_run = !settings.first_run_done;
+    if first_run {
         // Before the stock taskbar is taken over: the import only reads.
         first_run_import(&mut settings);
         if opts.debug_state {
@@ -2734,7 +2736,14 @@ pub fn run(opts: Options) -> Result<()> {
             }
         }
     }
-    apply_autostart(settings.start_with_windows);
+    if first_run {
+        apply_autostart(settings.start_with_windows);
+    } else if settings.start_with_windows {
+        // Only follows a Vitrobar that moved: never registers the exe started now by itself.
+        if let Err(e) = vitro_win::autostart::repair_autostart() {
+            eprintln!("vitrobar: could not check \"Start with Windows\": {e}");
+        }
+    }
     // Before the bar shows; restored when `app` (or a failing `App::new`) drops it.
     let stock = StockGuard::take_over(settings.stock_taskbar);
     #[cfg(debug_assertions)]
@@ -2746,12 +2755,16 @@ pub fn run(opts: Options) -> Result<()> {
     let mut msg = MSG::default();
     'event: loop {
         let removed = app.gpu.removed_event();
-        let mut handles: Vec<HANDLE> = vec![removed];
-        handles.extend(parent.handle());
+        let mut handles = [removed, HANDLE::default()];
+        let mut count = 1;
+        if let Some(h) = parent.handle() {
+            handles[1] = h;
+            count = 2;
+        }
         // SAFETY: the handles stay valid while `app.gpu` and `parent` live.
         let wait = unsafe {
             MsgWaitForMultipleObjectsEx(
-                Some(&handles),
+                Some(&handles[..count]),
                 parent.timeout_ms(),
                 QS_ALLINPUT,
                 MWMO_INPUTAVAILABLE,
@@ -2764,7 +2777,7 @@ pub fn run(opts: Options) -> Result<()> {
         let mut dirty = Dirty::default();
         if wait == WAIT_OBJECT_0 {
             app.on_device_removed(&mut dirty);
-        } else if handles.len() > 1 && wait.0 == WAIT_OBJECT_0.0 + 1 {
+        } else if count == 2 && wait.0 == WAIT_OBJECT_0.0 + 1 {
             parent.on_parent_exit();
         }
         // Cheap: starts an adopting watchdog only once one is due.

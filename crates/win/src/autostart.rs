@@ -26,6 +26,40 @@ pub fn set_autostart(enabled: bool) -> Result<()> {
     }
 }
 
+/// The executable a Run command starts: the quoted path, or everything up to the first
+/// space when it is not quoted.
+fn command_exe(cmd: &str) -> &str {
+    let cmd = cmd.trim();
+    match cmd.strip_prefix('"') {
+        Some(rest) => rest.split('"').next().unwrap_or(rest),
+        None => cmd.split(' ').next().unwrap_or(cmd),
+    }
+}
+
+/// The Run value must be pointed at `current_exe`: it names another executable, and that
+/// one no longer exists (Vitrobar was moved or updated to another folder).
+fn is_stale(value: &str, current_exe: &str, exists: impl Fn(&str) -> bool) -> bool {
+    let exe = command_exe(value);
+    !exe.eq_ignore_ascii_case(current_exe) && !exists(exe)
+}
+
+/// At a normal start-up: corrects an existing Run value only when it names another
+/// executable that no longer exists. Never creates the value (so a dev build started by hand
+/// does not register itself); the menu toggle and the first run do that through
+/// [`set_autostart`]. `Ok(true)` when the value was rewritten.
+pub fn repair_autostart() -> Result<bool> {
+    let Some(value) = autostart_value() else {
+        return Ok(false);
+    };
+    let exe = std::env::current_exe().map_err(|e| Error::new(E_FAIL, e.to_string()))?;
+    let current = exe.display().to_string();
+    if !is_stale(&value, &current, |p| std::path::Path::new(p).exists()) {
+        return Ok(false);
+    }
+    set_autostart(true)?;
+    Ok(true)
+}
+
 /// The Run value as it is now (`None` when there is none).
 pub fn autostart_value() -> Option<String> {
     get_value(RUN_KEY, RUN_VALUE)
@@ -109,6 +143,27 @@ mod tests {
         let c = autostart_command().unwrap();
         assert!(c.starts_with('"') && c.ends_with(".exe\""), "{c}");
         assert!(!c.contains("--"), "the watchdog takes no arguments: {c}");
+    }
+
+    #[test]
+    fn stale_only_when_another_exe_is_gone() {
+        let cur = r"C:\Apps\Vitrobar\vitrobar.exe";
+        let gone = |_: &str| false;
+        let there = |_: &str| true;
+        // The same executable (any case): never stale, even if the check says missing.
+        assert!(!is_stale(r#""C:\Apps\Vitrobar\vitrobar.exe""#, cur, gone));
+        assert!(!is_stale(r#""c:\apps\vitrobar\VITROBAR.EXE""#, cur, gone));
+        // Another executable that still exists (a dev build, another install): left alone.
+        assert!(!is_stale(
+            r#""D:\dev\target\release\vitrobar.exe""#,
+            cur,
+            there
+        ));
+        // Another executable that is gone: stale.
+        assert!(is_stale(r#""D:\old\vitrobar.exe""#, cur, gone));
+        assert!(is_stale(r"D:\old\vitrobar.exe --x", cur, gone));
+        assert_eq!(command_exe(r#" "C:\a b\v.exe" --x"#), r"C:\a b\v.exe");
+        assert_eq!(command_exe(r"C:\v.exe --x"), r"C:\v.exe");
     }
 
     #[test]
