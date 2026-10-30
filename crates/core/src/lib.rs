@@ -9,6 +9,8 @@ pub mod layout;
 pub mod restart;
 pub mod search;
 pub mod settings;
+pub mod settings_ui;
+pub mod start_layout;
 pub mod style;
 pub mod text_input;
 pub mod tray_model;

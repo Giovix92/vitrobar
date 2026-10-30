@@ -45,6 +45,7 @@ setting_enum!(IconSize {
 });
 setting_enum!(Position { Bottom, Top });
 setting_enum!(StockTaskbar { Hidden, AutoHide });
+setting_enum!(StartStyle { Panel, FullScreen });
 setting_enum!(ThemeChoice {
     System,
     Light,
@@ -84,6 +85,11 @@ pub struct Settings {
     /// Tray identity keys shown outside the overflow.
     pub tray_promoted: Vec<String>,
     pub first_run_done: bool,
+    pub start_style: StartStyle,
+    /// The Windows key opens the Vitrobar Start instead of the stock one.
+    pub win_key_opens_start: bool,
+    /// Start-panel pins. Empty means "fill from `pins` on first open".
+    pub start_pins: Vec<Pin>,
 }
 
 impl Default for Settings {
@@ -105,6 +111,9 @@ impl Default for Settings {
             pins: Vec::new(),
             tray_promoted: Vec::new(),
             first_run_done: false,
+            start_style: StartStyle::default(),
+            win_key_opens_start: true,
+            start_pins: Vec::new(),
         }
     }
 }
@@ -142,11 +151,13 @@ pub fn load_with_status(path: &Path) -> (Settings, LoadStatus) {
     };
     let parsed = std::str::from_utf8(&bytes)
         .ok()
-        .and_then(|t| toml::from_str::<Settings>(t).ok());
+        .and_then(|t| t.parse::<toml::Table>().ok());
     match parsed {
-        Some(s) => (s, LoadStatus::Loaded),
+        Some(t) => (from_table(&t), LoadStatus::Loaded),
         None => {
-            let _ = std::fs::write(bad_copy_path(path), &bytes);
+            if !identical_bad_copy_exists(path, &bytes) {
+                let _ = std::fs::write(bad_copy_path(path), &bytes);
+            }
             let s = Settings {
                 first_run_done: true,
                 ..Settings::default()
@@ -154,6 +165,59 @@ pub fn load_with_status(path: &Path) -> (Settings, LoadStatus) {
             (s, LoadStatus::Corrupt)
         }
     }
+}
+
+/// Builds settings field by field: a missing or invalid value gives that field's default
+/// and nothing else; unknown keys are ignored.
+fn from_table(t: &toml::Table) -> Settings {
+    let d = Settings::default();
+    fn get<T: serde::de::DeserializeOwned>(t: &toml::Table, key: &str, default: T) -> T {
+        t.get(key)
+            .cloned()
+            .and_then(|v| v.try_into().ok())
+            .unwrap_or(default)
+    }
+    Settings {
+        shape: get(t, "shape", d.shape),
+        material: get(t, "material", d.material),
+        hover: get(t, "hover", d.hover),
+        icon_size: get(t, "icon-size", d.icon_size),
+        position: get(t, "position", d.position),
+        reserve_space_floating: get(t, "reserve-space-floating", d.reserve_space_floating),
+        stock_taskbar: get(t, "stock-taskbar", d.stock_taskbar),
+        theme: get(t, "theme", d.theme),
+        accent: get(t, "accent", d.accent),
+        battery_fallback: get(t, "battery-fallback", d.battery_fallback),
+        live_refraction: get(t, "live-refraction", d.live_refraction),
+        start_with_windows: get(t, "start-with-windows", d.start_with_windows),
+        language: get(t, "language", d.language),
+        pins: get(t, "pins", d.pins),
+        tray_promoted: get(t, "tray-promoted", d.tray_promoted),
+        first_run_done: get(t, "first-run-done", d.first_run_done),
+        start_style: get(t, "start-style", d.start_style),
+        win_key_opens_start: get(t, "win-key-opens-start", d.win_key_opens_start),
+        start_pins: get(t, "start-pins", d.start_pins),
+    }
+}
+
+/// True if some `<name>.bad-*` next to `path` already holds exactly these bytes.
+fn identical_bad_copy_exists(path: &Path, bytes: &[u8]) -> bool {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return false;
+    };
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    let prefix = format!("{}.bad-", name.to_string_lossy());
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    rd.flatten().any(|e| {
+        e.file_name().to_string_lossy().starts_with(&prefix)
+            && std::fs::read(e.path()).is_ok_and(|b| b == bytes)
+    })
 }
 
 /// `<name>.bad-<unix ms>`, with a counter if that name is taken: never overwrites an
@@ -329,5 +393,98 @@ mod tests {
         assert_eq!(s.material, Material::SolidBlack);
         assert_eq!(s.stock_taskbar, StockTaskbar::AutoHide);
         assert_eq!(s.icon_size, IconSize::Large);
+    }
+
+    #[test]
+    fn old_file_without_new_fields_loads() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("settings.toml");
+        fs::write(
+            &p,
+            "shape = \"islands\"
+first-run-done = true",
+        )
+        .unwrap();
+        let (s, st) = load_with_status(&p);
+        assert_eq!(st, LoadStatus::Loaded);
+        assert_eq!(s.shape, Shape::Islands);
+        assert_eq!(s.start_style, StartStyle::Panel);
+        assert!(s.win_key_opens_start);
+        assert!(s.start_pins.is_empty());
+    }
+
+    #[test]
+    fn one_bad_value_resets_only_that_field() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("settings.toml");
+        fs::write(
+            &p,
+            "shape = \"hexagon\"
+position = \"top\"",
+        )
+        .unwrap();
+        let (s, st) = load_with_status(&p);
+        assert_eq!(st, LoadStatus::Loaded);
+        assert_eq!(s.shape, Shape::Pill);
+        assert_eq!(s.position, Position::Top);
+        assert!(!d.path().read_dir().unwrap().any(|e| e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".bad-")));
+    }
+
+    #[test]
+    fn wrong_type_resets_only_that_field() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("settings.toml");
+        fs::write(
+            &p,
+            "accent = \"red\"
+win-key-opens-start = false
+start-style = 3",
+        )
+        .unwrap();
+        let s = load(&p);
+        assert_eq!(s.accent, None);
+        assert!(!s.win_key_opens_start);
+        assert_eq!(s.start_style, StartStyle::Panel);
+    }
+
+    #[test]
+    fn identical_corruption_writes_one_bad_copy() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("settings.toml");
+        fs::write(&p, "shape = [").unwrap();
+        assert_eq!(load_with_status(&p).1, LoadStatus::Corrupt);
+        assert_eq!(load_with_status(&p).1, LoadStatus::Corrupt);
+        let n = fs::read_dir(d.path())
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("settings.toml.bad-")
+            })
+            .count();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn new_fields_roundtrip() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("settings.toml");
+        let o = Settings {
+            start_style: StartStyle::FullScreen,
+            win_key_opens_start: false,
+            start_pins: vec![Pin {
+                name: "X".into(),
+                ..Pin::default()
+            }],
+            ..Settings::default()
+        };
+        save(&p, &o).unwrap();
+        assert_eq!(load(&p), o);
     }
 }
