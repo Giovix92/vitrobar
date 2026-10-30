@@ -35,6 +35,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 /// An icon finished loading on the icon thread (posted by the worker).
 pub const WM_APP_ICON: u32 = WM_APP + 0x22;
+/// Posted once after the first frame: take the stock taskbar over now (R12: the bar shows
+/// first, the slow `ABM_SETSTATE` round trip to Explorer comes after).
+pub const WM_APP_TAKE_OVER: u32 = WM_APP + 0x23;
 
 /// Timers on the notify window (ids distinct from the tracker's 0x5601/0x5602).
 pub const TIMER_CLOCK: usize = 0x5701;
@@ -82,6 +85,8 @@ pub struct Inbox {
     pub fullscreen: bool,
     /// Tray messages the tray host accepted, in arrival order.
     pub tray: Vec<TrayMessage>,
+    /// [`WM_APP_TAKE_OVER`] arrived: finish the start-up.
+    pub take_over: bool,
 }
 
 thread_local! {
@@ -155,6 +160,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_APP_ICON => {
             with_inbox(|i| i.icons = true);
+            return LRESULT(0);
+        }
+        WM_APP_TAKE_OVER => {
+            with_inbox(|i| i.take_over = true);
             return LRESULT(0);
         }
         WM_VITRO_APPBAR => {

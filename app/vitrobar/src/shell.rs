@@ -111,14 +111,23 @@ pub struct StockGuard {
 }
 
 impl StockGuard {
-    pub fn take_over(mode: StockTaskbar) -> Self {
-        let mut g = Self {
+    /// A guard that has not taken anything over yet (see [`StockGuard::take_over_now`]); it
+    /// already restores on drop, so every way out after this point gives the shell back.
+    pub fn new(mode: StockTaskbar) -> Self {
+        Self {
             mode,
             active: false,
             windows: Vec::new(),
-        };
-        g.try_take_over();
-        g
+        }
+    }
+
+    /// Takes the stock taskbar over unless that already happened (an early
+    /// `TaskbarCreated`) or the shell was given back. Blocks for as long as Explorer takes to
+    /// apply auto-hide (~0.5 s), so the app calls it once its bars are on screen.
+    pub fn take_over_now(&mut self) {
+        if !self.active {
+            self.try_take_over();
+        }
     }
 
     fn try_take_over(&mut self) {

@@ -9,8 +9,10 @@
 //! in `Settings.tray_promoted` sit in the bar; the rest live in the overflow, a glass grid
 //! opened by the chevron. Clicks are handed to the icon's owner as the stock taskbar does.
 //!
-//! The stock taskbar is taken over before the bar appears and given back on every way out
-//! ([`StockGuard`]).
+//! The stock taskbar is taken over right after the bar first appears (ruling R12: Explorer
+//! applies auto-hide synchronously in ~0.5 s, which must not delay the bar) and given back
+//! on every way out ([`StockGuard`]). The appbars and the tray host only start after the
+//! take-over, in the same order as before.
 //!
 //! Every monitor has its own bar ([`MonitorBar`]): its windows, layout, scale (the monitor's
 //! DPI / 96), app groups (pins, then the windows on that monitor and the current virtual
@@ -66,9 +68,9 @@ use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetDoubleClickTime, VK_ESCAPE};
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetForegroundWindow, GetMessagePos, IsWindow, KillTimer,
-    MsgWaitForMultipleObjectsEx, PeekMessageW, PostQuitMessage, PostThreadMessageW, SetTimer,
-    TranslateMessage, MSG, MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT, WM_KEYDOWN, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    MsgWaitForMultipleObjectsEx, PeekMessageW, PostMessageW, PostQuitMessage, PostThreadMessageW,
+    SetTimer, TranslateMessage, MSG, MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT, WM_KEYDOWN,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
 };
 
 use crate::bar_window::{
@@ -79,7 +81,7 @@ use crate::launcher::{Job, Launcher};
 use crate::menus::{app_menu, bar_menu, MenuChoice};
 use crate::notify::{
     take_inbox, Inbox, NotifyWindow, TIMER_CLOCK, TIMER_GPU_RETRY, TIMER_HOVER_HIDE,
-    TIMER_HOVER_SHOW, TIMER_MARGIN_COLLAPSE, TIMER_REASSERT, TIMER_TRAY_TIP,
+    TIMER_HOVER_SHOW, TIMER_MARGIN_COLLAPSE, TIMER_REASSERT, TIMER_TRAY_TIP, WM_APP_TAKE_OVER,
 };
 use crate::shell::{self, StockGuard};
 use crate::window_set::WindowSet;
@@ -530,6 +532,9 @@ struct App {
     /// A click on the hovered app: no strip opens until the cursor moves to another item.
     show_suppressed: bool,
     gpu_lost: bool,
+    /// The stock taskbar was taken over (or that was tried): the appbars may reserve their
+    /// strips and the tray host runs. False until the first frame is on screen (R12).
+    shell_ready: bool,
     /// The minute timer could not be armed; retried on the next flush.
     clock_unarmed: bool,
     /// The tray icons as last read from the host (dead owners swept).
@@ -581,12 +586,9 @@ impl App {
         let icons =
             IconLoader::start(notify.hwnd).map_err(|e| Error::new(E_FAIL, e.to_string()))?;
         let launcher = Launcher::start(None).map_err(|e| Error::new(E_FAIL, e.to_string()))?;
-        // The bar works without it (no tray icons).
-        let tray = TrayHost::start(notify.hwnd)
-            .inspect_err(|e| eprintln!("vitrobar: the tray host could not start: {e}"))
-            .ok();
         let mut app = Self {
-            tray,
+            // Started with the take-over, after the first frame (`finish_start`).
+            tray: None,
             tooltip: None,
             overflow: None,
             strip: None,
@@ -621,6 +623,7 @@ impl App {
             flyout_pressed: None,
             show_suppressed: false,
             gpu_lost: false,
+            shell_ready: false,
             clock_unarmed: false,
             tray_entries: Vec::new(),
             tray_keys: HashMap::new(),
@@ -643,14 +646,43 @@ impl App {
             app.set_fullscreen(k, on);
         }
         app.refresh()?;
+        // The bars are on screen: the take-over follows as the next message, after the
+        // compositor has committed this frame.
+        // SAFETY: plain call; posting carries no pointer.
+        unsafe {
+            PostMessageW(
+                Some(app.notify.hwnd),
+                WM_APP_TAKE_OVER,
+                WPARAM(0),
+                LPARAM(0),
+            )?;
+        }
+        Ok(app)
+    }
+
+    /// The second half of the start-up (R12): take the stock taskbar over, then reserve the
+    /// bars' strips and start the tray host, in the order they had before the bar showed
+    /// first. Runs once.
+    fn finish_start(&mut self, dirty: &mut Dirty) {
+        if self.shell_ready {
+            return;
+        }
+        // Record + RunOnce first, then auto-hide and hide (all inside `take_over_now`).
+        self.stock.take_over_now();
+        self.shell_ready = true;
+        // The bar works without it (no tray icons).
+        self.tray = TrayHost::start(self.notify.hwnd)
+            .inspect_err(|e| eprintln!("vitrobar: the tray host could not start: {e}"))
+            .ok();
         // Every app registers its tray icons again, now with us (and, forwarded, Explorer).
-        if let Some(t) = &app.tray {
+        if let Some(t) = &self.tray {
             t.announce();
         }
         // Explorer applies the auto-hide change of the takeover asynchronously and can show
         // a secondary taskbar again meanwhile: hide once more a little later.
-        app.arm_reassert();
-        Ok(app)
+        self.arm_reassert();
+        // Registers the appbars and draws the tray area.
+        dirty.visuals = true;
     }
 
     /// Index of the bar of monitor `id`.
@@ -1031,6 +1063,10 @@ impl App {
     /// Keeps bar `k`'s main window registered as the appbar reserving its strip of its
     /// monitor.
     fn sync_appbar(&mut self, k: usize) {
+        if !self.shell_ready {
+            // Reserved only once the stock taskbar no longer reserves its own strip.
+            return;
+        }
         let edge = self.settings.position;
         let mb = &mut self.monitors[k];
         let Some(bar) = mb.bars.first() else {
@@ -2590,6 +2626,9 @@ impl App {
                 t.reassert_topmost();
             }
         }
+        if inbox.take_over {
+            self.finish_start(dirty);
+        }
         if inbox.taskbar_created {
             self.on_taskbar_created();
         } else if inbox.shell || inbox.display {
@@ -2744,8 +2783,9 @@ pub fn run(opts: Options) -> Result<()> {
             eprintln!("vitrobar: could not check \"Start with Windows\": {e}");
         }
     }
-    // Before the bar shows; restored when `app` (or a failing `App::new`) drops it.
-    let stock = StockGuard::take_over(settings.stock_taskbar);
+    // Takes nothing over yet (that follows the first frame), but from here on the shell is
+    // restored when `app` (or a failing `App::new`) drops it.
+    let stock = StockGuard::new(settings.stock_taskbar);
     #[cfg(debug_assertions)]
     if std::env::var_os("VITROBAR_TEST_PANIC").is_some() {
         // Test hook (debug builds only): proves the panic hook restores the shell.
