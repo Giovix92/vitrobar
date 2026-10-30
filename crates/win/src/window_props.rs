@@ -28,6 +28,10 @@ use crate::monitors::monitor_id;
 
 /// `DWM_CLOAKED_APP`: the app cloaked its own window (as opposed to shell or inherited cloaking).
 const DWM_CLOAKED_APP: u32 = 1;
+/// `DWM_CLOAKED_SHELL`: cloaked by the shell. That is how windows on other virtual desktops
+/// are hidden, but also suspended UWP frames, "Windows Input Experience" and similar
+/// always-present system windows that the stock taskbar never lists.
+const DWM_CLOAKED_SHELL: u32 = 2;
 
 struct Process(HANDLE);
 
@@ -181,6 +185,12 @@ pub fn read_window_info(hwnd: HWND, seq: u64, desktops: &Desktops) -> Option<Win
             aumid = proc.as_ref().and_then(Process::aumid);
         }
 
+        let on_current_desktop = desktops.is_on_current(hwnd);
+        // A shell-cloaked window on the current desktop is a hidden system window; on another
+        // desktop the cloak is the desktop switch itself, reported by `on_current_desktop`.
+        let cloaked_by_app =
+            cloak & DWM_CLOAKED_APP != 0 || (cloak & DWM_CLOAKED_SHELL != 0 && on_current_desktop);
+
         Some(WindowInfo {
             hwnd: hwnd.0 as usize as u64,
             seq,
@@ -191,8 +201,8 @@ pub fn read_window_info(hwnd: HWND, seq: u64, desktops: &Desktops) -> Option<Win
             tool_window: ex & WS_EX_TOOLWINDOW.0 != 0,
             app_window: ex & WS_EX_APPWINDOW.0 != 0,
             has_owner,
-            cloaked_by_app: cloak & DWM_CLOAKED_APP != 0,
-            on_current_desktop: desktops.is_on_current(hwnd),
+            cloaked_by_app,
+            on_current_desktop,
             monitor: monitor_id(hmon).unwrap_or(0),
             minimized: IsIconic(hwnd).as_bool(),
             flashing: false,

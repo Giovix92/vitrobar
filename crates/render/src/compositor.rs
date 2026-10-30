@@ -7,16 +7,28 @@ use windows::System::DispatcherQueueController;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::System::WinRT::Composition::ICompositorDesktopInterop;
 use windows::Win32::System::WinRT::{
-    CreateDispatcherQueueController, DispatcherQueueOptions, RoInitialize, DQTAT_COM_STA,
-    DQTYPE_THREAD_CURRENT, RO_INIT_SINGLETHREADED,
+    CreateDispatcherQueueController, DispatcherQueueOptions, RoInitialize, RoUninitialize,
+    DQTAT_COM_STA, DQTYPE_THREAD_CURRENT, RO_INIT_SINGLETHREADED,
 };
 use windows::UI::Composition::Compositor;
 use windows::UI::Composition::Desktop::DesktopWindowTarget;
 
+/// Balances a successful `RoInitialize` (S_OK or S_FALSE) when dropped.
+struct RoGuard;
+
+impl Drop for RoGuard {
+    fn drop(&mut self) {
+        // SAFETY: only constructed after RoInitialize succeeded on this thread.
+        unsafe { RoUninitialize() };
+    }
+}
+
 /// The compositor plus the dispatcher queue that keeps it alive on this thread.
+/// Fields drop in declaration order, so the apartment is released last.
 pub struct Comp {
     pub compositor: Compositor,
     _queue: DispatcherQueueController,
+    _ro: Option<RoGuard>,
 }
 
 impl Deref for Comp {
@@ -29,9 +41,12 @@ impl Deref for Comp {
 /// Creates a dispatcher queue on the current thread (COM STA) and a compositor.
 /// The thread must pump messages for composition to run.
 pub fn init_compositor() -> Result<Comp> {
-    // Make sure the thread is an STA; S_FALSE (already initialised) is fine. If the
-    // thread is already MTA, the queue creation below reports the error.
-    let _ = unsafe { RoInitialize(RO_INIT_SINGLETHREADED) };
+    // Make sure the thread is an STA; S_FALSE (already initialised) is fine and is balanced
+    // like S_OK. If the thread is already MTA, the queue creation below reports the error.
+    // SAFETY: plain apartment initialisation of the current thread.
+    let ro = unsafe { RoInitialize(RO_INIT_SINGLETHREADED) }
+        .is_ok()
+        .then_some(RoGuard);
     let options = DispatcherQueueOptions {
         dwSize: size_of::<DispatcherQueueOptions>() as u32,
         threadType: DQTYPE_THREAD_CURRENT,
@@ -42,6 +57,7 @@ pub fn init_compositor() -> Result<Comp> {
     Ok(Comp {
         compositor,
         _queue: queue,
+        _ro: ro,
     })
 }
 

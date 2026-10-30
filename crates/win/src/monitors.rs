@@ -38,7 +38,10 @@ fn info(hmon: HMONITOR) -> Option<MonitorInfo> {
         },
         ..Default::default()
     };
-    if !unsafe { GetMonitorInfoW(hmon, &mut mi.monitorInfo) }.as_bool() {
+    // SAFETY: MONITORINFOEXW starts with MONITORINFO and cbSize says it is the EX variant;
+    // the pointer is derived from the whole struct, so it may cover all of it.
+    let p = &mut mi as *mut MONITORINFOEXW as *mut MONITORINFO;
+    if !unsafe { GetMonitorInfoW(hmon, p) }.as_bool() {
         return None;
     }
     let (mut dx, mut dy) = (96, 96);
