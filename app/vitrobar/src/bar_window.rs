@@ -1,18 +1,23 @@
 //! The bar's top-level windows (one per glass surface): borderless, non-activating, topmost
 //! tool windows with no redirection bitmap, whose content is a composition visual tree.
 //! Also maps cursor positions to bar items (hit testing, in DIPs).
+//!
+//! A window can carry a transparent margin beyond the bar's outer edge (Magnify grows icons
+//! past it). The margin is outside the window region, so it is click-through, except while
+//! [`BarWindow::set_expanded`] says an icon may be drawn there.
 
 use std::sync::OnceLock;
 
 use vitro_core::layout::{BarLayout, Rect};
 use vitro_render::compositor::{window_target, Comp};
-use vitro_render::Vector2;
+use vitro_render::{Vector2, Vector3};
 use windows::core::{w, Error, Interface, Result, BOOL, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_USE_HOSTBACKDROPBRUSH, DWMWA_WINDOW_CORNER_PREFERENCE,
     DWMWCP_DONOTROUND,
 };
+use windows::Win32::Graphics::Gdi::{CreateRectRgn, DeleteObject, SetWindowRgn, HRGN};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -34,7 +39,17 @@ pub struct BarWindow {
     pub hwnd: HWND,
     _target: DesktopWindowTarget,
     root: ContainerVisual,
+    /// Holds the content, offset by the top margin.
+    content: ContainerVisual,
+    /// The bar itself, without margins.
     rect_px: PxRect,
+    /// Extra px above and below the bar.
+    margin: (i32, i32),
+    expanded: bool,
+}
+
+fn window_rect(r: PxRect, m: (i32, i32)) -> PxRect {
+    (r.0, r.1 - m.0, r.2, r.3 + m.1)
 }
 
 fn register_class() -> Result<()> {
@@ -75,10 +90,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     }
 }
 
-/// The window starts hidden.
-pub fn create_bar_window(comp: &Comp, rect_px: PxRect) -> Result<BarWindow> {
+/// The window starts hidden. `margin`: extra px (above, below) the bar.
+pub fn create_bar_window(comp: &Comp, rect_px: PxRect, margin: (i32, i32)) -> Result<BarWindow> {
     register_class()?;
-    let (l, t, r, b) = rect_px;
+    let (l, t, r, b) = window_rect(rect_px, margin);
     let class = HSTRING::from(BAR_CLASS);
     // SAFETY: the class is registered and the strings outlive the call.
     let hwnd = unsafe {
@@ -117,14 +132,21 @@ pub fn create_bar_window(comp: &Comp, rect_px: PxRect) -> Result<BarWindow> {
         }
         let target = window_target(comp, hwnd)?;
         let root = comp.CreateContainerVisual()?;
-        root.SetSize(Vector2::new((r - l) as f32, (b - t) as f32))?;
+        let content = comp.CreateContainerVisual()?;
+        root.Children()?.InsertAtTop(&content)?;
         target.SetRoot(&root)?;
-        Ok(BarWindow {
+        let mut w = BarWindow {
             hwnd,
             _target: target,
             root,
+            content,
             rect_px,
-        })
+            margin,
+            expanded: true,
+        };
+        w.layout_visuals()?;
+        w.set_expanded(false);
+        Ok(w)
     };
     // SAFETY: destroying the window we just created.
     finish().inspect_err(|_| unsafe {
@@ -135,21 +157,69 @@ pub fn create_bar_window(comp: &Comp, rect_px: PxRect) -> Result<BarWindow> {
 impl BarWindow {
     /// Replaces everything drawn in the window with `visual`.
     pub fn set_content(&self, visual: &impl Interface) -> Result<()> {
-        let children = self.root.Children()?;
+        let children = self.content.Children()?;
         children.RemoveAll()?;
         children.InsertAtTop(&visual.cast::<Visual>()?)
     }
 
+    /// The bar's rectangle (margins excluded).
     pub fn rect_px(&self) -> PxRect {
         self.rect_px
     }
 
+    /// The margins currently take input (see [`BarWindow::set_expanded`]).
+    pub fn expanded(&self) -> bool {
+        self.expanded && self.margin != (0, 0)
+    }
+
+    fn layout_visuals(&self) -> Result<()> {
+        let (l, t, r, b) = window_rect(self.rect_px, self.margin);
+        self.root
+            .SetSize(Vector2::new((r - l) as f32, (b - t) as f32))?;
+        self.content
+            .SetOffset(Vector3::new(0.0, self.margin.0 as f32, 0.0))?;
+        let (w, h) = (
+            self.rect_px.2 - self.rect_px.0,
+            self.rect_px.3 - self.rect_px.1,
+        );
+        self.content.SetSize(Vector2::new(w as f32, h as f32))
+    }
+
+    /// Whether the margins take mouse input and show content (while an icon is magnified).
+    /// Collapsed, the window region is the bar alone and the margins are click-through.
+    pub fn set_expanded(&mut self, on: bool) {
+        if self.margin == (0, 0) || on == self.expanded {
+            return;
+        }
+        self.expanded = on;
+        self.apply_region();
+    }
+
+    fn apply_region(&self) {
+        let (w, h) = (
+            self.rect_px.2 - self.rect_px.0,
+            self.rect_px.3 - self.rect_px.1,
+        );
+        // SAFETY: plain calls on our own window. On success the system owns the region; on
+        // failure it is still ours and is deleted. A null region means the whole window.
+        unsafe {
+            let rgn = if self.expanded {
+                HRGN::default()
+            } else {
+                CreateRectRgn(0, self.margin.0, w, self.margin.0 + h)
+            };
+            if SetWindowRgn(self.hwnd, Some(rgn), true) == 0 && !rgn.is_invalid() {
+                let _ = DeleteObject(rgn.into());
+            }
+        }
+    }
+
     /// Moves / resizes the window (no activation, stays topmost).
-    pub fn set_rect(&mut self, rect_px: PxRect) -> Result<()> {
-        if rect_px == self.rect_px {
+    pub fn set_rect(&mut self, rect_px: PxRect, margin: (i32, i32)) -> Result<()> {
+        if rect_px == self.rect_px && margin == self.margin {
             return Ok(());
         }
-        let (l, t, r, b) = rect_px;
+        let (l, t, r, b) = window_rect(rect_px, margin);
         // SAFETY: plain call on our own window.
         unsafe {
             SetWindowPos(
@@ -162,9 +232,17 @@ impl BarWindow {
                 SWP_NOACTIVATE,
             )?
         };
-        self.root
-            .SetSize(Vector2::new((r - l) as f32, (b - t) as f32))?;
+        let had_margin = self.margin != (0, 0);
         self.rect_px = rect_px;
+        self.margin = margin;
+        self.layout_visuals()?;
+        if margin != (0, 0) || had_margin {
+            // The region follows the new size (or is removed with the margin).
+            if margin == (0, 0) {
+                self.expanded = true;
+            }
+            self.apply_region();
+        }
         Ok(())
     }
 
@@ -177,24 +255,29 @@ impl BarWindow {
 
     /// Asks for one `WM_MOUSELEAVE` when the cursor leaves the window.
     pub fn track_leave(&self) {
-        let mut tme = TRACKMOUSEEVENT {
-            cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
-            dwFlags: TME_LEAVE,
-            hwndTrack: self.hwnd,
-            dwHoverTime: 0,
-        };
-        // SAFETY: `tme` is a valid local for the duration of the call.
-        unsafe {
-            let _ = TrackMouseEvent(&mut tme);
-        }
+        track_leave(self.hwnd);
     }
 
     /// Client-area pixel position -> absolute DIP position.
     pub fn client_to_dip(&self, x: i32, y: i32, scale: f32) -> (f32, f32) {
         (
             (self.rect_px.0 + x) as f32 / scale,
-            (self.rect_px.1 + y) as f32 / scale,
+            (self.rect_px.1 - self.margin.0 + y) as f32 / scale,
         )
+    }
+}
+
+/// Asks for one `WM_MOUSELEAVE` when the cursor leaves `hwnd` (one of our windows).
+pub fn track_leave(hwnd: HWND) {
+    let mut tme = TRACKMOUSEEVENT {
+        cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+        dwFlags: TME_LEAVE,
+        hwndTrack: hwnd,
+        dwHoverTime: 0,
+    };
+    // SAFETY: `tme` is a valid local for the duration of the call.
+    unsafe {
+        let _ = TrackMouseEvent(&mut tme);
     }
 }
 

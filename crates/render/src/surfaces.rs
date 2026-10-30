@@ -20,7 +20,8 @@ use windows::Win32::Graphics::Direct2D::{
 use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteTextLayout, DWRITE_FACTORY_TYPE_SHARED,
     DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_NORMAL,
-    DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_METRICS,
+    DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING,
+    DWRITE_TEXT_METRICS, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
     DWRITE_WORD_WRAPPING_NO_WRAP,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -170,6 +171,52 @@ impl Painter {
                 &brush,
                 D2D1_DRAW_TEXT_OPTIONS_NONE,
             );
+            Ok(())
+        })?;
+        Ok(surface)
+    }
+
+    /// One line of text per `(text, x, w)` box, left-aligned and vertically centred in a
+    /// `w` x `h` px surface, cut with an ellipsis when it does not fit its box (the titles
+    /// under the window thumbnails). `size` is the font size in px.
+    pub fn text_row(
+        &self,
+        boxes: &[(&str, f32, f32)],
+        size: f32,
+        color: Rgba,
+        w: u32,
+        h: u32,
+    ) -> Result<CompositionDrawingSurface> {
+        let surface = self.new_surface(w, h)?;
+        let mut layouts = Vec::with_capacity(boxes.len());
+        for &(text, x, bw) in boxes {
+            let layout = self.layout(text, FontKind::Text, size, bw.max(1.0), h as f32)?;
+            // SAFETY: plain DirectWrite calls on objects we own; the trimming options are a
+            // local that outlives the call (DirectWrite copies them).
+            unsafe {
+                layout.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)?;
+                let trimming = DWRITE_TRIMMING {
+                    granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER,
+                    delimiter: 0,
+                    delimiterCount: 0,
+                };
+                let sign = self.dwrite.CreateEllipsisTrimmingSign(&layout)?;
+                layout.SetTrimming(&trimming, &sign)?;
+            }
+            layouts.push((x, layout));
+        }
+        draw(&surface, |dc| unsafe {
+            // SAFETY: `dc` is the context returned by BeginDraw, valid until EndDraw.
+            let brush = dc.CreateSolidColorBrush(&d2d_color(color), None)?;
+            dc.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+            for (x, layout) in &layouts {
+                dc.DrawTextLayout(
+                    Vector2::new(*x, 0.0),
+                    layout,
+                    &brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                );
+            }
             Ok(())
         })?;
         Ok(surface)

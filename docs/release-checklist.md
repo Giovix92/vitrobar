@@ -32,3 +32,31 @@ Also check while you are here:
 - An app asking for attention (e.g. a chat app flashing) gets an accent plate that pulses
   twice and stays until the app is activated. With Settings > Accessibility > Visual effects >
   Animation effects off, the plate appears without pulsing.
+
+## Hover and thumbnails
+
+Introduced by stage 1, Task 10. The hover effect is read from `settings.toml` at start-up
+(`hover = "plate" | "lift" | "magnify" | "sweep"` in `%APPDATA%\Vitrobar\settings.toml`) until
+the settings menu of Task 13 can switch it live: edit the file and restart the bar.
+
+1. Hover each app icon under each of the 4 hover settings and compare with the brainstorm
+   mockup (`.superpowers/brainstorm/*/content/hover.html`):
+   - **Plate**: a white glass tile (28 %) with a bright top edge fades in behind the icon in
+     150 ms; pressing squeezes the icon to 90 %.
+   - **Lift**: the icon pops up 5 DIP with a small springy overshoot (220 ms).
+   - **Magnify**: the hovered icon grows to 155 % and its neighbours to 122 %, growing up from
+     the bottom edge (down from the top edge with a top bar), 180 ms. The grown icon may stand
+     out above the glass; the strip above the bar stays click-through when nothing is hovered.
+   - **Sweep**: a light streak crosses the icon (shaped like the icon) in 450 ms while the
+     icon lifts 2 DIP and grows to 106 % in 220 ms.
+2. Open Notepad twice. Hover its icon: after 400 ms a glass strip appears 8 DIP above the bar
+   with 2 live thumbnails (200 DIP wide at most 120 DIP high, title under each, cut with "…"
+   when too long). Type in one Notepad: its thumbnail updates. Move onto the strip: it stays.
+   Move away from both icon and strip: it closes 300 ms later. Hovering another app while the
+   strip is open swaps it at once (an app with one window shows a strip of one). Clicking the
+   Notepad icon opens the strip at once; clicking a thumbnail brings that window to the front
+   and closes the strip.
+3. Turn off Settings > Accessibility > Visual effects > Animation effects (the bar follows
+   at once): every effect appears in its final state with no motion (Sweep shows no streak).
+4. After the strip closes and 2 s pass: Task Manager shows 0 % CPU for `vitrobar.exe` and no
+   GPU use.

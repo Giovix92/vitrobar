@@ -1,7 +1,8 @@
 //! App state and the event-driven message loop (nothing redraws unless something happened).
 //!
-//! Timers: the minute clock tick, the tracker's coalescing timers and a one-shot GPU
-//! recreation retry. Everything else is driven by window, shell and input messages.
+//! Timers: the minute clock tick, the tracker's coalescing timers, a one-shot GPU
+//! recreation retry and the one-shot hover timers of the thumbnail strip. Everything else is
+//! driven by window, shell and input messages.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -10,7 +11,7 @@ use std::sync::Arc;
 
 use vitro_core::clock::ms_until_next_minute;
 use vitro_core::layout::{compute_layout, metrics, BarLayout, LayoutInput, Rect};
-use vitro_core::settings::{self, Settings, ThemeChoice};
+use vitro_core::settings::{self, Position, Settings, ThemeChoice};
 use vitro_core::style::{hover_style, material_style, HoverStyle, MaterialStyle, Rgba, Theme};
 use vitro_core::windows_model::{
     build_groups, click_action, AppGroup, ClickAction, GroupKey, Hwnd,
@@ -18,6 +19,7 @@ use vitro_core::windows_model::{
 use vitro_render::bar_visual::{BarVisual, ItemState, VisualEnv};
 use vitro_render::compositor::{init_compositor, Comp};
 use vitro_render::device::{create_gpu_device, GpuDevice};
+use vitro_render::flyout::{live_thumbnails, Flyout, ThumbnailStrip};
 use vitro_render::surfaces::{FontKind, Painter};
 use vitro_win::desktops::Desktops;
 use vitro_win::launch::{activate_window, minimize_window, open_stock_start};
@@ -36,10 +38,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
     QS_ALLINPUT, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_QUIT,
 };
 
-use crate::bar_window::{create_bar_window, hit_test, mouse_pos, BarWindow, Hit, PxRect};
+use crate::bar_window::{
+    create_bar_window, hit_test, mouse_pos, track_leave, BarWindow, Hit, PxRect,
+};
 use crate::icon_loader::{IconLoader, IconSrc, Lookup, MAX_ICON_PX};
 use crate::launcher::{Job, Launcher};
-use crate::notify::{take_inbox, Inbox, NotifyWindow, TIMER_CLOCK, TIMER_GPU_RETRY};
+use crate::notify::{
+    take_inbox, Inbox, NotifyWindow, TIMER_CLOCK, TIMER_GPU_RETRY, TIMER_HOVER_HIDE,
+    TIMER_HOVER_SHOW,
+};
 use crate::window_set::WindowSet;
 
 /// Command-line options for the bar process.
@@ -56,6 +63,13 @@ const CLOCK_FONT_DIP: f32 = 12.0;
 const CLOCK_PAD_DIP: f32 = 4.0;
 const CLOCK_MIN_DIP: f32 = 64.0;
 const GPU_RETRY_MS: u32 = 2000;
+/// Hovering an app opens its thumbnail strip after this long.
+const HOVER_SHOW_MS: u32 = 400;
+/// Leaving both the icon and the strip closes the strip after this long.
+const HOVER_HIDE_MS: u32 = 300;
+/// Highest point of the springy hover curve, cubic-bezier(0.3, 1.6, 0.5, 1): about 1.11 of
+/// the distance to the target.
+const SPRING_PEAK: f32 = 1.12;
 
 static UI_THREAD: AtomicU32 = AtomicU32::new(0);
 
@@ -134,6 +148,16 @@ fn json_rect(r: PxRect) -> String {
     format!("[{},{},{},{}]", r.0, r.1, r.2, r.3)
 }
 
+/// The open thumbnail strip.
+struct Strip {
+    // Field order = drop order: the thumbnails are unregistered before their window goes.
+    thumbs: ThumbnailStrip,
+    flyout: Flyout,
+    group: GroupKey,
+    windows: Vec<Hwnd>,
+    anchor: PxRect,
+}
+
 /// One bar surface on screen.
 struct Bar {
     // Field order = drop order: the visual tree goes before its window.
@@ -154,8 +178,10 @@ struct Dirty {
 }
 
 struct App {
-    // Field order = drop order: bars, then the tracker (before its notify window), then the
-    // notify window (drains queued events), then the GPU objects, the compositor last.
+    // Field order = drop order: the strip, the bars, then the tracker (before its notify
+    // window), then the notify window (drains queued events), then the GPU objects, the
+    // compositor last.
+    strip: Option<Strip>,
     bars: Vec<Bar>,
     tracker: WindowTracker,
     icons: IconLoader,
@@ -183,6 +209,16 @@ struct App {
     pressed: Option<Hit>,
     /// Bar window currently tracked for WM_MOUSELEAVE.
     tracking: Option<HWND>,
+    /// App whose strip opens when TIMER_HOVER_SHOW fires.
+    show_pending: Option<usize>,
+    /// TIMER_HOVER_HIDE is armed.
+    hide_pending: bool,
+    /// The cursor is over the flyout (tracked for WM_MOUSELEAVE).
+    over_flyout: bool,
+    /// Thumbnail under the button press in the flyout.
+    flyout_pressed: Option<HWND>,
+    /// A click on the hovered app: no strip opens until the cursor moves to another item.
+    show_suppressed: bool,
     gpu_lost: bool,
     /// The minute timer could not be armed; retried on the next flush.
     clock_unarmed: bool,
@@ -214,6 +250,7 @@ impl App {
             IconLoader::start(notify.hwnd).map_err(|e| Error::new(E_FAIL, e.to_string()))?;
         let launcher = Launcher::start(None).map_err(|e| Error::new(E_FAIL, e.to_string()))?;
         let mut app = Self {
+            strip: None,
             bars: Vec::new(),
             tracker,
             icons,
@@ -253,6 +290,11 @@ impl App {
             hover: None,
             pressed: None,
             tracking: None,
+            show_pending: None,
+            hide_pending: false,
+            over_flyout: false,
+            flyout_pressed: None,
+            show_suppressed: false,
             gpu_lost: false,
             clock_unarmed: false,
             last_dump: String::new(),
@@ -295,6 +337,35 @@ impl App {
             dpi: self.monitor.dpi,
             accent: rgb(self.settings.accent.unwrap_or(self.sys.accent)),
             animations: self.sys.animations,
+            position: self.settings.position,
+        }
+    }
+
+    /// Extra px beyond the bar's outer edge, (above, below), that a magnified icon can reach
+    /// (spring overshoot included). Only Magnify grows icons past the edge.
+    fn hover_margin(&self) -> (i32, i32) {
+        let h = &self.hover_style;
+        if h.neighbour_scale <= 1.0 {
+            return (0, 0);
+        }
+        let m = metrics(self.settings.icon_size);
+        let peak = 1.0 + (h.scale - 1.0) * SPRING_PEAK;
+        // Icons sit centred in the bar, 1 DIP above centre; Magnify anchors them at the edge.
+        let (near_edge, grown) = match self.settings.position {
+            Position::Bottom => (m.bar_h / 2.0 + m.icon / 2.0 - 1.0, m.icon * peak),
+            Position::Top => (
+                m.bar_h - (m.bar_h / 2.0 - m.icon / 2.0 - 1.0),
+                m.icon * peak,
+            ),
+        };
+        let over = grown - near_edge;
+        if over <= 0.0 {
+            return (0, 0);
+        }
+        let px = ((over + 1.0) * self.scale).ceil() as i32;
+        match self.settings.position {
+            Position::Bottom => (px, 0),
+            Position::Top => (0, px),
         }
     }
 
@@ -391,7 +462,11 @@ impl App {
             self.bars.pop();
         }
         for i in self.bars.len()..layout.surfaces.len() {
-            let window = create_bar_window(&self.comp, to_px(layout.surfaces[i], self.scale))?;
+            let window = create_bar_window(
+                &self.comp,
+                to_px(layout.surfaces[i], self.scale),
+                self.hover_margin(),
+            )?;
             let visual = BarVisual::new(&self.comp, &self.gpu, i)?;
             window.set_content(visual.root())?;
             self.bars.push(Bar {
@@ -402,9 +477,11 @@ impl App {
         }
         let items = self.items(layout.apps.len());
         let env = self.env();
+        let margin = self.hover_margin();
         let mut draw_failed = None;
         for (i, bar) in self.bars.iter_mut().enumerate() {
-            bar.window.set_rect(to_px(layout.surfaces[i], self.scale))?;
+            bar.window
+                .set_rect(to_px(layout.surfaces[i], self.scale), margin)?;
             bar.visual.set_env(env);
             if let Err(e) = bar.visual.update(
                 &layout,
@@ -495,14 +572,46 @@ impl App {
             .iter()
             .map(|b| {
                 format!(
-                    "{{\"hwnd\":{},\"rect\":{}}}",
+                    "{{\"hwnd\":{},\"rect\":{},\"expanded\":{}}}",
                     b.window.hwnd.0 as usize,
-                    json_rect(b.window.rect_px())
+                    json_rect(b.window.rect_px()),
+                    b.window.expanded()
                 )
             })
             .collect();
+        let strip = match &self.strip {
+            None => "null".to_string(),
+            Some(st) => {
+                let (fl, ft, _, _) = st.flyout.rect_px();
+                let thumbs: Vec<String> = st
+                    .thumbs
+                    .thumbnails()
+                    .into_iter()
+                    .map(|(h, r)| {
+                        format!(
+                            "[{},{}]",
+                            h.0 as usize,
+                            json_rect((fl + r.0, ft + r.1, fl + r.2, ft + r.3))
+                        )
+                    })
+                    .collect();
+                format!(
+                    "{{\"hwnd\":{},\"rect\":{},\"thumbs\":[{}]}}",
+                    st.flyout.hwnd().0 as usize,
+                    json_rect(st.flyout.rect_px()),
+                    thumbs.join(",")
+                )
+            }
+        };
+        let hover = match self.hover {
+            Some(Hit::App(i)) => i.to_string(),
+            _ => "null".to_string(),
+        };
         let dump = format!(
-            "{{\"bars\":[{}],\"groups\":{},\"shown\":{},\"start\":{},\"quick\":{},\"clock\":{},\"clock_text\":{},\"more\":{},\"apps\":[{}]}}",
+            "{{\"hover\":{},\"strip\":{},\"live_thumbnails\":{},\"bars\":[{}],\"groups\":{},\"shown\":{},\"start\":{},\"quick\":{},\"clock\":{},\"clock_text\":{},\"more\":{},\"apps\":[{}]}}",
+            hover,
+            strip,
+            live_thumbnails(),
             bars.join(","),
             self.groups.len(),
             l.apps.len(),
@@ -570,6 +679,21 @@ impl App {
                     dirty.visuals = true;
                 }
             }
+            TIMER_HOVER_SHOW => {
+                self.kill_timer(TIMER_HOVER_SHOW);
+                if let Some(i) = self.show_pending.take() {
+                    if self.hover == Some(Hit::App(i)) && self.strip.is_none() {
+                        self.open_strip(i);
+                    }
+                }
+            }
+            TIMER_HOVER_HIDE => {
+                self.kill_timer(TIMER_HOVER_HIDE);
+                self.hide_pending = false;
+                if self.strip.is_some() && !self.over_flyout && self.hovered_strip_app().is_none() {
+                    self.close_strip();
+                }
+            }
             other => self.tracker.on_timer(other),
         }
     }
@@ -578,8 +702,15 @@ impl App {
         self.bars.iter().position(|b| b.window.hwnd == hwnd)
     }
 
-    /// Mouse input on a bar window; returns true if the message was handled.
+    /// Mouse input on a bar window or the flyout; returns true if the message was handled.
     fn on_mouse(&mut self, msg: &MSG, dirty: &mut Dirty) -> bool {
+        if self
+            .strip
+            .as_ref()
+            .is_some_and(|s| s.flyout.hwnd() == msg.hwnd)
+        {
+            return self.on_flyout_mouse(msg);
+        }
         let Some(i) = self.bar_index(msg.hwnd) else {
             return false;
         };
@@ -594,6 +725,7 @@ impl App {
                 }
                 if self.hover != hit {
                     self.hover = hit;
+                    self.show_suppressed = false;
                     dirty.visuals = true;
                 }
             }
@@ -611,6 +743,9 @@ impl App {
             }
             WM_LBUTTONDOWN => {
                 self.pressed = hit;
+                // A click decides what happens; the hover timer does not open the strip later.
+                self.show_suppressed = true;
+                self.cancel_show();
                 dirty.visuals = true;
             }
             WM_LBUTTONUP => {
@@ -624,10 +759,258 @@ impl App {
             }
             _ => return false,
         }
+        self.sync_expanded();
+        self.update_strip();
         true
     }
 
+    /// Mouse input on the flyout: hovering keeps the strip open, a click on a thumbnail
+    /// switches to that window.
+    fn on_flyout_mouse(&mut self, msg: &MSG) -> bool {
+        let pt = mouse_pos(msg.lParam);
+        let hit = self.strip.as_ref().and_then(|s| s.thumbs.hit(pt));
+        match msg.message {
+            WM_MOUSEMOVE => {
+                if !self.over_flyout {
+                    track_leave(msg.hwnd);
+                    self.over_flyout = true;
+                }
+            }
+            WM_MOUSELEAVE => {
+                self.over_flyout = false;
+                self.flyout_pressed = None;
+            }
+            WM_LBUTTONDOWN => self.flyout_pressed = hit,
+            WM_LBUTTONUP => {
+                let pressed = self.flyout_pressed.take();
+                if let Some(h) = hit.filter(|_| pressed == hit) {
+                    if self.opts.debug_state {
+                        eprintln!("vitrobar-thumb-click {}", h.0 as usize);
+                    }
+                    if !activate_window(h) {
+                        eprintln!("vitrobar: SetForegroundWindow refused for {:?}", h.0);
+                    }
+                    self.close_strip();
+                    return true;
+                }
+            }
+            _ => return false,
+        }
+        self.update_strip();
+        true
+    }
+
+    /// Only the bar window under the cursor, while it is over an app, takes input in (and
+    /// shows content in) its margin.
+    fn sync_expanded(&mut self) {
+        let on_app = matches!(self.hover, Some(Hit::App(_)));
+        let tracking = self.tracking;
+        for b in &mut self.bars {
+            b.window
+                .set_expanded(on_app && tracking == Some(b.window.hwnd));
+        }
+    }
+
+    /// The hovered app, if it has windows (and so a strip).
+    fn hovered_strip_app(&self) -> Option<usize> {
+        match self.hover {
+            Some(Hit::App(i)) if self.groups.get(i).is_some_and(|g| !g.windows.is_empty()) => {
+                Some(i)
+            }
+            _ => None,
+        }
+    }
+
+    /// Arms or cancels the hover timers after the cursor moved.
+    fn update_strip(&mut self) {
+        let hovered = self.hovered_strip_app();
+        if let Some(s) = &self.strip {
+            let own = hovered.is_some_and(|i| self.groups[i].key == s.group);
+            self.cancel_show();
+            if self.over_flyout || own {
+                self.cancel_hide();
+            } else if let Some(i) = hovered {
+                // Another app while the strip is open: swap at once.
+                self.open_strip(i);
+            } else {
+                self.arm_hide();
+            }
+        } else {
+            match hovered {
+                Some(i) if !self.show_suppressed => {
+                    if self.show_pending != Some(i) {
+                        self.arm_show(i);
+                    }
+                }
+                _ => self.cancel_show(),
+            }
+        }
+    }
+
+    fn kill_timer(&self, id: usize) {
+        // SAFETY: timer on our own window.
+        unsafe {
+            let _ = KillTimer(Some(self.notify.hwnd), id);
+        }
+    }
+
+    fn arm_show(&mut self, i: usize) {
+        // SAFETY: one-shot timer on our own window (killed when it fires); re-setting the id
+        // restarts it.
+        let id = unsafe {
+            SetTimer(
+                Some(self.notify.hwnd),
+                TIMER_HOVER_SHOW,
+                HOVER_SHOW_MS,
+                None,
+            )
+        };
+        self.show_pending = (id != 0).then_some(i);
+    }
+
+    fn cancel_show(&mut self) {
+        if self.show_pending.take().is_some() {
+            self.kill_timer(TIMER_HOVER_SHOW);
+        }
+    }
+
+    fn arm_hide(&mut self) {
+        if self.hide_pending {
+            return;
+        }
+        // SAFETY: one-shot timer on our own window (killed when it fires).
+        let id = unsafe {
+            SetTimer(
+                Some(self.notify.hwnd),
+                TIMER_HOVER_HIDE,
+                HOVER_HIDE_MS,
+                None,
+            )
+        };
+        self.hide_pending = id != 0;
+        if id == 0 {
+            // No timer available: close now rather than leave the strip open.
+            self.close_strip();
+        }
+    }
+
+    fn cancel_hide(&mut self) {
+        if self.hide_pending {
+            self.hide_pending = false;
+            self.kill_timer(TIMER_HOVER_HIDE);
+        }
+    }
+
+    /// Screen px of app `i`'s slot, spanning the full height of its bar surface.
+    fn anchor_px(&self, i: usize) -> Option<PxRect> {
+        let r = self.layout.apps.get(i)?;
+        let (cx, cy) = (r.x + r.w / 2.0, r.y + r.h / 2.0);
+        let s = self
+            .layout
+            .surfaces
+            .iter()
+            .find(|s| cx >= s.x && cx < s.right() && cy >= s.y && cy < s.bottom())?;
+        Some(to_px(
+            Rect {
+                x: r.x,
+                y: s.y,
+                w: r.w,
+                h: s.h,
+            },
+            self.scale,
+        ))
+    }
+
+    /// Opens the strip of app `i` now (replacing any other strip).
+    fn open_strip(&mut self, i: usize) {
+        self.cancel_show();
+        self.cancel_hide();
+        self.build_strip(i);
+    }
+
+    /// (Re)builds the strip of app `i` unless it already shows exactly that; the hover
+    /// timers are left alone.
+    fn build_strip(&mut self, i: usize) {
+        let Some(g) = self.groups.get(i) else { return };
+        if g.windows.is_empty() {
+            self.close_strip();
+            return;
+        }
+        let Some(anchor) = self.anchor_px(i) else {
+            self.close_strip();
+            return;
+        };
+        if self
+            .strip
+            .as_ref()
+            .is_some_and(|s| s.group == g.key && s.windows == g.windows && s.anchor == anchor)
+        {
+            return;
+        }
+        let (key, hwnds) = (g.key.clone(), g.windows.clone());
+        let windows: Vec<(HWND, String)> = hwnds
+            .iter()
+            .map(|&h| (hwnd_of(h), self.windows.title(h).unwrap_or("").to_string()))
+            .collect();
+        let raw: Vec<HWND> = windows.iter().map(|(h, _)| *h).collect();
+        let size = ThumbnailStrip::size_dip(&raw);
+        let opened = Flyout::show(
+            &self.comp,
+            anchor,
+            self.settings.position,
+            size,
+            self.monitor.dpi,
+            &self.style,
+        )
+        .and_then(|flyout| {
+            let thumbs = ThumbnailStrip::show(&flyout, &self.painter, self.style.text, &windows)?;
+            Ok(Strip {
+                thumbs,
+                flyout,
+                group: key,
+                windows: hwnds,
+                anchor,
+            })
+        });
+        match opened {
+            Ok(strip) => {
+                // The new strip is up before the old one goes (no flicker on a swap).
+                let old = self.strip.replace(strip);
+                drop(old);
+                self.over_flyout = false;
+                self.flyout_pressed = None;
+            }
+            Err(e) => eprintln!("vitrobar: thumbnail strip failed: {e}"),
+        }
+        if self.opts.debug_state {
+            self.dump_state();
+        }
+    }
+
+    fn close_strip(&mut self) {
+        self.cancel_hide();
+        if self.strip.take().is_some() {
+            self.over_flyout = false;
+            self.flyout_pressed = None;
+            if self.opts.debug_state {
+                self.dump_state();
+            }
+        }
+    }
+
+    /// After the groups or the layout changed: follow the strip's group, or close it.
+    fn sync_strip(&mut self) {
+        let Some(s) = &self.strip else { return };
+        match self.groups.iter().position(|g| g.key == s.group) {
+            Some(i) if i < self.layout.apps.len() => self.build_strip(i),
+            _ => self.close_strip(),
+        }
+    }
+
     fn click(&mut self, hit: Hit) {
+        if !matches!(hit, Hit::App(_)) {
+            self.close_strip();
+        }
         match hit {
             Hit::Start => open_stock_start(),
             Hit::Quick => self.launcher.launch(Job::QuickSettings),
@@ -651,8 +1034,12 @@ impl App {
                         }
                     }
                     ClickAction::Minimize(h) => minimize_window(hwnd_of(h)),
-                    // Thumbnails are Task 10.
                     ClickAction::ShowThumbnails => {}
+                }
+                if action == ClickAction::ShowThumbnails {
+                    self.open_strip(i);
+                } else {
+                    self.close_strip();
                 }
             }
             // The overflow menu and show-desktop arrive in later tasks.
@@ -709,6 +1096,7 @@ impl App {
         }
         if redraw {
             self.refresh()?;
+            self.sync_strip();
         }
         if self.clock_unarmed {
             self.tick_clock();

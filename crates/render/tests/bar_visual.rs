@@ -6,7 +6,7 @@ use vitro_core::image::BgraImage;
 use vitro_core::layout::{compute_layout, BarLayout, LayoutInput, Rect};
 use vitro_core::settings::{HoverEffect, IconSize, Material, Position, Shape};
 use vitro_core::style::{hover_style, material_style, Rgba, Theme};
-use vitro_render::bar_visual::{BarVisual, ItemState, VisualEnv};
+use vitro_render::bar_visual::{hover_timing, BarVisual, ItemState, VisualEnv};
 use vitro_render::compositor::init_compositor;
 use vitro_render::device::create_gpu_device;
 use vitro_render::surfaces::{FontKind, Painter};
@@ -62,6 +62,7 @@ fn update_draws_only_what_changed() {
         dpi: 120,
         accent: Rgba(0, 120, 212, 255),
         animations: false,
+        ..Default::default()
     });
     let style = material_style(Material::Frosted, Theme::Dark, true);
     let hover = hover_style(HoverEffect::Plate);
@@ -159,4 +160,136 @@ fn islands_split_items_between_surfaces() {
         .update(&l, &items, "1:00\n1/1/2027", &style, &hover)
         .unwrap();
     assert_eq!(extra.surfaces_drawn(), 0);
+}
+
+fn icons(n: usize) -> Vec<ItemState> {
+    let img = Arc::new(icon(24));
+    (0..n)
+        .map(|_| ItemState {
+            icon: Some(Arc::clone(&img)),
+            dots: 1,
+            ..Default::default()
+        })
+        .collect()
+}
+
+/// (offset y, scale) targets of every app item.
+fn motions(bar: &BarVisual, n: usize) -> Vec<(f32, f32)> {
+    (0..n)
+        .map(|i| {
+            let m = bar.app_motion(i).unwrap();
+            (m.dy, m.scale)
+        })
+        .collect()
+}
+
+#[test]
+fn hover_effects_set_their_targets_without_redrawing() {
+    let comp = init_compositor().unwrap();
+    let gpu = create_gpu_device(&comp).unwrap();
+    let style = material_style(Material::Frosted, Theme::Dark, true);
+    let l = layout(Shape::Pill, 4);
+    let clock = "1:00
+1/1/2027";
+    let mut bar = BarVisual::new(&comp, &gpu, 0).unwrap();
+    // 150 % scaling, animations off: final values are set at once and can be read back.
+    bar.set_env(VisualEnv {
+        dpi: 144,
+        animations: false,
+        ..Default::default()
+    });
+    let mut items = icons(4);
+
+    let magnify = hover_style(HoverEffect::Magnify);
+    bar.update(&l, &items, clock, &style, &magnify).unwrap();
+    let drawn = bar.surfaces_drawn();
+    assert_eq!(motions(&bar, 4), vec![(0.0, 1.0); 4]);
+    items[1].hovered = true;
+    bar.update(&l, &items, clock, &style, &magnify).unwrap();
+    assert_eq!(
+        motions(&bar, 4),
+        vec![(0.0, 1.22), (0.0, 1.55), (0.0, 1.22), (0.0, 1.0)]
+    );
+    assert_eq!(bar.app_static_transform(1), Some((0.0, 1.55, 0.0)));
+    assert_eq!(bar.app_static_transform(3), Some((0.0, 1.0, 0.0)));
+
+    let lift = hover_style(HoverEffect::Lift);
+    bar.update(&l, &items, clock, &style, &lift).unwrap();
+    // -5 DIP at 150 % = -7.5 px, snapped to whole pixels.
+    assert_eq!(motions(&bar, 4)[1], (-8.0, 1.0));
+    assert_eq!(
+        motions(&bar, 4)[0],
+        (0.0, 1.0),
+        "Lift has no neighbour effect"
+    );
+    assert_eq!(bar.app_static_transform(1), Some((-8.0, 1.0, 0.0)));
+
+    let sweep = hover_style(HoverEffect::Sweep);
+    bar.update(&l, &items, clock, &style, &sweep).unwrap();
+    assert_eq!(motions(&bar, 4)[1], (-3.0, 1.06));
+
+    let plate = hover_style(HoverEffect::Plate);
+    bar.update(&l, &items, clock, &style, &plate).unwrap();
+    assert_eq!(motions(&bar, 4)[1], (0.0, 1.0));
+    assert_eq!(
+        bar.app_static_transform(1),
+        Some((0.0, 1.0, 1.0)),
+        "plate shown"
+    );
+    items[1].pressed = true;
+    bar.update(&l, &items, clock, &style, &plate).unwrap();
+    assert_eq!(motions(&bar, 4)[1], (0.0, 0.9), "pressed icon squeezes");
+    items[1].pressed = false;
+    items[1].hovered = false;
+    bar.update(&l, &items, clock, &style, &plate).unwrap();
+    assert_eq!(
+        bar.app_static_transform(1),
+        Some((0.0, 1.0, 0.0)),
+        "plate gone"
+    );
+
+    assert_eq!(
+        bar.surfaces_drawn(),
+        drawn,
+        "hover effects are transforms, never redraws"
+    );
+}
+
+#[test]
+fn top_bars_mirror_lift() {
+    let comp = init_compositor().unwrap();
+    let gpu = create_gpu_device(&comp).unwrap();
+    let style = material_style(Material::Frosted, Theme::Light, true);
+    let l = layout(Shape::Pill, 2);
+    let mut bar = BarVisual::new(&comp, &gpu, 0).unwrap();
+    bar.set_env(VisualEnv {
+        position: Position::Top,
+        ..Default::default()
+    });
+    let mut items = icons(2);
+    items[0].hovered = true;
+    bar.update(&l, &items, "1:00", &style, &hover_style(HoverEffect::Lift))
+        .unwrap();
+    assert_eq!(motions(&bar, 2)[0], (5.0, 1.0));
+    // With animations on, a hover change still succeeds (the compositor runs it).
+    items[0].hovered = false;
+    items[1].hovered = true;
+    bar.update(&l, &items, "1:00", &style, &hover_style(HoverEffect::Sweep))
+        .unwrap();
+    assert_eq!(motions(&bar, 2), vec![(0.0, 1.0), (2.0, 1.06)]);
+}
+
+#[test]
+fn motion_never_exceeds_250_ms() {
+    for h in vitro_core::style::ALL_HOVERS {
+        let (motion, fade, streak) = hover_timing(&hover_style(*h));
+        assert!(motion <= 250 && fade <= 250, "{h:?}");
+        let expected = match h {
+            HoverEffect::Plate => (150, 150, 150),
+            HoverEffect::Lift => (220, 220, 220),
+            HoverEffect::Magnify => (180, 180, 180),
+            HoverEffect::Sweep => (220, 250, 450),
+        };
+        assert_eq!((motion, fade, streak), expected, "{h:?}");
+    }
 }

@@ -28,6 +28,9 @@ pub const WM_APP_ICON: u32 = WM_APP + 0x22;
 /// Timers on the notify window (ids distinct from the tracker's 0x5601/0x5602).
 pub const TIMER_CLOCK: usize = 0x5701;
 pub const TIMER_GPU_RETRY: usize = 0x5702;
+/// One-shot hover timers of the thumbnail strip (400 ms to open, 300 ms to close).
+pub const TIMER_HOVER_SHOW: usize = 0x5703;
+pub const TIMER_HOVER_HIDE: usize = 0x5704;
 
 /// Everything the notify window received since the last [`take_inbox`].
 #[derive(Debug, Default, PartialEq)]
