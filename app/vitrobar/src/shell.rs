@@ -146,6 +146,11 @@ impl StockGuard {
             );
             return;
         };
+        if RESTORED.load(Ordering::SeqCst) {
+            // A restore (console handler, end of session, panic hook) ran while we waited for
+            // the lock: taking over now would hide the taskbar after it was given back.
+            return;
+        }
         if self.mode == StockTaskbar::Hidden {
             // Before the windows are hidden, so no way out can miss showing them.
             HID_TASKBAR.store(true, Ordering::SeqCst);

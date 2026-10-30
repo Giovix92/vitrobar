@@ -281,8 +281,14 @@ function Start-Tracked([string]$file, [string]$handOff) {
 }
 
 function Test-OurFolderTitle([string]$title, [string]$name) {
-    # File Explorer titles are "<folder>" or "<folder> - File Explorer" (localized suffix).
-    return $title -eq $name -or $title.StartsWith("$name - ")
+    # File Explorer titles are "<folder>" or "<folder> - File Explorer" (localized suffix);
+    # with "Display the full path in the title bar" on, the folder comes after its path. So
+    # the name may sit anywhere, but must end the title or be followed by a space (so that
+    # "<tag>-1" never matches "<tag>-10").
+    $i = $title.IndexOf($name, [StringComparison]::OrdinalIgnoreCase)
+    if ($i -lt 0) { return $false }
+    $end = $i + $name.Length
+    return $end -eq $title.Length -or $title[$end] -eq ' '
 }
 
 function Open-Apps([int]$count) {
@@ -354,9 +360,10 @@ function Close-Apps {
         if ($ownPids -notcontains [int]$c.ProcessId) { $ownPids.Add([int]$c.ProcessId) }
     }
     # A File Explorer window on one of this run's folders that showed up too late to be
-    # tracked is still ours (the folder names are unique to this run).
+    # tracked is still ours (the folder names are unique to this run; Contains, not
+    # StartsWith: the title may begin with the folder's full path).
     foreach ($h in [VitroPerf]::WindowsOfClass('CabinetWClass')) {
-        if ($ownWindows -notcontains $h -and [VitroPerf]::Title($h).StartsWith("$tag-")) {
+        if ($ownWindows -notcontains $h -and [VitroPerf]::Title($h).Contains("$tag-")) {
             $ownWindows.Add($h)
             $failures.Add('explorer_window_tracked_late')
         }

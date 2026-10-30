@@ -212,7 +212,8 @@ appbar strip, bar windows, groups with their windows) and `vitrobar-monitors` li
 reconcile. Steps 1 and 2 can be scripted with test windows of your own moved with
 `SetWindowPos` (run the script Per-Monitor-V2 aware: a system-aware script sees monitors at
 another scale in scaled coordinates). Steps 3 and 4 can be simulated on any machine: set
-`VITROBAR_FAKE_MONITOR` to a file path before starting; writing `left,top,right,bottom,dpi`
+`VITROBAR_FAKE_MONITOR` to a file path and start Vitrobar with `--debug-state` (the variable
+is ignored without that flag); writing `left,top,right,bottom,dpi`
 into that file and posting `WM_DISPLAYCHANGE` to Vitrobar's `VitrobarNotify` window adds a
 made-up monitor (deleting the file and posting again removes it; changing its DPI and posting
 again re-lays it out). A virtual desktop switch can be simulated by posting `WM_TIMER` with id
@@ -274,7 +275,7 @@ folder name, Character Map and Paint by the process the check started.
    - `exe_mb` < 5;
    - `startup_ms` < 300: launch of `vitrobar.exe` (the watchdog) until a visible
      `VitrobarBar` window exists (polled every ~2 ms through `EnumWindows`). Expected about
-     200 ms: the bar shows first and takes the stock taskbar over right after (ruling R12),
+     100 ms (measured 82–101 ms): the bar shows first and takes the stock taskbar over right after (ruling R12),
      so the stock taskbar may stay visible under the bar for about half a second;
    - `shell_ok` true: afterwards Explorer's `Shell_TrayWnd` is the only one and visible.
    `failures` names every budget missed, and every test window left open. Run it 3 times;

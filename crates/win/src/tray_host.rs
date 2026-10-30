@@ -281,6 +281,15 @@ unsafe fn forward_appbar(own: HWND, wparam: WPARAM, data: &[u8]) -> Option<LRESU
     // Only a block allocated for this process (as shell32 does for a caller that found our
     // window) is opened: any other process id is left alone, so a sender cannot make us open
     // a process of its choosing. Such a copy is forwarded verbatim.
+    //
+    // Parity with Explorer: the message filter lets lower-integrity senders (sandboxed apps)
+    // reach this path, exactly as they reach Explorer's `Shell_TrayWnd`. Such a sender can
+    // name our process id and any handle value; the value is then a handle *in this
+    // process*, which `SHLockShared` only maps if it is a section, and at most
+    // APPBAR_DATA_SIZE bytes are read from or written to that view, after the size and
+    // layout check below. That is the same exposure Explorer has for the same message (it
+    // opens the caller-supplied handle in its own process the same way), not a new one:
+    // nothing else is done with the handle, and it is never duplicated or closed here.
     let call = parse_appbar_copydata(data).filter(|c| c.shared != 0 && c.proc_id == own_pid())?;
     let Some(target) = explorer_target(own) else {
         return Some(LRESULT(0));
@@ -524,9 +533,15 @@ fn setting_is(lparam: LPARAM, area: &str) -> bool {
 }
 
 fn register_class() -> Result<()> {
-    static RESULT: OnceLock<Result<()>> = OnceLock::new();
-    RESULT
-        .get_or_init(|| unsafe {
+    // Only a success is remembered: a failed registration is tried again by the next
+    // caller (a class registered in this process stays registered).
+    static DONE: Mutex<bool> = Mutex::new(false);
+    let mut done = DONE.lock().unwrap_or_else(|e| e.into_inner());
+    if *done {
+        return Ok(());
+    }
+    let registered = (|| -> Result<()> {
+        unsafe {
             // SAFETY: plain class registration with a static window procedure. The class
             // name is registered in this process only.
             let wc = WNDCLASSW {
@@ -539,8 +554,12 @@ fn register_class() -> Result<()> {
                 return Err(Error::from_thread());
             }
             Ok(())
-        })
-        .clone()
+        }
+    })();
+    if registered.is_ok() {
+        *done = true;
+    }
+    registered
 }
 
 /// Puts `hwnd` (our tray window) back at the top of the topmost band, without waiting.

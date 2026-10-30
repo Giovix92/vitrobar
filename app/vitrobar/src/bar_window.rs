@@ -9,7 +9,7 @@
 //! [`MarginMode`].
 
 use std::cell::Cell;
-use std::sync::OnceLock;
+use std::sync::Mutex;
 
 use vitro_core::layout::{BarLayout, Rect};
 use vitro_render::compositor::{window_target, Comp};
@@ -134,10 +134,15 @@ fn window_rect(r: PxRect, m: (i32, i32)) -> PxRect {
 }
 
 fn register_class() -> Result<()> {
-    // The outcome of the first registration is kept, failure included.
-    static RESULT: OnceLock<Result<()>> = OnceLock::new();
-    RESULT
-        .get_or_init(|| unsafe {
+    // Only a success is remembered: a failed registration is tried again by the next
+    // caller (a class registered in this process stays registered).
+    static DONE: Mutex<bool> = Mutex::new(false);
+    let mut done = DONE.lock().unwrap_or_else(|e| e.into_inner());
+    if *done {
+        return Ok(());
+    }
+    let registered = (|| -> Result<()> {
+        unsafe {
             // SAFETY: plain class registration with a static window procedure.
             let class = HSTRING::from(BAR_CLASS);
             let wc = WNDCLASSEXW {
@@ -152,8 +157,12 @@ fn register_class() -> Result<()> {
                 return Err(Error::from_thread());
             }
             Ok(())
-        })
-        .clone()
+        }
+    })();
+    if registered.is_ok() {
+        *done = true;
+    }
+    registered
 }
 
 thread_local! {

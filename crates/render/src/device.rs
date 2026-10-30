@@ -117,6 +117,8 @@ fn create_devices(kind: DeviceKind) -> Result<Devices> {
 /// lacks ID3D11Device4 (then loss is only seen through [`GpuDevice::is_lost`] or a failed draw).
 fn register_removed(d3d: &ID3D11Device, event: HANDLE) -> Option<u32> {
     let d4: ID3D11Device4 = d3d.cast().ok()?;
+    // SAFETY: `event` is a valid event handle owned by the `GpuDevice`, which unregisters
+    // the cookie (`unregister_removed`) before it closes the handle.
     unsafe { d4.RegisterDeviceRemovedEvent(event).ok() }
 }
 
@@ -128,7 +130,9 @@ pub fn create_gpu_device(compositor: &Compositor) -> Result<GpuDevice> {
 pub fn create_gpu_device_of(compositor: &Compositor, kind: DeviceKind) -> Result<GpuDevice> {
     let devices = create_devices(kind)?;
     let interop: ICompositorInterop = compositor.cast()?;
+    // SAFETY: `devices.d2d` is a live D2D device; the interop call only adds a reference.
     let graphics = unsafe { interop.CreateGraphicsDevice(&devices.d2d)? };
+    // SAFETY: an unnamed auto-reset event with default security; closed in `Drop`.
     let removed_event = unsafe { CreateEventW(None, false, false, None)? };
     let removed_cookie = register_removed(&devices.d3d, removed_event);
     Ok(GpuDevice {
@@ -154,6 +158,7 @@ impl GpuDevice {
 
     /// True if the D3D device has been removed and must be recreated.
     pub fn is_lost(&self) -> bool {
+        // SAFETY: a read-only query on a live device.
         unsafe { self.d3d.GetDeviceRemovedReason().is_err() }
     }
 
@@ -169,6 +174,8 @@ impl GpuDevice {
     pub fn recreate(&mut self) -> Result<()> {
         let devices = create_devices(self.kind)?;
         let interop: ICompositionGraphicsDeviceInterop = self.graphics.cast()?;
+        // SAFETY: `devices.d2d` is a live D2D device; the composition device keeps its own
+        // reference, and surfaces made from it stay valid (their content must be redrawn).
         unsafe { interop.SetRenderingDevice(&devices.d2d)? };
         self.unregister_removed();
         self.removed_cookie = register_removed(&devices.d3d, self.removed_event);
@@ -181,6 +188,8 @@ impl GpuDevice {
     fn unregister_removed(&mut self) {
         if let Some(cookie) = self.removed_cookie.take() {
             if let Ok(d4) = self.d3d.cast::<ID3D11Device4>() {
+                // SAFETY: `cookie` came from `RegisterDeviceRemovedEvent` on this device and is
+                // unregistered once (`take` above).
                 unsafe { d4.UnregisterDeviceRemoved(cookie) };
             }
         }
@@ -190,6 +199,8 @@ impl GpuDevice {
 impl Drop for GpuDevice {
     fn drop(&mut self) {
         self.unregister_removed();
+        // SAFETY: the event handle is owned by this device, no longer registered with D3D,
+        // and closed exactly once here.
         unsafe {
             let _ = CloseHandle(self.removed_event);
         }

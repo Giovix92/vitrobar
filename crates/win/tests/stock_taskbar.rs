@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 
 use vitro_core::settings::StockTaskbar;
 use vitro_win::stock_taskbar::{
-    autohide_now, restore_stock_taskbar, runonce_exists, show_stock_taskbar, stock_taskbar_visible,
-    take_over_stock_taskbar, RestoreRecord, ShellLock,
+    autohide_now, delete_runonce, restore_stock_taskbar, runonce_exists, show_stock_taskbar,
+    stock_taskbar_visible, take_over_stock_taskbar, RestoreRecord, ShellLock,
 };
 
 fn temp_record(name: &str) -> PathBuf {
@@ -40,11 +40,17 @@ fn eventually(mut f: impl FnMut() -> bool) -> bool {
     }
 }
 
-/// Puts the shell back if an assertion failed half-way.
+/// Puts the shell back however the test ends (also on a panic half-way). The RunOnce value
+/// these tests make points at the test binary, which cannot restore anything at sign-in, so
+/// it is deleted even when the restore keeps it (record unreadable, Explorer gone).
 struct Cleanup(PathBuf);
 impl Drop for Cleanup {
     fn drop(&mut self) {
         let _ = restore_stock_taskbar(&self.0);
+        let _ = delete_runonce();
+        if let Some(dir) = self.0.parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 }
 

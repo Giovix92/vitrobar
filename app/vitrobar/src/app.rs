@@ -120,13 +120,16 @@ const TRAY_TIP_MS: u32 = 500;
 /// Debug hook for live tests of the multi-monitor paths: names a file that, while it exists
 /// and holds `left,top,right,bottom,dpi`, adds one made-up monitor to the real ones. It is
 /// read on every display check (post `WM_DISPLAYCHANGE` to the notify window after editing
-/// it). Unset in normal use.
+/// it). Honoured only together with `--debug-state` (ruling R13): an environment variable
+/// alone never changes a normal run. Unset in normal use.
 const FAKE_MONITOR_ENV: &str = "VITROBAR_FAKE_MONITOR";
 
-/// The monitors bars belong on: the real ones (primary first), plus the debug hook's.
-fn current_monitors() -> Vec<MonitorInfo> {
+/// The monitors bars belong on: the real ones (primary first), plus the debug hook's when
+/// `debug_state` (`--debug-state`) is on.
+fn current_monitors(debug_state: bool) -> Vec<MonitorInfo> {
     let mut list = list_monitors();
-    if let Some(path) = std::env::var_os(FAKE_MONITOR_ENV).filter(|p| !p.is_empty()) {
+    let hook = std::env::var_os(FAKE_MONITOR_ENV).filter(|p| debug_state && !p.is_empty());
+    if let Some(path) = hook {
         if let Some(m) = std::fs::read_to_string(path)
             .ok()
             .and_then(|s| parse_monitor_spec(&s))
@@ -568,7 +571,7 @@ impl App {
         let comp = init_compositor()?;
         let gpu = create_gpu_device(&comp)?;
         let painter = Painter::new(&gpu)?;
-        let monitors: Vec<MonitorBar> = current_monitors()
+        let monitors: Vec<MonitorBar> = current_monitors(opts.debug_state)
             .into_iter()
             .enumerate()
             .map(|(k, m)| MonitorBar::new(m, k == 0))
@@ -1092,9 +1095,16 @@ impl App {
         }
     }
 
-    /// Explorer restarted: hide its new taskbar and register the appbars with the new shell.
-    fn on_taskbar_created(&mut self) {
+    /// Explorer restarted: hide its new taskbar, register the appbars with the new shell and
+    /// reconnect to its virtual desktop manager.
+    fn on_taskbar_created(&mut self, dirty: &mut Dirty) {
         self.stock.on_taskbar_created();
+        // The old manager is a proxy into the Explorer that just ended: every query on it
+        // would fail open (every window "on the current desktop") until the next restart.
+        match self.desktops.recreate() {
+            Ok(()) => dirty.regroup |= self.windows.refresh_desktops(&self.desktops),
+            Err(e) => eprintln!("vitrobar: could not reconnect to the virtual desktops: {e}"),
+        }
         for mb in &mut self.monitors {
             if let Some(ab) = &mut mb.appbar {
                 if let Err(e) = ab.reregister() {
@@ -2630,7 +2640,7 @@ impl App {
             self.finish_start(dirty);
         }
         if inbox.taskbar_created {
-            self.on_taskbar_created();
+            self.on_taskbar_created(dirty);
         } else if inbox.shell || inbox.display {
             self.stock.reassert();
         }
@@ -2654,7 +2664,7 @@ impl App {
 
     /// Applies everything collected from one drain of the queue.
     fn flush(&mut self, mut d: Dirty) -> Result<()> {
-        if d.monitors && self.reconcile_monitors(current_monitors()) {
+        if d.monitors && self.reconcile_monitors(current_monitors(self.opts.debug_state)) {
             // New bars, new geometry: everything is laid out and drawn again, and every
             // window's monitor is read again (windows on a removed monitor were moved).
             d.visuals = true;
@@ -2782,7 +2792,17 @@ pub fn run(opts: Options) -> Result<()> {
     let mut parent = crate::watchdog::ParentWatch::new(opts.parent, opts.pass_on.clone());
 
     let path = settings_path();
-    let mut settings = path.as_deref().map(settings::load).unwrap_or_default();
+    let (mut settings, status) = path
+        .as_deref()
+        .map(settings::load_with_status)
+        .unwrap_or((Settings::default(), settings::LoadStatus::Missing));
+    let corrupt = status == settings::LoadStatus::Corrupt;
+    if corrupt {
+        // Not a first run (`first_run_done` is set): no import, and the `Run` value stays
+        // exactly as it is. The menu shows what it actually is.
+        settings.start_with_windows = vitro_win::autostart::autostart_value().is_some();
+        eprintln!("vitrobar: the settings file could not be read; using defaults (copy kept)");
+    }
     let first_run = !settings.first_run_done;
     if first_run {
         // Before the stock taskbar is taken over: the import only reads.
@@ -2802,7 +2822,7 @@ pub fn run(opts: Options) -> Result<()> {
     }
     if first_run {
         apply_autostart(settings.start_with_windows);
-    } else if settings.start_with_windows {
+    } else if settings.start_with_windows && !corrupt {
         // Only follows a Vitrobar that moved: never registers the exe started now by itself.
         if let Err(e) = vitro_win::autostart::repair_autostart() {
             eprintln!("vitrobar: could not check \"Start with Windows\": {e}");
@@ -2983,12 +3003,15 @@ mod tests {
         std::fs::write(&f, "1920,0,3840,1080,144").unwrap();
         // No other test reads this variable.
         std::env::set_var(FAKE_MONITOR_ENV, &f);
-        let with = current_monitors();
+        let with = current_monitors(true);
+        // R13: without --debug-state the variable is ignored.
+        let not_debug = current_monitors(false);
         std::fs::remove_file(&f).unwrap();
-        let without = current_monitors();
+        let without = current_monitors(true);
         std::env::remove_var(FAKE_MONITOR_ENV);
         let _ = std::fs::remove_dir(&dir);
         assert_eq!(with.len(), without.len() + 1);
+        assert_eq!(not_debug.len(), without.len());
         let fake = with.last().unwrap();
         assert_eq!((fake.dpi, fake.primary), (144, false));
         assert!(with[0].primary, "a real primary stays first: the tray bar");

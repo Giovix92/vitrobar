@@ -4,9 +4,7 @@ use std::cell::Cell;
 
 use windows::core::{Result, GUID};
 use windows::Win32::Foundation::HWND;
-use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_APARTMENTTHREADED,
-};
+use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
 use windows::Win32::UI::Shell::{IVirtualDesktopManager, VirtualDesktopManager};
 use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 
@@ -16,18 +14,21 @@ pub struct Desktops {
 }
 
 impl Desktops {
-    /// Initialises COM (apartment) on the calling thread if needed and creates the manager.
+    /// Creates the manager. The calling thread must already have initialised COM (the UI
+    /// thread does, in `app::run`); this never initialises it, so there is nothing to balance.
     pub fn new() -> Result<Self> {
-        // SAFETY: plain COM calls; an already-initialised or changed-mode result is fine,
-        // CoCreateInstance reports real problems.
-        unsafe {
-            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-            let mgr = CoCreateInstance(&VirtualDesktopManager, None, CLSCTX_ALL)?;
-            Ok(Self {
-                mgr,
-                current: Cell::new(None),
-            })
-        }
+        Ok(Self {
+            mgr: create_manager()?,
+            current: Cell::new(None),
+        })
+    }
+
+    /// Creates the manager again (Explorer restarted: the old proxy points at a process that
+    /// is gone, and every query on it would fail open forever). On failure the old one stays.
+    pub fn recreate(&mut self) -> Result<()> {
+        self.mgr = create_manager()?;
+        self.invalidate();
+        Ok(())
     }
 
     /// Cold cache: learns the current desktop id from the foreground window, and only from
@@ -84,6 +85,11 @@ impl Desktops {
         }
         decide(cur, id, self.current.get())
     }
+}
+
+fn create_manager() -> Result<IVirtualDesktopManager> {
+    // SAFETY: plain COM activation on a thread that initialised COM.
+    unsafe { CoCreateInstance(&VirtualDesktopManager, None, CLSCTX_ALL) }
 }
 
 /// The reference id a foreground window yields: only when the shell confirms it is on the

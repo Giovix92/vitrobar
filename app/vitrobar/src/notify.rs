@@ -13,7 +13,7 @@
 //! posting them (any same-integrity process can) only makes us drain our own queues.
 
 use std::cell::RefCell;
-use std::sync::OnceLock;
+use std::sync::Mutex;
 
 use vitro_core::tray_wire::TrayMessage;
 use vitro_win::appbar::WM_VITRO_APPBAR;
@@ -237,9 +237,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 }
 
 fn register_class() -> Result<()> {
-    static RESULT: OnceLock<Result<()>> = OnceLock::new();
-    RESULT
-        .get_or_init(|| unsafe {
+    // Only a success is remembered: a failed registration is tried again by the next
+    // caller (a class registered in this process stays registered).
+    static DONE: Mutex<bool> = Mutex::new(false);
+    let mut done = DONE.lock().unwrap_or_else(|e| e.into_inner());
+    if *done {
+        return Ok(());
+    }
+    let registered = (|| -> Result<()> {
+        unsafe {
             // SAFETY: plain class registration with a static window procedure.
             let wc = WNDCLASSEXW {
                 cbSize: size_of::<WNDCLASSEXW>() as u32,
@@ -252,8 +258,12 @@ fn register_class() -> Result<()> {
                 return Err(Error::from_thread());
             }
             Ok(())
-        })
-        .clone()
+        }
+    })();
+    if registered.is_ok() {
+        *done = true;
+    }
+    registered
 }
 
 impl NotifyWindow {

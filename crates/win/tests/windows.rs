@@ -12,8 +12,17 @@ use vitro_win::window_tracker::{
 };
 use windows::core::w;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::*;
+
+/// `Desktops` needs COM on the calling thread, as the app's UI thread has it (each test
+/// runs on its own thread; it ends without uninitialising, which is fine for a test).
+fn desktops() -> Desktops {
+    // SAFETY: plain apartment initialisation of this test thread.
+    let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    Desktops::new().unwrap()
+}
 
 unsafe extern "system" fn wndproc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     unsafe { DefWindowProcW(h, m, w, l) }
@@ -62,7 +71,7 @@ fn hwnd_u64(h: HWND) -> u64 {
 #[test]
 fn normal_window_is_taskbar_window() {
     let h = make_window(WS_OVERLAPPEDWINDOW | WS_VISIBLE, WINDOW_EX_STYLE(0), None);
-    let i = read_window_info(h, 1, &Desktops::new().unwrap()).unwrap();
+    let i = read_window_info(h, 1, &desktops()).unwrap();
     assert!(is_taskbar_window(&i), "{i:?}");
     assert_eq!(i.hwnd, hwnd_u64(h));
     assert_eq!(i.seq, 1);
@@ -78,7 +87,7 @@ fn normal_window_is_taskbar_window() {
 #[test]
 fn tool_window_is_not() {
     let h = make_window(WS_POPUP | WS_VISIBLE, WS_EX_TOOLWINDOW, None);
-    let i = read_window_info(h, 1, &Desktops::new().unwrap()).unwrap();
+    let i = read_window_info(h, 1, &desktops()).unwrap();
     assert!(i.tool_window);
     assert!(!is_taskbar_window(&i));
     unsafe { DestroyWindow(h).unwrap() };
@@ -88,7 +97,7 @@ fn tool_window_is_not() {
 fn owned_window_is_not() {
     let owner = make_window(WS_OVERLAPPEDWINDOW | WS_VISIBLE, WINDOW_EX_STYLE(0), None);
     let h = make_window(WS_POPUP | WS_VISIBLE, WINDOW_EX_STYLE(0), Some(owner));
-    let i = read_window_info(h, 1, &Desktops::new().unwrap()).unwrap();
+    let i = read_window_info(h, 1, &desktops()).unwrap();
     assert!(i.has_owner);
     assert!(!is_taskbar_window(&i));
     unsafe {
@@ -107,7 +116,7 @@ fn hung_window_does_not_block() {
         std::thread::sleep(Duration::from_secs(5));
     });
     let h = HWND(rx.recv().unwrap() as usize as *mut _);
-    let desktops = Desktops::new().unwrap();
+    let desktops = desktops();
     let t = Instant::now();
     let i = read_window_info(h, 1, &desktops);
     let dt = t.elapsed();
@@ -172,7 +181,7 @@ fn tracker_reports_create_and_destroy() {
 /// a window right after creation must still say "current desktop".
 #[test]
 fn fresh_window_counts_as_on_current_desktop() {
-    let d = Desktops::new().unwrap();
+    let d = desktops();
     // Like the app, learn the current desktop from an already settled window first.
     let settled = make_window(WS_OVERLAPPEDWINDOW | WS_VISIBLE, WINDOW_EX_STYLE(0), None);
     let t = Instant::now();

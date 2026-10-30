@@ -115,22 +115,61 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     path.with_file_name(name)
 }
 
-/// Loads settings. Missing file or unreadable content gives defaults; a file
-/// that exists but fails to parse is first copied to `<name>.bad`.
+/// How [`load_with_status`] found the settings file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadStatus {
+    /// No file (or it cannot be read): a genuine first run.
+    Missing,
+    Loaded,
+    /// The file exists but does not parse. It was copied aside (see [`load_with_status`]);
+    /// this is not a first run.
+    Corrupt,
+}
+
+/// Loads settings. See [`load_with_status`].
 pub fn load(path: &Path) -> Settings {
+    load_with_status(path).0
+}
+
+/// Loads settings. A missing file gives defaults (a first run). A file that exists but fails
+/// to parse is copied to `<name>.bad-<unix ms>` (earlier copies are kept) and gives defaults
+/// with `first_run_done = true`: the user has run Vitrobar before, so nothing of the first
+/// run (pin import, "Start with Windows" registration) happens again. The caller must not
+/// touch the `Run` value either ([`LoadStatus::Corrupt`]).
+pub fn load_with_status(path: &Path) -> (Settings, LoadStatus) {
     let Ok(bytes) = std::fs::read(path) else {
-        return Settings::default();
+        return (Settings::default(), LoadStatus::Missing);
     };
     let parsed = std::str::from_utf8(&bytes)
         .ok()
         .and_then(|t| toml::from_str::<Settings>(t).ok());
     match parsed {
-        Some(s) => s,
+        Some(s) => (s, LoadStatus::Loaded),
         None => {
-            let _ = std::fs::write(with_suffix(path, ".bad"), &bytes);
-            Settings::default()
+            let _ = std::fs::write(bad_copy_path(path), &bytes);
+            let s = Settings {
+                first_run_done: true,
+                ..Settings::default()
+            };
+            (s, LoadStatus::Corrupt)
         }
     }
+}
+
+/// `<name>.bad-<unix ms>`, with a counter if that name is taken: never overwrites an
+/// earlier copy.
+fn bad_copy_path(path: &Path) -> PathBuf {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    let first = with_suffix(path, &format!(".bad-{ms}"));
+    let mut candidate = first.clone();
+    let mut n = 1;
+    while candidate.exists() {
+        candidate = with_suffix(path, &format!(".bad-{ms}-{n}"));
+        n += 1;
+    }
+    candidate
 }
 
 /// Atomically writes settings (`<path>.tmp` then rename), creating the folder if needed.
@@ -223,11 +262,58 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("settings.toml");
         fs::write(&p, "shape = [").unwrap();
-        assert_eq!(load(&p), Settings::default());
+        let (s, status) = load_with_status(&p);
+        assert_eq!(status, LoadStatus::Corrupt);
+        // Defaults, but not a first run: nothing is imported or registered again.
+        assert!(s.first_run_done);
         assert_eq!(
-            fs::read(d.path().join("settings.toml.bad")).unwrap(),
-            b"shape = ["
+            s,
+            Settings {
+                first_run_done: true,
+                ..Settings::default()
+            }
         );
+        let bad: Vec<_> = fs::read_dir(d.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.starts_with("settings.toml.bad-"))
+            .collect();
+        assert_eq!(bad.len(), 1, "{bad:?}");
+        assert_eq!(fs::read(d.path().join(&bad[0])).unwrap(), b"shape = [");
+    }
+
+    #[test]
+    fn earlier_bad_copies_are_kept() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("settings.toml");
+        fs::write(&p, "shape = [").unwrap();
+        let _ = load(&p);
+        fs::write(&p, "material = {").unwrap();
+        let _ = load(&p);
+        let mut contents: Vec<Vec<u8>> = fs::read_dir(d.path())
+            .unwrap()
+            .map(|e| e.unwrap())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("settings.toml.bad-")
+            })
+            .map(|e| fs::read(e.path()).unwrap())
+            .collect();
+        contents.sort();
+        assert_eq!(
+            contents,
+            vec![b"material = {".to_vec(), b"shape = [".to_vec()]
+        );
+    }
+
+    #[test]
+    fn missing_and_good_files_report_their_status() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("settings.toml");
+        assert_eq!(load_with_status(&p).1, LoadStatus::Missing);
+        fs::write(&p, "shape = \"full\"").unwrap();
+        assert_eq!(load_with_status(&p).1, LoadStatus::Loaded);
     }
 
     #[test]
