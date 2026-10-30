@@ -1,5 +1,7 @@
 //! BarVisual against a real compositor and GPU device (no window needed).
 
+use std::sync::Arc;
+
 use vitro_core::image::BgraImage;
 use vitro_core::layout::{compute_layout, BarLayout, LayoutInput, Rect};
 use vitro_core::settings::{HoverEffect, IconSize, Material, Position, Shape};
@@ -66,7 +68,7 @@ fn update_draws_only_what_changed() {
     let l = layout(Shape::Pill, 2);
     let mut items = vec![
         ItemState {
-            icon: Some(icon(30)),
+            icon: Some(Arc::new(icon(30))),
             dots: 2,
             active: true,
             ..Default::default()
@@ -101,24 +103,37 @@ fn update_draws_only_what_changed() {
         "plate and dots are shapes, not surfaces"
     );
 
-    items[1].icon = Some(icon(30));
+    items[1].icon = Some(Arc::new(icon(30)));
     bar.update(&l, &items, "12:35\n30/10/2026", &style, &hover)
         .unwrap();
     assert_eq!(bar.surfaces_drawn(), 6, "the arriving icon is drawn once");
+
+    // Same pixels in a new Arc count as a new icon (identity, not pixel comparison) ...
+    items[1].icon = Some(Arc::new(icon(30)));
+    bar.update(&l, &items, "12:35\n30/10/2026", &style, &hover)
+        .unwrap();
+    assert_eq!(bar.surfaces_drawn(), 7);
+    // ... and the same Arc again is unchanged.
+    bar.update(&l, &items, "12:35\n30/10/2026", &style, &hover)
+        .unwrap();
+    assert_eq!(bar.surfaces_drawn(), 7);
 
     bar.invalidate();
     bar.update(&l, &items, "12:35\n30/10/2026", &style, &hover)
         .unwrap();
     assert_eq!(
         bar.surfaces_drawn(),
-        11,
+        12,
         "after invalidate everything is redrawn"
     );
+    assert_eq!(bar.app_cells(), 2);
 
-    // Fewer apps: cells are removed, nothing redrawn.
+    // Fewer apps: the extra cell is removed, the rest only moves (no surface redrawn).
     let l1 = layout(Shape::Pill, 1);
     bar.update(&l1, &items[..1], "12:35\n30/10/2026", &style, &hover)
         .unwrap();
+    assert_eq!(bar.app_cells(), 1, "the second app's cell is removed");
+    assert_eq!(bar.surfaces_drawn(), 12, "moving cells redraws no surface");
 }
 
 #[test]

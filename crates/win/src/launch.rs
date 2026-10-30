@@ -1,7 +1,9 @@
 //! Launching pins, switching between windows and opening the stock shell panels.
 //!
 //! Nothing here waits on another app's thread: window state changes are asynchronous
-//! (`ShowWindowAsync`, `PostMessageW`), so a hung app cannot freeze the bar.
+//! (`ShowWindowAsync`, `PostMessageW`), so a hung app cannot freeze the bar. Launching
+//! (`launch_pin`, the `open_stock_*` URIs) can block for seconds: callers on the UI thread run
+//! it on a worker. Failures never show shell error dialogs (`SEE_MASK_FLAG_NO_UI`).
 
 use vitro_core::settings::Pin;
 use windows::core::{w, Error, Result, HSTRING, PCWSTR};
@@ -12,8 +14,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VIRTUAL_KEY, VK_CONTROL, VK_ESCAPE,
 };
 use windows::Win32::UI::Shell::{
-    ApplicationActivationManager, IApplicationActivationManager, ShellExecuteExW, ShellExecuteW,
-    AO_NONE, SHELLEXECUTEINFOW,
+    ApplicationActivationManager, IApplicationActivationManager, ShellExecuteExW, AO_NONE,
+    SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     IsIconic, PostMessageW, SetForegroundWindow, ShowWindowAsync, SW_MINIMIZE, SW_RESTORE,
@@ -21,6 +23,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 /// Starts a pinned app: packaged apps by AUMID, everything else through the shell.
+/// Blocking; needs COM initialised on the calling thread.
 pub fn launch_pin(p: &Pin) -> Result<()> {
     if let Some(aumid) = p.aumid.as_deref().filter(|a| !a.is_empty()) {
         // SAFETY: plain COM activation on the calling (STA) thread.
@@ -36,9 +39,14 @@ pub fn launch_pin(p: &Pin) -> Result<()> {
         .as_deref()
         .filter(|s| !s.is_empty())
         .ok_or_else(|| Error::new(E_INVALIDARG, "pin has neither AUMID nor path"))?;
-    let file = HSTRING::from(path);
+    shell_open(&HSTRING::from(path))
+}
+
+fn shell_open(file: &HSTRING) -> Result<()> {
     let mut info = SHELLEXECUTEINFOW {
         cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+        // NOASYNC: the call may run on a worker thread that does not pump messages.
+        fMask: SEE_MASK_FLAG_NO_UI | SEE_MASK_NOASYNC,
         lpVerb: w!("open"),
         lpFile: PCWSTR(file.as_ptr()),
         nShow: SW_SHOWNORMAL.0,
@@ -107,26 +115,12 @@ pub fn open_stock_start() {
     }
 }
 
-fn open_uri(uri: PCWSTR) {
-    // SAFETY: static strings; the shell copies what it needs.
-    unsafe {
-        ShellExecuteW(
-            None,
-            w!("open"),
-            uri,
-            PCWSTR::null(),
-            PCWSTR::null(),
-            SW_SHOWNORMAL,
-        );
-    }
+/// Quick Settings (Wi-Fi, volume, battery). Blocking.
+pub fn open_stock_quick_settings() -> Result<()> {
+    shell_open(&HSTRING::from("ms-actioncenter:controlcenter/"))
 }
 
-/// Quick Settings (Wi-Fi, volume, battery).
-pub fn open_stock_quick_settings() {
-    open_uri(w!("ms-actioncenter:controlcenter/"));
-}
-
-/// Notification centre and calendar.
-pub fn open_stock_notifications() {
-    open_uri(w!("ms-actioncenter:"));
+/// Notification centre and calendar. Blocking.
+pub fn open_stock_notifications() -> Result<()> {
+    shell_open(&HSTRING::from("ms-actioncenter:"))
 }

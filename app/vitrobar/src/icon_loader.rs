@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use vitro_core::image::BgraImage;
@@ -42,12 +43,12 @@ type Key = (IconSrc, u32);
 
 enum Slot {
     Pending,
-    Ready(BgraImage),
+    Ready(Arc<BgraImage>),
     Failed(Instant),
 }
 
 pub enum Lookup<'a> {
-    Ready(&'a BgraImage),
+    Ready(&'a Arc<BgraImage>),
     Pending,
     Failed,
 }
@@ -131,7 +132,7 @@ impl IconLoader {
         let mut any = false;
         while let Ok((key, image)) = self.rx.try_recv() {
             let slot = match image {
-                Some(img) => Slot::Ready(img),
+                Some(img) => Slot::Ready(Arc::new(img)),
                 None => Slot::Failed(Instant::now()),
             };
             self.slots.insert(key, slot);

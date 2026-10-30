@@ -5,6 +5,7 @@
 //! only the visuals that changed; text and icons are drawn into surfaces once and reused.
 //! Positions come from the layout in DIPs and are snapped to the window's physical pixels.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use vitro_core::image::BgraImage;
@@ -24,9 +25,11 @@ use crate::material::{backdrop_visual, color};
 use crate::surfaces::{FontKind, Painter};
 
 /// What an app item shows. `dots` is the number of running windows, capped at 3.
+/// The icon is shared with the icon store, never copied; a different `Arc` counts as a
+/// different icon (it is redrawn), the same `Arc` as unchanged.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ItemState {
-    pub icon: Option<BgraImage>,
+    pub icon: Option<Arc<BgraImage>>,
     pub dots: u8,
     pub active: bool,
     pub attention: bool,
@@ -96,7 +99,7 @@ enum Content {
         h: i32,
     },
     /// Icon centred in the cell, `dy` px above centre.
-    Icon { image: BgraImage, dy: i32 },
+    Icon { image: IconRef, dy: i32 },
     /// Rounded square of `size` px in place of an icon that has not loaded yet.
     Placeholder {
         size: i32,
@@ -104,6 +107,16 @@ enum Content {
         dy: i32,
         radius: i32,
     },
+}
+
+/// An icon compared by identity (`Arc::ptr_eq`), so diffing never compares pixels.
+#[derive(Clone, Debug)]
+struct IconRef(Arc<BgraImage>);
+
+impl PartialEq for IconRef {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -314,12 +327,12 @@ impl Cell {
             Content::Icon { image, dy } => {
                 self.placeholder.visual.SetIsVisible(false)?;
                 if redraw {
-                    let surface = painter.image(image)?;
+                    let surface = painter.image(&image.0)?;
                     self.sprite
                         .SetBrush(&comp.CreateSurfaceBrushWithSurface(&surface)?)?;
                     drawn = 1;
                 }
-                let (w, h) = (image.width as i32, image.height as i32);
+                let (w, h) = (image.0.width as i32, image.0.height as i32);
                 let x = (r.w - w) / 2;
                 let y = (r.h - h) / 2 - dy;
                 self.sprite.SetSize(Vector2::new(w as f32, h as f32))?;
@@ -471,6 +484,11 @@ impl BarVisual {
         self.surfaces_drawn
     }
 
+    /// Number of app items currently in the tree (diagnostics and tests).
+    pub fn app_cells(&self) -> usize {
+        self.apps.iter().flatten().count()
+    }
+
     /// Takes effect on the next [`BarVisual::update`].
     pub fn set_env(&mut self, env: VisualEnv) {
         self.env = env;
@@ -601,7 +619,7 @@ impl BarVisual {
                     let icon_px = px(r.h.min(r.w) * 0.6).clamp(1, 96);
                     let content = match &it.icon {
                         Some(img) if img.is_valid() && img.width > 0 => Content::Icon {
-                            image: img.clone(),
+                            image: IconRef(Arc::clone(img)),
                             dy: icon_dy,
                         },
                         _ => Content::Placeholder {

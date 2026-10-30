@@ -6,6 +6,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 use vitro_core::clock::ms_until_next_minute;
 use vitro_core::layout::{compute_layout, metrics, BarLayout, LayoutInput, Rect};
@@ -19,17 +20,11 @@ use vitro_render::compositor::{init_compositor, Comp};
 use vitro_render::device::{create_gpu_device, GpuDevice};
 use vitro_render::surfaces::{FontKind, Painter};
 use vitro_win::desktops::Desktops;
-use vitro_win::launch::{
-    activate_window, launch_pin, minimize_window, open_stock_notifications,
-    open_stock_quick_settings, open_stock_start,
-};
+use vitro_win::launch::{activate_window, minimize_window, open_stock_start};
 use vitro_win::monitors::{list_monitors, MonitorInfo};
 use vitro_win::system_theme::{read_system_theme, SystemTheme};
 use vitro_win::time_format::clock_now;
-use vitro_win::window_tracker::{
-    shell_hook_message_id, take_window_event, translate_shell_hook, WindowEvent, WindowTracker,
-    WM_VITRO_WINDOW_EVENT,
-};
+use vitro_win::window_tracker::{WindowEvent, WindowTracker};
 use windows::core::{Error, Result, BOOL};
 use windows::Win32::Foundation::{E_FAIL, HWND, LPARAM, WAIT_FAILED, WAIT_OBJECT_0, WPARAM};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
@@ -38,14 +33,13 @@ use windows::Win32::System::Threading::{GetCurrentThreadId, INFINITE};
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetForegroundWindow, KillTimer, MsgWaitForMultipleObjectsEx, PeekMessageW,
     PostThreadMessageW, SetTimer, TranslateMessage, MSG, MWMO_INPUTAVAILABLE, PM_REMOVE,
-    QS_ALLINPUT, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_QUIT, WM_TIMER,
+    QS_ALLINPUT, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_QUIT,
 };
 
 use crate::bar_window::{create_bar_window, hit_test, mouse_pos, BarWindow, Hit, PxRect};
 use crate::icon_loader::{IconLoader, IconSrc, Lookup, MAX_ICON_PX};
-use crate::notify::{
-    NotifyWindow, TIMER_CLOCK, TIMER_GPU_RETRY, WM_APP_CLOCK, WM_APP_ICON, WM_APP_THEME,
-};
+use crate::launcher::{Job, Launcher};
+use crate::notify::{take_inbox, Inbox, NotifyWindow, TIMER_CLOCK, TIMER_GPU_RETRY};
 use crate::window_set::WindowSet;
 
 /// Command-line options for the bar process.
@@ -165,6 +159,7 @@ struct App {
     bars: Vec<Bar>,
     tracker: WindowTracker,
     icons: IconLoader,
+    launcher: Launcher,
     notify: NotifyWindow,
     desktops: Desktops,
     painter: Painter,
@@ -189,6 +184,8 @@ struct App {
     /// Bar window currently tracked for WM_MOUSELEAVE.
     tracking: Option<HWND>,
     gpu_lost: bool,
+    /// The minute timer could not be armed; retried on the next flush.
+    clock_unarmed: bool,
     last_dump: String,
 }
 
@@ -215,10 +212,12 @@ impl App {
         let tracker = WindowTracker::start(notify.hwnd)?;
         let icons =
             IconLoader::start(notify.hwnd).map_err(|e| Error::new(E_FAIL, e.to_string()))?;
+        let launcher = Launcher::start(None).map_err(|e| Error::new(E_FAIL, e.to_string()))?;
         let mut app = Self {
             bars: Vec::new(),
             tracker,
             icons,
+            launcher,
             notify,
             desktops,
             painter,
@@ -255,6 +254,7 @@ impl App {
             pressed: None,
             tracking: None,
             gpu_lost: false,
+            clock_unarmed: false,
             last_dump: String::new(),
         };
         app.tick_clock();
@@ -327,7 +327,9 @@ impl App {
         // A few ms late rather than early, so the new minute is already there.
         let wait = ms_until_next_minute(into_minute) + 15;
         // SAFETY: timer on our own window; re-setting the id replaces the previous one.
-        unsafe { SetTimer(Some(self.notify.hwnd), TIMER_CLOCK, wait, None) };
+        let id = unsafe { SetTimer(Some(self.notify.hwnd), TIMER_CLOCK, wait, None) };
+        // On failure (out of timers / quota) the next flush tries again; any message wakes it.
+        self.clock_unarmed = id == 0;
         if text == self.clock_text {
             return false;
         }
@@ -350,7 +352,7 @@ impl App {
             for src in icon_sources(g) {
                 match self.icons.get(&src, icon_px) {
                     Lookup::Ready(img) => {
-                        icon = Some(img.clone());
+                        icon = Some(Arc::clone(img));
                         break;
                     }
                     // Wait for this source before trying the next one.
@@ -380,7 +382,8 @@ impl App {
 
     /// `retry`: after a lost device is recovered mid-draw, draw once more (only once).
     fn refresh_once(&mut self, retry: bool) -> Result<()> {
-        if self.gpu_lost && !self.recover_gpu() {
+        if self.gpu_lost {
+            // Recovery is driven by the removal event and the one-shot retry timer only.
             return Ok(());
         }
         let layout = self.compute_layout();
@@ -563,7 +566,9 @@ impl App {
                 unsafe {
                     let _ = KillTimer(Some(self.notify.hwnd), TIMER_GPU_RETRY);
                 }
-                dirty.visuals = true;
+                if self.gpu_lost && self.recover_gpu() {
+                    dirty.visuals = true;
+                }
             }
             other => self.tracker.on_timer(other),
         }
@@ -593,13 +598,15 @@ impl App {
                 }
             }
             WM_MOUSELEAVE => {
+                // With several bar windows (Islands) the move into the next window can arrive
+                // before the leave of the previous one: only the tracked window's leave counts.
                 if self.tracking == Some(msg.hwnd) {
                     self.tracking = None;
-                }
-                if self.hover.is_some() || self.pressed.is_some() {
-                    self.hover = None;
-                    self.pressed = None;
-                    dirty.visuals = true;
+                    if self.hover.is_some() || self.pressed.is_some() {
+                        self.hover = None;
+                        self.pressed = None;
+                        dirty.visuals = true;
+                    }
                 }
             }
             WM_LBUTTONDOWN => {
@@ -623,8 +630,8 @@ impl App {
     fn click(&mut self, hit: Hit) {
         match hit {
             Hit::Start => open_stock_start(),
-            Hit::Quick => open_stock_quick_settings(),
-            Hit::Clock => open_stock_notifications(),
+            Hit::Quick => self.launcher.launch(Job::QuickSettings),
+            Hit::Clock => self.launcher.launch(Job::Notifications),
             Hit::App(i) => {
                 let Some(g) = self.groups.get(i) else { return };
                 // The bar never takes focus, so the foreground window is the user's app.
@@ -635,9 +642,7 @@ impl App {
                 match action {
                     ClickAction::Launch(p) => {
                         if let Some(pin) = self.settings.pins.get(p) {
-                            if let Err(e) = launch_pin(pin) {
-                                eprintln!("vitrobar: launching {:?} failed: {e}", pin.name);
-                            }
+                            self.launcher.launch(Job::Pin(pin.clone()));
                         }
                     }
                     ClickAction::Activate(h) => {
@@ -661,6 +666,19 @@ impl App {
         if self.recover_gpu() {
             dirty.visuals = true;
         }
+    }
+
+    /// Folds what the notify window recorded into `dirty`.
+    fn absorb(&mut self, inbox: Inbox, dirty: &mut Dirty) {
+        for ev in inbox.events {
+            self.on_window_event(ev, dirty);
+        }
+        for id in inbox.timers {
+            self.on_timer(id, dirty);
+        }
+        dirty.theme |= inbox.theme;
+        dirty.clock |= inbox.clock;
+        dirty.icons |= inbox.icons;
     }
 
     /// Applies everything collected from one drain of the queue.
@@ -689,8 +707,11 @@ impl App {
         if d.icons {
             redraw |= self.icons.drain();
         }
-        if redraw || self.gpu_lost {
+        if redraw {
             self.refresh()?;
+        }
+        if self.clock_unarmed {
+            self.tick_clock();
         }
         Ok(())
     }
@@ -715,7 +736,6 @@ pub fn run(opts: Options) -> Result<()> {
     }
 
     let mut app = App::new(opts)?;
-    let shell_hook = shell_hook_message_id();
     let mut msg = MSG::default();
     'event: loop {
         let removed = app.gpu.removed_event();
@@ -738,23 +758,10 @@ pub fn run(opts: Options) -> Result<()> {
         }
         // SAFETY: standard message pump; boxed window events are reclaimed exactly once.
         while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
-            let to_notify = msg.hwnd == app.notify.hwnd;
+            // Everything for the notify window goes through its window procedure, which records
+            // it in the inbox (the same path a nested modal loop would take).
             match msg.message {
                 WM_QUIT => break 'event,
-                m if to_notify && m == WM_VITRO_WINDOW_EVENT => {
-                    // SAFETY: posted by the tracker to the notify window; taken once here.
-                    let ev = unsafe { take_window_event(msg.lParam) };
-                    app.on_window_event(ev, &mut dirty);
-                }
-                m if to_notify && m == shell_hook => {
-                    if let Some(ev) = translate_shell_hook(msg.wParam, msg.lParam) {
-                        app.on_window_event(ev, &mut dirty);
-                    }
-                }
-                WM_TIMER if to_notify => app.on_timer(msg.wParam.0, &mut dirty),
-                WM_APP_THEME if to_notify => dirty.theme = true,
-                WM_APP_CLOCK if to_notify => dirty.clock = true,
-                WM_APP_ICON if to_notify => dirty.icons = true,
                 WM_MOUSEMOVE | WM_MOUSELEAVE | WM_LBUTTONDOWN | WM_LBUTTONUP
                     if app.on_mouse(&msg, &mut dirty) => {}
                 _ => unsafe {
@@ -763,6 +770,7 @@ pub fn run(opts: Options) -> Result<()> {
                 },
             }
         }
+        app.absorb(take_inbox(), &mut dirty);
         app.flush(dirty)?;
     }
     drop(app);
