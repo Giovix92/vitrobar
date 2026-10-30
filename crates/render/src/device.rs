@@ -8,7 +8,7 @@ use windows::Win32::Graphics::Direct2D::{
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11Device4, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-    D3D11_SDK_VERSION,
+    D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS, D3D11_SDK_VERSION,
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIDevice, IDXGIFactory6,
@@ -56,7 +56,11 @@ fn create_devices() -> Result<Devices> {
             &adapter,
             D3D_DRIVER_TYPE_UNKNOWN,
             HMODULE::default(),
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            // No driver worker threads: Vitrobar draws a few small surfaces only on change,
+            // and the threads' buffers cost ~1 MB of private bytes (measured with the
+            // memprobe example on an AMD iGPU, Task 16).
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT
+                | D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS,
             None,
             D3D11_SDK_VERSION,
             Some(&mut d3d),
