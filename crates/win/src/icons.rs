@@ -49,9 +49,9 @@ pub fn load_icon(src: IconSource, size_px: u32) -> Option<BgraImage> {
             unsafe { render_icon(icon, size_px) }
         }
         IconSource::TrayHandle(v) => {
-            let handle = HICON(v as usize as *mut c_void);
-            // SAFETY: CopyIcon returns Err on an invalid handle; the copy is ours
-            // and is destroyed right after drawing.
+            let handle = HICON(v as i32 as isize as *mut c_void); // 32-bit handle, sign-extended
+                                                                  // SAFETY: CopyIcon returns Err on an invalid handle; the copy is ours
+                                                                  // and is destroyed right after drawing.
             unsafe {
                 let copy = CopyIcon(handle).ok()?;
                 let img = render_icon(copy, size_px);
@@ -78,8 +78,9 @@ fn window_icon(h: HWND) -> Option<HICON> {
             )
         };
         if ok.0 == 0 {
-            // Timed out or hung: do not keep poking a stuck window.
-            return None;
+            // Timed out or hung: at most one 100 ms wait per call. Skip the
+            // remaining message and use the class icon (sends no message).
+            break;
         }
         if result != 0 {
             return Some(HICON(result as *mut c_void));
@@ -101,8 +102,9 @@ fn load_shell_item(parsing_name: &str, size_px: u32) -> Option<BgraImage> {
         cy: size_px as i32,
     };
     // SAFETY: plain COM call; the returned HBITMAP is ours to delete.
-    // The shell occasionally fails the very first request while its icon cache is
-    // cold; one retry is enough.
+    // Observed once: the very first GetImage after a fresh build failed and a
+    // rerun succeeded. The cause is unknown; we retry once, only if the first
+    // call failed.
     let hbmp = unsafe { factory.GetImage(size, SIIGBF_ICONONLY) }
         .or_else(|_| unsafe { factory.GetImage(size, SIIGBF_ICONONLY) })
         .ok()?;
@@ -327,23 +329,32 @@ impl IconCache {
     /// Returns the cached icon or loads it; failures are not cached.
     pub fn get(&mut self, src: IconSource, size_px: u32) -> Option<&BgraImage> {
         let key = key_of(&src);
-        if let Some(i) = self
-            .entries
-            .iter()
-            .position(|e| e.size == size_px && e.key == key)
-        {
-            let e = self.entries.remove(i);
-            self.entries.push(e);
-        } else {
+        if !self.touch(&key, size_px) {
             let image = load_icon(src, size_px)?;
             self.push(key, size_px, image);
         }
         self.entries.last().map(|e| &e.image)
     }
 
+    /// Moves an existing entry to the most-recent position.
+    fn touch(&mut self, key: &str, size: u32) -> bool {
+        match self
+            .entries
+            .iter()
+            .position(|e| e.size == size && e.key == key)
+        {
+            Some(i) => {
+                let e = self.entries.remove(i);
+                self.entries.push(e);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Drops every cached size for this window handle.
     pub fn invalidate_window(&mut self, h: HWND) {
-        let key = format!("hwnd:{}", h.0 as usize);
+        let key = key_of(&IconSource::Window(h));
         self.entries.retain(|e| e.key != key);
     }
 
@@ -353,9 +364,79 @@ impl IconCache {
         }
         self.entries.push(Entry { key, size, image });
     }
+}
 
-    #[doc(hidden)]
-    pub fn insert_for_test(&mut self, key: String, size: u32) {
-        self.push(key, size, BgraImage::new(1, 1));
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn has(c: &IconCache, k: &str) -> bool {
+        c.entries.iter().any(|e| e.key == k)
+    }
+
+    fn fill(c: &mut IconCache, n: usize) {
+        for i in 0..n {
+            c.push(format!("path:{i}"), 16, BgraImage::new(1, 1));
+        }
+    }
+
+    #[test]
+    fn evicts_oldest_at_capacity() {
+        let mut c = IconCache::new();
+        fill(&mut c, 257);
+        assert_eq!(c.len(), 256);
+        assert!(!has(&c, "path:0"));
+        assert!(has(&c, "path:1"));
+        assert!(has(&c, "path:256"));
+    }
+
+    #[test]
+    fn touched_entry_survives_eviction() {
+        let mut c = IconCache::new();
+        fill(&mut c, 256);
+        assert!(c.touch("path:0", 16));
+        c.push("path:new".into(), 16, BgraImage::new(1, 1));
+        assert!(has(&c, "path:0"), "touched key survives");
+        assert!(!has(&c, "path:1"), "next-oldest evicted");
+        assert!(has(&c, "path:new"));
+        assert_eq!(c.len(), 256);
+    }
+
+    #[test]
+    fn invalidate_window_removes_all_sizes_only_for_that_window() {
+        let mut c = IconCache::new();
+        let h = HWND(0x1234 as *mut c_void);
+        let other = HWND(0x99 as *mut c_void);
+        c.push(key_of(&IconSource::Window(h)), 16, BgraImage::new(1, 1));
+        c.push(key_of(&IconSource::Window(h)), 32, BgraImage::new(1, 1));
+        c.push(key_of(&IconSource::Window(other)), 16, BgraImage::new(1, 1));
+        c.invalidate_window(h);
+        assert_eq!(c.len(), 1);
+        assert!(has(&c, &key_of(&IconSource::Window(other))));
+    }
+
+    #[test]
+    fn zero_alpha_becomes_opaque() {
+        let mut b = [10, 20, 30, 0, 1, 2, 3, 0];
+        normalize_alpha(&mut b);
+        assert_eq!(b, [10, 20, 30, 255, 1, 2, 3, 255]);
+    }
+
+    #[test]
+    fn straight_alpha_is_premultiplied() {
+        let mut b = [200, 200, 200, 128, 0, 0, 0, 0];
+        normalize_alpha(&mut b);
+        assert_eq!(b[3], 128);
+        for c in &b[..3] {
+            assert!((*c as i32 - 100).abs() <= 1, "got {c}");
+        }
+    }
+
+    #[test]
+    fn premultiplied_is_unchanged() {
+        let mut b = [100, 100, 100, 128, 0, 0, 0, 0];
+        let before = b;
+        normalize_alpha(&mut b);
+        assert_eq!(b, before);
     }
 }

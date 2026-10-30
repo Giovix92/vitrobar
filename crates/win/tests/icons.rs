@@ -123,23 +123,3 @@ fn cache_hits_and_skips_negatives() {
     assert!(c.get(IconSource::Path(NOTEPAD), 16).is_some());
     assert_eq!(c.len(), 2, "size is part of the key");
 }
-
-#[test]
-fn cache_is_lru_bounded() {
-    let mut c = IconCache::new();
-    for i in 0..300u32 {
-        c.insert_for_test(format!("path:{i}"), 16);
-    }
-    assert_eq!(c.len(), 256);
-}
-
-#[test]
-fn invalidate_window_removes_its_entries() {
-    let mut c = IconCache::new();
-    let h = HWND(0x1234 as *mut _);
-    c.insert_for_test(format!("hwnd:{}", h.0 as usize), 16);
-    c.insert_for_test(format!("hwnd:{}", h.0 as usize), 32);
-    c.insert_for_test("hwnd:99".into(), 16);
-    c.invalidate_window(h);
-    assert_eq!(c.len(), 1);
-}
