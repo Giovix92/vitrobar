@@ -82,7 +82,9 @@ fn activate_aumid(aumid: &str) -> Result<()> {
     Ok(())
 }
 
-fn shell_open(file: &HSTRING) -> Result<()> {
+/// Opens `file` (a path, shortcut or URI such as `ms-settings:`) with its default handler,
+/// without shell error dialogs. Blocking; needs COM initialised on the calling thread.
+pub fn shell_open(file: &HSTRING) -> Result<()> {
     let mut info = SHELLEXECUTEINFOW {
         cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
         // NOASYNC: the call may run on a worker thread that does not pump messages.

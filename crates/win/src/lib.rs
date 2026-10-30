@@ -1,13 +1,18 @@
 //! vitro-win: Win32 / WinRT system queries and integration.
 
+pub mod account;
 pub mod appbar;
 pub mod autostart;
+pub mod catalog;
+pub mod clipboard;
 pub mod desktops;
 pub mod event_queue;
+pub mod file_search;
 pub mod icons;
 pub mod launch;
 pub mod monitors;
 pub mod pins_import;
+pub mod power;
 pub mod stock_taskbar;
 pub mod system_theme;
 pub mod time_format;

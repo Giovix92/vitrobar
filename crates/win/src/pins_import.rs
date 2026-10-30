@@ -411,7 +411,7 @@ pub fn read_link(path: &Path) -> Option<LinkInfo> {
 }
 
 /// Display name of an installed packaged app, `None` if it is not installed.
-fn packaged_app_name(aumid: &str) -> Option<String> {
+pub(crate) fn packaged_app_name(aumid: &str) -> Option<String> {
     let name = HSTRING::from(format!(r"shell:AppsFolder\{aumid}"));
     // SAFETY: `name` outlives the call; the display name is ours to free.
     unsafe {
@@ -446,7 +446,7 @@ fn links_in(dir: &Path) -> Vec<(PathBuf, SystemTime)> {
 }
 
 /// `.lnk` files under `dir` (depth-limited, sorted for a stable result).
-fn links_under(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+pub(crate) fn links_under(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
     };
@@ -471,7 +471,7 @@ fn pinned_folder() -> Option<PathBuf> {
     Some(env_path("APPDATA")?.join(r"Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar"))
 }
 
-fn start_menu_folders() -> Vec<PathBuf> {
+pub(crate) fn start_menu_folders() -> Vec<PathBuf> {
     [
         ("APPDATA", r"Microsoft\Windows\Start Menu\Programs"),
         ("ProgramData", r"Microsoft\Windows\Start Menu\Programs"),
@@ -498,7 +498,7 @@ enum Source {
     Packaged(String),
 }
 
-fn pin_from_link(path: &Path) -> Option<Pin> {
+pub(crate) fn pin_from_link(path: &Path) -> Option<Pin> {
     let info = read_link(path)?;
     let name = path.file_stem()?.to_string_lossy().into_owned();
     let target = (!info.target.is_empty()).then_some(info.target);
