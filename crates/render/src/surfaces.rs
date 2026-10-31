@@ -299,7 +299,8 @@ impl Painter {
     }
 
     /// `s` word-wrapped to `w_px`, at most `max_lines` lines (the last one ends in an
-    /// ellipsis when the text is longer). Returns the surface and its height in px.
+    /// ellipsis when the text is longer), each line centred when `centred`. Returns the surface and its height in px.
+    #[allow(clippy::too_many_arguments)]
     pub fn text_wrapped(
         &self,
         s: &str,
@@ -308,6 +309,7 @@ impl Painter {
         color: Rgba,
         w_px: u32,
         max_lines: u32,
+        centred: bool,
     ) -> Result<(CompositionDrawingSurface, u32)> {
         let max_lines = max_lines.max(1);
         let layout = self.layout(s, kind, size_px, w_px.max(1) as f32, 100_000.0)?;
@@ -319,7 +321,11 @@ impl Painter {
         };
         // SAFETY: plain DirectWrite calls on an object we own.
         unsafe {
-            layout.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)?;
+            layout.SetTextAlignment(if centred {
+                DWRITE_TEXT_ALIGNMENT_CENTER
+            } else {
+                DWRITE_TEXT_ALIGNMENT_LEADING
+            })?;
             layout.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR)?;
             layout.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP)?;
         }

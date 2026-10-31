@@ -224,6 +224,22 @@ fn rank<'a>(
 }
 
 pub fn search(query: &str, apps: &[Pin], files: &[FileHit], lang: Lang) -> SearchResults {
+    search_capped(query, apps, files, lang, MAX_APPS)
+}
+
+/// [`search`] for the full-screen grid: every matching app is listed (the other kinds keep
+/// their caps), best first.
+pub fn search_grid(query: &str, apps: &[Pin], files: &[FileHit], lang: Lang) -> SearchResults {
+    search_capped(query, apps, files, lang, usize::MAX)
+}
+
+fn search_capped(
+    query: &str,
+    apps: &[Pin],
+    files: &[FileHit],
+    lang: Lang,
+    max_apps: usize,
+) -> SearchResults {
     let trimmed = query.trim();
     let mut items = Vec::new();
     if trimmed.is_empty() {
@@ -246,7 +262,7 @@ pub fn search(query: &str, apps: &[Pin], files: &[FileHit], lang: Lang) -> Searc
             apps.iter()
                 .enumerate()
                 .map(|(i, p)| (i, vec![p.name.as_str()])),
-            MAX_APPS,
+            max_apps,
             0,
         )
         .into_iter()

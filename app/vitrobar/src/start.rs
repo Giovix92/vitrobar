@@ -14,9 +14,11 @@ use std::time::{Duration, Instant};
 use vitro_core::calc::format_result;
 use vitro_core::i18n::{tr, Key, Lang};
 use vitro_core::layout::Rect;
-use vitro_core::search::{fold, search, FileHit, ResultKind, SETTINGS_PAGES};
+use vitro_core::search::{fold, search, search_grid, FileHit, ResultKind, SETTINGS_PAGES};
 use vitro_core::settings::Pin;
-use vitro_core::start_layout::{StartLayout, RESULT_ROW_H_DIP};
+use vitro_core::start_layout::{
+    grid_layout, StartLayout, GRID_CELL_DIP, GRID_GAP_DIP, RESULT_ROW_H_DIP,
+};
 use vitro_core::style::{MaterialStyle, Rgba};
 use vitro_core::text_input::TextInput;
 use vitro_render::compositor::Comp;
@@ -45,6 +47,12 @@ pub const ICON_DIP: f32 = 32.0;
 pub const CATALOG_MAX_AGE: Duration = Duration::from_secs(60);
 /// The account page the account button opens.
 pub const ACCOUNT_URI: &str = "ms-settings:yourinfo";
+/// Icons in the full-screen grid are drawn this big.
+pub const GRID_ICON_DIP: f32 = 48.0;
+/// Alpha (of 255) the full-screen grid's frosted tint gets: 0.12.
+const GRID_TINT_ALPHA: u8 = 31;
+/// Grid rows drawn beyond the visible ones (above and below).
+const GRID_SLACK_ROWS: usize = 2;
 /// Rows the wheel moves per notch.
 const WHEEL_ROWS: f32 = 3.0;
 /// All-apps rows drawn beyond the visible ones (above and below).
@@ -208,9 +216,87 @@ pub struct Geom {
     /// The All-apps list viewport.
     pub list: PxRect,
     pub row_h: i32,
+    /// Set in the full-screen grid layout (the panel fields above are then empty).
+    pub grid: Option<GridGeom>,
+}
+
+/// The full-screen grid's geometry in panel client px.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GridGeom {
+    pub cols: usize,
+    /// Cell side and the distance between cell origins.
+    pub cell: i32,
+    pub step: i32,
+    /// Left edge of column 0 and top edge of row 0 (when no result rows are above the grid).
+    pub x0: i32,
+    pub top: i32,
+}
+
+/// The tint of the full-screen grid: the material's own with alpha 0.12 when it is frosted
+/// (a solid material has nothing behind it to show through, so it stays as it is).
+pub fn grid_style(style: &MaterialStyle) -> MaterialStyle {
+    let mut s = *style;
+    if s.backdrop_blur {
+        s.tint.3 = GRID_TINT_ALPHA;
+    }
+    s
 }
 
 impl Geom {
+    /// The full-screen grid's layout for a panel of `work` DIP (origin 0,0) at `scale`.
+    pub fn new_grid(work: Rect, scale: f32) -> Self {
+        let gl = grid_layout(work, 1);
+        let p = |v: f32| (v * scale).round() as i32;
+        let empty = (0, 0, 0, 0);
+        let cell = gl.cells.first().copied().unwrap_or(Rect {
+            x: 0.0,
+            y: 0.0,
+            w: GRID_CELL_DIP,
+            h: GRID_CELL_DIP,
+        });
+        Self {
+            scale,
+            size: (p(work.w), p(work.h)),
+            search: px_rect(gl.search, work, scale),
+            pins_title: empty,
+            all_apps: empty,
+            pins: Vec::new(),
+            recent_title: empty,
+            recent: Vec::new(),
+            footer: empty,
+            account: empty,
+            power: empty,
+            results: Vec::new(),
+            results_view: empty,
+            list: empty,
+            row_h: (RESULT_ROW_H_DIP * scale).round().max(1.0) as i32,
+            grid: Some(GridGeom {
+                cols: gl.cols,
+                cell: p(GRID_CELL_DIP),
+                step: p(GRID_CELL_DIP + GRID_GAP_DIP),
+                x0: p(cell.x),
+                top: p(cell.y),
+            }),
+        }
+    }
+
+    /// Top of the scrolling grid when `n_top` result rows sit above it.
+    pub fn grid_view_top(&self, n_top: usize) -> i32 {
+        self.grid.as_ref().map_or(0, |g| g.top) + n_top as i32 * self.row_h
+    }
+
+    /// Height of the scrolling grid viewport.
+    pub fn grid_view_h(&self, n_top: usize) -> i32 {
+        (self.size.1 - self.grid_view_top(n_top)).max(0)
+    }
+
+    /// Whole grid rows that fit the viewport (at least 1).
+    pub fn grid_rows_visible(&self, n_top: usize) -> usize {
+        let Some(g) = &self.grid else { return 1 };
+        let gap = g.step - g.cell;
+        (((self.grid_view_h(n_top) + gap) / g.step.max(1)) as usize).max(1)
+    }
+
     pub fn new(l: &StartLayout, scale: f32) -> Self {
         let o = l.panel;
         let r = |x: Rect| px_rect(x, o, scale);
@@ -241,6 +327,7 @@ impl Geom {
                 footer.1,
             ),
             row_h: (RESULT_ROW_H_DIP * scale).round().max(1.0) as i32,
+            grid: None,
         }
     }
 
@@ -283,6 +370,21 @@ pub fn fit_results(mut items: Vec<ResultKind>, rows: usize) -> Vec<ResultKind> {
     }
 }
 
+/// The full-screen grid's results: with no query every app in catalog order; otherwise the
+/// Math/Settings/Files results first (they sit in rows above the grid), then every matching
+/// app, best first.
+pub fn grid_results(text: &str, apps: &[Pin], files: &[FileHit], lang: Lang) -> Vec<ResultKind> {
+    if text.trim().is_empty() {
+        return (0..apps.len()).map(ResultKind::App).collect();
+    }
+    let (matched, mut rows): (Vec<_>, Vec<_>) = search_grid(text, apps, files, lang)
+        .items
+        .into_iter()
+        .partition(|k| matches!(k, ResultKind::App(_)));
+    rows.extend(matched);
+    rows
+}
+
 /// What [`StartState::handle`] needs to know besides the input: geometry and content.
 pub struct StartCtx<'a> {
     pub geom: &'a Geom,
@@ -301,9 +403,28 @@ impl StartCtx<'_> {
         self.start_pins.len().min(self.geom.pins.len())
     }
 
+    /// Result rows (Math, Settings, Files) above the grid in the full-screen grid.
+    fn top_rows(&self) -> usize {
+        self.results
+            .iter()
+            .take_while(|k| !matches!(k, ResultKind::App(_)))
+            .count()
+    }
+
     /// How far the current mode's list can scroll.
     fn max_scroll(&self, mode: StartMode) -> f32 {
         let g = self.geom;
+        if let Some(gg) = &g.grid {
+            let n_top = self.top_rows();
+            let cells = self.results.len() - n_top;
+            let rows = cells.div_ceil(gg.cols.max(1)) as i32;
+            let content = if rows == 0 {
+                0
+            } else {
+                rows * gg.step - (gg.step - gg.cell)
+            };
+            return (content - g.grid_view_h(n_top)).max(0) as f32;
+        }
         let (n, h) = match mode {
             StartMode::Search => (self.results.len(), g.results_h()),
             _ => (self.rows.len(), g.list_h()),
@@ -328,6 +449,12 @@ pub struct StartState {
     /// The revision of the file results accepted last, and how many there were.
     pub files_rev: u64,
     pub files: usize,
+    /// The full-screen grid: `selected` indexes the results (rows first, then apps), the
+    /// empty query lists every app (mode `AllApps`), arrows move the focus.
+    pub grid: bool,
+    /// A key moved the grid focus (Enter launches the focused app only then, while the query
+    /// is empty).
+    pub kbd: bool,
 }
 
 impl Default for StartState {
@@ -353,12 +480,37 @@ impl StartState {
             query_rev: rev,
             files_rev: 0,
             files: 0,
+            grid: false,
+            kbd: false,
         }
     }
 
-    /// Scrolls the results so the selected row is fully visible.
+    /// The same state for the full-screen grid (all apps, no query).
+    pub fn into_grid(mut self) -> Self {
+        self.grid = true;
+        self.mode = StartMode::AllApps;
+        self
+    }
+
+    /// Scrolls the results (or the grid) so the selected item is fully visible.
     pub fn reveal_selected(&mut self, ctx: &StartCtx) {
         let g = ctx.geom;
+        if let Some(gg) = &g.grid {
+            let n_top = ctx.top_rows();
+            if self.selected >= n_top {
+                let row = ((self.selected - n_top) / gg.cols.max(1)) as i32;
+                let top = (row * gg.step) as f32;
+                let bottom = top + gg.cell as f32;
+                let h = g.grid_view_h(n_top) as f32;
+                if top < self.scroll {
+                    self.scroll = top;
+                } else if bottom > self.scroll + h {
+                    self.scroll = bottom - h;
+                }
+            }
+            self.scroll = self.scroll.clamp(0.0, ctx.max_scroll(self.mode));
+            return;
+        }
         let top = (self.selected as i32 * g.row_h) as f32;
         let bottom = top + g.row_h as f32;
         let h = g.results_h() as f32;
@@ -386,8 +538,14 @@ impl StartState {
         self.query_rev += 1;
         self.selected = 0;
         self.files = 0;
+        self.kbd = false;
         if self.input.is_empty() {
-            self.mode = StartMode::Home;
+            self.mode = if self.grid {
+                self.scroll = 0.0;
+                StartMode::AllApps
+            } else {
+                StartMode::Home
+            };
         } else {
             self.mode = StartMode::Search;
             self.scroll = 0.0;
@@ -417,7 +575,11 @@ impl StartState {
                 if self.mode == StartMode::Home {
                     return StartAction::None;
                 }
-                let step = WHEEL_ROWS * ctx.geom.row_h as f32 * delta as f32 / 120.0;
+                let notch = match &ctx.geom.grid {
+                    Some(gg) => gg.step as f32,
+                    None => WHEEL_ROWS * ctx.geom.row_h as f32,
+                };
+                let step = notch * delta as f32 / 120.0;
                 self.scroll_to(self.scroll - step, ctx)
             }
             StartInput::Move(pt) => {
@@ -485,7 +647,63 @@ impl StartState {
         }
     }
 
+    /// Keys in the full-screen grid (Esc is handled by [`Self::key`]).
+    fn grid_key(&mut self, vk: u32, ctrl: bool, ctx: &StartCtx) -> StartAction {
+        let searching = self.mode == StartMode::Search;
+        let n = ctx.results.len();
+        match vk {
+            VK_BACK | VK_DELETE if searching => {
+                match (vk, ctrl) {
+                    (VK_BACK, true) => self.input.backspace_word(),
+                    (VK_BACK, false) => self.input.backspace(),
+                    _ => self.input.delete(),
+                }
+                self.edited()
+            }
+            VK_RETURN if searching || self.kbd => self.run(self.selected, ctx),
+            VK_LEFT | VK_RIGHT | VK_UP | VK_DOWN | VK_PRIOR | VK_NEXT | VK_HOME | VK_END
+                if n > 0 =>
+            {
+                let cols = ctx.geom.grid.as_ref().map_or(1, |g| g.cols.max(1));
+                let n_top = ctx.top_rows();
+                let ngrid = n - n_top;
+                let cur = self.selected.min(n - 1);
+                let in_top = cur < n_top;
+                let g = cur.saturating_sub(n_top);
+                let page = ctx.geom.grid_rows_visible(n_top) * cols;
+                let to = match vk {
+                    VK_LEFT if !in_top && g > 0 => cur - 1,
+                    VK_RIGHT if !in_top && g + 1 < ngrid => cur + 1,
+                    VK_UP if in_top => cur.saturating_sub(1),
+                    VK_UP if g >= cols => cur - cols,
+                    VK_UP if n_top > 0 => n_top - 1,
+                    VK_DOWN if in_top => (cur + 1).min(n - 1),
+                    VK_DOWN if g + cols < ngrid => cur + cols,
+                    // A short last row has nothing below this column: the last app.
+                    VK_DOWN if g / cols < (ngrid - 1) / cols => n - 1,
+                    VK_PRIOR if !in_top => n_top + g.saturating_sub(page),
+                    VK_NEXT if in_top && ngrid > 0 => n_top,
+                    VK_NEXT if !in_top => n_top + (g + page).min(ngrid - 1),
+                    VK_HOME => 0,
+                    VK_END => n - 1,
+                    _ => cur,
+                };
+                if to == self.selected && self.kbd {
+                    return StartAction::None;
+                }
+                self.selected = to;
+                self.kbd = true;
+                self.reveal_selected(ctx);
+                StartAction::Redraw
+            }
+            _ => StartAction::None,
+        }
+    }
+
     fn key(&mut self, vk: u32, ctrl: bool, ctx: &StartCtx) -> StartAction {
+        if self.grid && vk != VK_ESCAPE {
+            return self.grid_key(vk, ctrl, ctx);
+        }
         let searching = self.mode == StartMode::Search;
         let all_apps = self.mode == StartMode::AllApps;
         match vk {
@@ -583,6 +801,28 @@ impl StartState {
         let g = ctx.geom;
         if contains(g.search, pt) {
             return Some(Target::Search);
+        }
+        if let Some(gg) = &g.grid {
+            let n_top = ctx.top_rows();
+            let (x, y) = pt;
+            if x >= g.search.0
+                && x < g.search.2
+                && y >= gg.top
+                && y < gg.top + n_top as i32 * g.row_h
+            {
+                return Some(Target::Result(((y - gg.top) / g.row_h) as usize));
+            }
+            let view_top = g.grid_view_top(n_top);
+            if y < view_top || y >= g.size.1 || x < gg.x0 {
+                return None;
+            }
+            let (cx, cy) = (x - gg.x0, y - view_top + self.scroll.round() as i32);
+            let (col, row) = ((cx / gg.step) as usize, (cy / gg.step) as usize);
+            if cx % gg.step >= gg.cell || cy % gg.step >= gg.cell || col >= gg.cols {
+                return None;
+            }
+            let idx = row * gg.cols + col;
+            return (n_top + idx < ctx.results.len()).then_some(Target::Result(n_top + idx));
         }
         if contains(g.account, pt) {
             return Some(Target::Account);
@@ -877,8 +1117,42 @@ impl StartPanel {
         title: &str,
     ) -> Result<Self> {
         let panel = Panel::show(comp, rect_px, dpi, style, PANEL_RADIUS_DIP, title, false)?;
-        let view = StartView::new(&panel)?;
         let geom = Geom::new(layout, panel.scale());
+        Self::with_panel(panel, geom, monitor)
+    }
+
+    /// Opens the full-screen grid over `rect_px` (a monitor's work area) on a monitor of
+    /// `dpi`: square corners, the frosted tint of [`grid_style`].
+    pub fn open_grid(
+        comp: &Comp,
+        rect_px: PxRect,
+        dpi: u32,
+        style: &MaterialStyle,
+        monitor: u64,
+        title: &str,
+    ) -> Result<Self> {
+        let style = grid_style(style);
+        let panel = Panel::show(comp, rect_px, dpi, &style, 0.0, title, false)?;
+        let scale = panel.scale();
+        let work = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: (rect_px.2 - rect_px.0) as f32 / scale,
+            h: (rect_px.3 - rect_px.1) as f32 / scale,
+        };
+        let geom = Geom::new_grid(work, scale);
+        let mut sp = Self::with_panel(panel, geom, monitor)?;
+        sp.state = StartState::new().into_grid();
+        Ok(sp)
+    }
+
+    /// Fades the panel in (and scales it from 98 %) over `ms`.
+    pub fn animate_open(&self, ms: u32) -> Result<()> {
+        self.panel.animate_open(ms)
+    }
+
+    fn with_panel(panel: Panel, geom: Geom, monitor: u64) -> Result<Self> {
+        let view = StartView::new(&panel)?;
         Ok(Self {
             view,
             panel,
@@ -968,8 +1242,12 @@ impl StartPanel {
         }
         self.searched = rev;
         let text = self.state.input.text();
-        let items = search(&text, &data.apps, &self.files, lang).items;
-        self.results = fit_results(items, self.geom.result_rows());
+        self.results = if self.state.grid {
+            grid_results(&text, &data.apps, &self.files, lang)
+        } else {
+            let items = search(&text, &data.apps, &self.files, lang).items;
+            fit_results(items, self.geom.result_rows())
+        };
         if !changed {
             // Same query ranked again (files or the catalog arrived): the selection stays
             // on the same item.
@@ -985,7 +1263,7 @@ impl StartPanel {
         if self.state.selected >= n {
             self.state.selected = n.saturating_sub(1);
         }
-        if self.state.mode == StartMode::Search {
+        if self.state.mode == StartMode::Search || self.state.grid {
             let ctx = StartCtx {
                 geom: &self.geom,
                 start_pins: &[],
@@ -1023,8 +1301,17 @@ impl StartPanel {
         icons: &mut IconLoader,
         src: Option<IconSrc>,
     ) -> Option<Arc<vitro_core::image::BgraImage>> {
+        self.icon_at(icons, src, ICON_DIP)
+    }
+
+    fn icon_at(
+        &mut self,
+        icons: &mut IconLoader,
+        src: Option<IconSrc>,
+        dip: f32,
+    ) -> Option<Arc<vitro_core::image::BgraImage>> {
         let src = src?;
-        let px = ((ICON_DIP * self.geom.scale).round() as u32).clamp(1, MAX_ICON_PX);
+        let px = ((dip * self.geom.scale).round() as u32).clamp(1, MAX_ICON_PX);
         let img = match icons.get(&src, px) {
             Lookup::Ready(img) => Some(Arc::clone(img)),
             _ => None,
@@ -1043,6 +1330,14 @@ impl StartPanel {
         look: &Look,
     ) -> Result<()> {
         let chrome = self.chrome_items(painter, data, look);
+        if self.geom.grid.is_some() {
+            let (page, list, viewport) = self.grid_items(icons, data, look);
+            self.view.set_layer(Layer::Chrome, painter, chrome)?;
+            self.view.set_layer(Layer::Page, painter, page)?;
+            self.view.set_viewport(Some(viewport))?;
+            self.view.set_scroll(self.state.scroll)?;
+            return self.view.set_layer(Layer::List, painter, list);
+        }
         let (page, list) = match self.state.mode {
             StartMode::Home => (self.home_items(icons, data, start_pins, look), None),
             StartMode::AllApps => {
@@ -1125,10 +1420,20 @@ impl StartPanel {
         img: Option<Arc<vitro_core::image::BgraImage>>,
         look: &Look,
     ) -> Item {
+        self.image_at(rect, img, look, ICON_DIP)
+    }
+
+    fn image_at(
+        &self,
+        rect: PxRect,
+        img: Option<Arc<vitro_core::image::BgraImage>>,
+        look: &Look,
+        dip: f32,
+    ) -> Item {
         let t = look.style.text;
         // An icon-sized square centred in `rect` (images are centred in it anyway; the
         // placeholder of an icon still loading takes its size).
-        let side = self.px(ICON_DIP).min(rect.2 - rect.0).min(rect.3 - rect.1);
+        let side = self.px(dip).min(rect.2 - rect.0).min(rect.3 - rect.1);
         let x = (rect.0 + rect.2 - side) / 2;
         let y = (rect.1 + rect.3 - side) / 2;
         Item {
@@ -1206,6 +1511,9 @@ impl StartPanel {
         let ch = self.px(18.0);
         let cy = (s.1 + s.3 - ch) / 2;
         items.push(self.plate((cx, cy, cx + self.px(1.5).max(1), cy + ch), t, 0.0));
+        if g.grid.is_some() {
+            return items;
+        }
         // Footer: account and power.
         let a = g.account;
         if let Some(p) = self.hover_plate(Target::Account, a, look) {
@@ -1359,64 +1667,172 @@ impl StartPanel {
             } else if let Some(p) = self.hover_plate(Target::Result(i), *r, look) {
                 items.push(p);
             }
-            let icon_w = self.px(44.0);
-            let glyph_box = (r.0, r.1, r.0 + icon_w, r.3);
-            let lang = look.lang;
-            let (title, sub, icon) = match kind {
-                ResultKind::Math(v) => (
-                    format!("= {}", format_result(*v, lang)),
-                    format!(
-                        "{} \u{00B7} {}",
-                        tr(lang, Key::Calculator),
-                        tr(lang, Key::CopyResult)
-                    ),
-                    Err('\u{E8EF}'),
-                ),
-                ResultKind::App(a) => {
-                    let Some(p) = data.apps.get(*a) else { continue };
-                    (
-                        p.name.clone(),
-                        tr(lang, Key::Apps).to_string(),
-                        Ok(pin_icon(p)),
-                    )
-                }
-                ResultKind::Setting(s) => {
-                    let Some(p) = SETTINGS_PAGES.get(*s) else {
-                        continue;
-                    };
-                    (
-                        tr(lang, p.key).to_string(),
-                        tr(lang, Key::SettingsPages).to_string(),
-                        Err('\u{E713}'),
-                    )
-                }
-                ResultKind::File(f) => {
-                    let Some(h) = self.files.get(*f) else {
-                        continue;
-                    };
-                    (
-                        h.name.clone(),
-                        h.path.clone(),
-                        Ok(Some(IconSrc::Path(h.path.clone()))),
-                    )
-                }
-            };
-            match icon {
-                Ok(src) => {
-                    let img = self.icon(icons, src);
-                    items.extend(self.two_line_row(*r, img, &title, &sub, look));
-                }
-                Err(glyph) => {
-                    items.push(self.glyph(glyph, glyph_box, 18.0, t));
-                    items.extend(
-                        self.two_line_row(*r, None, &title, &sub, look)
-                            .into_iter()
-                            .skip(1),
-                    );
-                }
-            }
+            items.extend(self.result_items(icons, data, look, *r, kind));
         }
         (page, items)
+    }
+
+    /// The icon (or glyph) and the two text lines of one search result in the row `r`.
+    fn result_items(
+        &mut self,
+        icons: &mut IconLoader,
+        data: &StartData,
+        look: &Look,
+        r: PxRect,
+        kind: &ResultKind,
+    ) -> Vec<Item> {
+        let t = look.style.text;
+        let icon_w = self.px(44.0);
+        let glyph_box = (r.0, r.1, r.0 + icon_w, r.3);
+        let lang = look.lang;
+        let (title, sub, icon) = match kind {
+            ResultKind::Math(v) => (
+                format!("= {}", format_result(*v, lang)),
+                format!(
+                    "{} \u{00B7} {}",
+                    tr(lang, Key::Calculator),
+                    tr(lang, Key::CopyResult)
+                ),
+                Err('\u{E8EF}'),
+            ),
+            ResultKind::App(a) => {
+                let Some(p) = data.apps.get(*a) else {
+                    return Vec::new();
+                };
+                (
+                    p.name.clone(),
+                    tr(lang, Key::Apps).to_string(),
+                    Ok(pin_icon(p)),
+                )
+            }
+            ResultKind::Setting(s) => {
+                let Some(p) = SETTINGS_PAGES.get(*s) else {
+                    return Vec::new();
+                };
+                (
+                    tr(lang, p.key).to_string(),
+                    tr(lang, Key::SettingsPages).to_string(),
+                    Err('\u{E713}'),
+                )
+            }
+            ResultKind::File(f) => {
+                let Some(h) = self.files.get(*f) else {
+                    return Vec::new();
+                };
+                (
+                    h.name.clone(),
+                    h.path.clone(),
+                    Ok(Some(IconSrc::Path(h.path.clone()))),
+                )
+            }
+        };
+        match icon {
+            Ok(src) => {
+                let img = self.icon(icons, src);
+                self.two_line_row(r, img, &title, &sub, look)
+            }
+            Err(glyph) => {
+                let mut v = vec![self.glyph(glyph, glyph_box, 18.0, t)];
+                v.extend(
+                    self.two_line_row(r, None, &title, &sub, look)
+                        .into_iter()
+                        .skip(1),
+                );
+                v
+            }
+        }
+    }
+
+    /// The full-screen grid: the result rows above it (page layer, panel px), the app cells
+    /// near the viewport (list layer, content px) and the viewport itself.
+    fn grid_items(
+        &mut self,
+        icons: &mut IconLoader,
+        data: &StartData,
+        look: &Look,
+    ) -> (Vec<Item>, Vec<Item>, PxRect) {
+        let t = look.style.text;
+        let dim = Rgba(t.0, t.1, t.2, 150);
+        let g = self.geom.clone();
+        let Some(gg) = g.grid.clone() else {
+            return (Vec::new(), Vec::new(), (0, 0, 0, 0));
+        };
+        let results = self.results.clone();
+        let n_top = results
+            .iter()
+            .take_while(|k| !matches!(k, ResultKind::App(_)))
+            .count();
+        let focus = self.state.mode == StartMode::Search || self.state.kbd;
+        let mut page = Vec::new();
+        if results.is_empty() && self.state.mode == StartMode::Search {
+            let r = (g.search.0, gg.top, g.search.2, gg.top + g.row_h);
+            page.push(self.text(tr(look.lang, Key::NoResults), r, 14.0, dim, false));
+        }
+        for (i, kind) in results.iter().take(n_top).enumerate() {
+            let y = gg.top + i as i32 * g.row_h;
+            let r = (g.search.0, y, g.search.2, y + g.row_h);
+            if i == self.state.selected && focus {
+                page.push(self.plate(r, Rgba(t.0, t.1, t.2, 30), 6.0));
+            } else if let Some(p) = self.hover_plate(Target::Result(i), r, look) {
+                page.push(p);
+            }
+            page.extend(self.result_items(icons, data, look, r, kind));
+        }
+        let view = (0, g.grid_view_top(n_top), g.size.0, g.size.1);
+        let cols = gg.cols.max(1);
+        let cells = results.len() - n_top;
+        let total_rows = cells.div_ceil(cols);
+        let rows_visible = g.grid_rows_visible(n_top);
+        let first_row = (self.state.scroll as i32 / gg.step.max(1)) as usize;
+        let start_row = first_row.saturating_sub(GRID_SLACK_ROWS);
+        let end_row = (first_row + rows_visible + GRID_SLACK_ROWS + 1).min(total_rows);
+        let pad = self.px(4.0);
+        let mut list = Vec::new();
+        for idx in (start_row * cols)..(end_row * cols).min(cells) {
+            let ri = n_top + idx;
+            let ResultKind::App(a) = results[ri] else {
+                continue;
+            };
+            let Some(p) = data.apps.get(a) else { continue };
+            let (c, row) = ((idx % cols) as i32, (idx / cols) as i32);
+            let x = gg.x0 + c * gg.step;
+            let y = row * gg.step;
+            let r = (x, y, x + gg.cell, y + gg.cell);
+            if ri == self.state.selected && focus {
+                list.push(self.plate(r, Rgba(t.0, t.1, t.2, 30), 8.0));
+                list.push(Item {
+                    rect: r,
+                    part: Part::Outline {
+                        color: look.accent,
+                        radius_px: self.sz(8.0),
+                        thickness_px: self.sz(2.0).max(1.0),
+                    },
+                });
+            } else if let Some(h) = self.hover_plate(Target::Result(ri), r, look) {
+                list.push(h);
+            }
+            let icon_box = self.px(GRID_ICON_DIP);
+            let top = y + self.px(8.0);
+            let img = self.icon_at(icons, pin_icon(p), GRID_ICON_DIP);
+            list.push(self.image_at(
+                (x, top, x + gg.cell, top + icon_box),
+                img,
+                look,
+                GRID_ICON_DIP,
+            ));
+            let ny = top + icon_box + self.px(4.0);
+            list.push(Item {
+                rect: (x + pad, ny, x + gg.cell - pad, y + gg.cell),
+                part: Part::Wrapped {
+                    text: p.name.clone(),
+                    font: FontKind::Text,
+                    size_px: self.sz(12.0),
+                    color: t,
+                    max_lines: 2,
+                },
+            });
+        }
+        (page, list, view)
     }
 
     /// The page (title and Back button) and the list layer's rows near the viewport.
@@ -2015,5 +2431,198 @@ mod tests {
             assert!(r.0 >= 0 && r.1 >= 0 && r.2 <= g.size.0 && r.3 <= g.size.1);
         }
         assert!(g.list.1 > g.pins_title.3 && g.list.3 == g.footer.1);
+    }
+
+    // ---- full-screen grid ----
+
+    /// 1920x1040 at 1x: 8 columns.
+    fn grid_geom() -> Geom {
+        Geom::new_grid(
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 1920.0,
+                h: 1040.0,
+            },
+            1.0,
+        )
+    }
+
+    fn grid_fixture(n: usize) -> Fixture {
+        let mut f = Fixture::new();
+        f.apps = (0..n).map(|i| pin(&format!("App {i:03}"))).collect();
+        f.rows = list_rows(&f.apps);
+        f.geom = grid_geom();
+        f.results = grid_results("", &f.apps, &[], Lang::En);
+        f
+    }
+
+    fn key(s: &mut StartState, f: &Fixture, vk: u32) -> StartAction {
+        s.handle(StartInput::Key(vk, false), &f.ctx())
+    }
+
+    #[test]
+    fn grid_arrows_move_by_one_and_by_columns_and_clamp() {
+        let f = grid_fixture(20);
+        let cols = f.geom.grid.as_ref().unwrap().cols;
+        assert_eq!(cols, 8);
+        let mut s = StartState::new().into_grid();
+        assert_eq!(s.mode, StartMode::AllApps);
+        // Enter does nothing until a key moved the focus.
+        assert_eq!(key(&mut s, &f, VK_RETURN), StartAction::None);
+        // The first key shows the focus on app 0; the left edge clamps.
+        assert_eq!(key(&mut s, &f, VK_LEFT), StartAction::Redraw);
+        assert_eq!(s.selected, 0);
+        assert_eq!(key(&mut s, &f, VK_LEFT), StartAction::None);
+        assert_eq!(key(&mut s, &f, VK_RIGHT), StartAction::Redraw);
+        assert_eq!(s.selected, 1);
+        assert_eq!(key(&mut s, &f, VK_DOWN), StartAction::Redraw);
+        assert_eq!(s.selected, 1 + cols);
+        assert_eq!(key(&mut s, &f, VK_UP), StartAction::Redraw);
+        assert_eq!(s.selected, 1);
+        assert_eq!(key(&mut s, &f, VK_UP), StartAction::None);
+        // 20 apps: rows of 8, 8, 4. Down from column 5 of row 1 has no cell below: last app.
+        s.selected = cols + 5;
+        key(&mut s, &f, VK_DOWN);
+        assert_eq!(s.selected, 19);
+        assert_eq!(key(&mut s, &f, VK_DOWN), StartAction::None);
+        assert_eq!(key(&mut s, &f, VK_RIGHT), StartAction::None);
+        assert_eq!(s.selected, 19);
+        // Enter launches the focused app.
+        assert_eq!(
+            key(&mut s, &f, VK_RETURN),
+            StartAction::Launch(f.apps[19].clone())
+        );
+    }
+
+    #[test]
+    fn grid_page_down_moves_by_a_screenful_of_rows() {
+        let f = grid_fixture(200);
+        let cols = f.geom.grid.as_ref().unwrap().cols;
+        let rows = f.geom.grid_rows_visible(0);
+        assert!(rows >= 2, "{rows}");
+        let mut s = StartState::new().into_grid();
+        key(&mut s, &f, VK_NEXT);
+        assert_eq!(s.selected, rows * cols);
+        key(&mut s, &f, VK_NEXT);
+        assert_eq!(s.selected, 2 * rows * cols);
+        // The focused row stays inside the viewport.
+        let gg = f.geom.grid.as_ref().unwrap();
+        let top = (s.selected / cols) as i32 * gg.step;
+        let h = f.geom.grid_view_h(0);
+        assert!(s.scroll as i32 <= top && top + gg.cell <= s.scroll as i32 + h);
+        key(&mut s, &f, VK_PRIOR);
+        assert_eq!(s.selected, rows * cols);
+        key(&mut s, &f, VK_END);
+        assert_eq!(s.selected, 199);
+        key(&mut s, &f, VK_NEXT);
+        assert_eq!(s.selected, 199);
+        key(&mut s, &f, VK_HOME);
+        assert_eq!(s.selected, 0);
+        assert_eq!(s.scroll, 0.0);
+    }
+
+    #[test]
+    fn grid_typing_lists_matching_apps_only_with_the_other_kinds_above() {
+        let mut apps: Vec<Pin> = (0..30).map(|i| pin(&format!("Tool {i:02}"))).collect();
+        apps.push(pin("Paint"));
+        apps.push(pin("Paint 3D"));
+        let all = grid_results("", &apps, &[], Lang::En);
+        assert_eq!(all.len(), 32);
+        let r = grid_results("paint", &apps, &[], Lang::En);
+        let names: Vec<&str> = r
+            .iter()
+            .filter_map(|k| match k {
+                ResultKind::App(a) => Some(apps[*a].name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, ["Paint", "Paint 3D"]);
+        // More matches than the panel's six-app cap are all listed.
+        let r = grid_results("tool", &apps, &[], Lang::En);
+        let n = r.iter().filter(|k| matches!(k, ResultKind::App(_))).count();
+        assert_eq!(n, 30);
+        let r = grid_results("display", &apps, &[], Lang::En);
+        assert!(matches!(r.first(), Some(ResultKind::Setting(_))));
+        let r = grid_results("2+3", &apps, &[], Lang::En);
+        assert!(matches!(r.first(), Some(ResultKind::Math(_))));
+        assert!(r.iter().skip(1).all(|k| matches!(k, ResultKind::App(_))));
+    }
+
+    #[test]
+    fn grid_rows_above_the_grid_are_reached_with_arrows_and_run_with_enter() {
+        let mut f = grid_fixture(40);
+        f.results = vec![ResultKind::Math(5.0), ResultKind::Setting(0)];
+        f.results.extend((0..40).map(ResultKind::App));
+        let cols = f.geom.grid.as_ref().unwrap().cols;
+        let mut s = StartState::new().into_grid();
+        s.handle(StartInput::Char('x'), &f.ctx());
+        assert_eq!(s.mode, StartMode::Search);
+        assert_eq!(s.selected, 0);
+        // Down walks the rows into the first app, Up from the first grid row walks back.
+        key(&mut s, &f, VK_DOWN);
+        key(&mut s, &f, VK_DOWN);
+        assert_eq!(s.selected, 2);
+        key(&mut s, &f, VK_DOWN);
+        assert_eq!(s.selected, 2 + cols);
+        key(&mut s, &f, VK_UP);
+        key(&mut s, &f, VK_UP);
+        assert_eq!(s.selected, 1);
+        assert!(matches!(key(&mut s, &f, VK_RETURN), StartAction::Open(_)));
+        // Backspace edits the query; the arrows never touch the caret.
+        assert_eq!(key(&mut s, &f, VK_BACK), StartAction::Redraw);
+        assert_eq!(s.mode, StartMode::AllApps);
+        assert!(!s.kbd);
+    }
+
+    #[test]
+    fn grid_clicks_and_wheel() {
+        let f = grid_fixture(200);
+        let gg = f.geom.grid.clone().unwrap();
+        let mut s = StartState::new().into_grid();
+        let cell = |i: usize, s: &StartState| {
+            let (c, r) = ((i % gg.cols) as i32, (i / gg.cols) as i32);
+            (
+                gg.x0 + c * gg.step + gg.cell / 2,
+                gg.top + r * gg.step - s.scroll as i32 + gg.cell / 2,
+            )
+        };
+        let a = s.handle(StartInput::Click(cell(10, &s)), &f.ctx());
+        assert_eq!(a, StartAction::Launch(f.apps[10].clone()));
+        // The gap between cells is not a cell.
+        let gap = (gg.x0 + gg.cell + 2, gg.top + 2);
+        assert_eq!(s.hit(gap, &f.ctx()), None);
+        // One notch scrolls one row; the wheel clamps at both ends.
+        s.handle(StartInput::Wheel(-120), &f.ctx());
+        assert_eq!(s.scroll, gg.step as f32);
+        let a = s.handle(StartInput::Click(cell(40, &s)), &f.ctx());
+        assert_eq!(a, StartAction::Launch(f.apps[40].clone()));
+        s.handle(StartInput::Wheel(120 * 50), &f.ctx());
+        assert_eq!(s.scroll, 0.0);
+        s.handle(StartInput::Wheel(-120 * 500), &f.ctx());
+        assert!(s.scroll > 0.0 && s.scroll == f.ctx().max_scroll(s.mode));
+        // Esc clears the query first, then closes.
+        s.handle(StartInput::Char('a'), &f.ctx());
+        assert_eq!(key(&mut s, &f, VK_ESCAPE), StartAction::Redraw);
+        assert_eq!(s.mode, StartMode::AllApps);
+        assert_eq!(key(&mut s, &f, VK_ESCAPE), StartAction::Close);
+    }
+
+    #[test]
+    fn grid_tint_is_the_materials_with_alpha_012() {
+        let mut m = vitro_core::style::material_style(
+            vitro_core::settings::Material::Frosted,
+            vitro_core::style::Theme::Dark,
+            true,
+        );
+        assert!(m.backdrop_blur);
+        let g = grid_style(&m);
+        assert_eq!(g.tint.3, 31);
+        assert_eq!(
+            (g.tint.0, g.tint.1, g.tint.2),
+            (m.tint.0, m.tint.1, m.tint.2)
+        );
+        m.backdrop_blur = false;
+        assert_eq!(grid_style(&m), m);
     }
 }

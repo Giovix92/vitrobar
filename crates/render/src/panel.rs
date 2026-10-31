@@ -7,7 +7,7 @@ use std::cell::RefCell;
 use std::sync::Mutex;
 
 use vitro_core::style::MaterialStyle;
-use windows::core::{w, Error, Interface, Result, BOOL, HSTRING, PCWSTR};
+use windows::core::{h, w, Error, Interface, Result, BOOL, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_USE_HOSTBACKDROPBRUSH, DWMWA_WINDOW_CORNER_PREFERENCE,
@@ -25,7 +25,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::UI::Composition::Desktop::DesktopWindowTarget;
 use windows::UI::Composition::{ContainerVisual, Visual};
-use windows_numerics::Vector2;
+use windows_numerics::{Vector2, Vector3};
 
 use crate::compositor::{window_target, Comp};
 use crate::flyout::PxRect;
@@ -219,6 +219,30 @@ impl Panel {
     /// The panel's visual tree: the glass is its bottom child; content goes on top.
     pub fn root(&self) -> &ContainerVisual {
         &self.root
+    }
+
+    /// Fades the panel in over `ms` and scales it from 98 % to 100 % about its centre: a
+    /// composition animation (the compositor runs it, no timer). Call right after `show`.
+    pub fn animate_open(&self, ms: u32) -> Result<()> {
+        use windows::Foundation::TimeSpan;
+        let comp = self.root.Compositor()?;
+        let size = self.root.Size()?;
+        self.root
+            .SetCenterPoint(Vector3::new(size.X / 2.0, size.Y / 2.0, 0.0))?;
+        let ease =
+            comp.CreateCubicBezierEasingFunction(Vector2::new(0.1, 0.9), Vector2::new(0.2, 1.0))?;
+        let span = TimeSpan::from(std::time::Duration::from_millis(ms as u64));
+        let fade = comp.CreateScalarKeyFrameAnimation()?;
+        fade.InsertKeyFrame(0.0, 0.0)?;
+        fade.InsertKeyFrameWithEasingFunction(1.0, 1.0, &ease)?;
+        fade.SetDuration(span)?;
+        let grow = comp.CreateVector3KeyFrameAnimation()?;
+        grow.InsertKeyFrame(0.0, Vector3::new(0.98, 0.98, 1.0))?;
+        grow.InsertKeyFrameWithEasingFunction(1.0, Vector3::new(1.0, 1.0, 1.0), &ease)?;
+        grow.SetDuration(span)?;
+        self.root.SetOpacity(0.0)?;
+        self.root.StartAnimation(h!("Opacity"), &fade)?;
+        self.root.StartAnimation(h!("Scale"), &grow)
     }
 
     /// Makes the top `dip` band of the panel a window caption (drag to move). Default 0.

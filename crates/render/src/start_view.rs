@@ -44,6 +44,21 @@ pub enum Part {
     },
     /// A filled rounded rectangle covering the box.
     Plate { color: Rgba, radius_px: f32 },
+    /// Text word-wrapped to the box's width in at most `max_lines` lines (the last ends in an
+    /// ellipsis when cut), lines centred, placed at the box's top.
+    Wrapped {
+        text: String,
+        font: FontKind,
+        size_px: f32,
+        color: Rgba,
+        max_lines: u32,
+    },
+    /// The outline of a rounded rectangle covering the box (a focus ring).
+    Outline {
+        color: Rgba,
+        radius_px: f32,
+        thickness_px: f32,
+    },
 }
 
 /// One thing to draw, in the layer's own px coordinates.
@@ -83,6 +98,21 @@ enum CacheKey {
     Plate {
         color: Rgba,
         radius: u32,
+        w: i32,
+        h: i32,
+    },
+    Wrapped {
+        text: String,
+        font: FontKind,
+        size: u32,
+        color: Rgba,
+        w: i32,
+        lines: u32,
+    },
+    Outline {
+        color: Rgba,
+        radius: u32,
+        thickness: u32,
         w: i32,
         h: i32,
     },
@@ -190,6 +220,7 @@ impl StartView {
             let (cw, ch) = cached.size;
             let (x, y) = match &item.part {
                 Part::Text { centred: false, .. } => (item.rect.0, item.rect.1),
+                Part::Wrapped { .. } => (item.rect.0 + (w - cw) / 2, item.rect.1),
                 _ => (item.rect.0 + (w - cw) / 2, item.rect.1 + (h - ch) / 2),
             };
             cached
@@ -245,6 +276,36 @@ impl StartView {
             Part::Plate { color, radius_px } => CacheKey::Plate {
                 color: *color,
                 radius: radius_px.to_bits(),
+                w,
+                h,
+            },
+            Part::Wrapped {
+                text,
+                font,
+                size_px,
+                color,
+                max_lines,
+            } => {
+                if text.is_empty() {
+                    return Ok(None);
+                }
+                CacheKey::Wrapped {
+                    text: text.clone(),
+                    font: *font,
+                    size: size_px.to_bits(),
+                    color: *color,
+                    w,
+                    lines: *max_lines,
+                }
+            }
+            Part::Outline {
+                color,
+                radius_px,
+                thickness_px,
+            } => CacheKey::Outline {
+                color: *color,
+                radius: radius_px.to_bits(),
+                thickness: thickness_px.to_bits(),
                 w,
                 h,
             },
@@ -309,6 +370,43 @@ impl StartView {
                     _image: None,
                 })
             }
+            (
+                CacheKey::Wrapped {
+                    text,
+                    font,
+                    color,
+                    w,
+                    lines,
+                    ..
+                },
+                Part::Wrapped { size_px, .. },
+            ) => {
+                let (surface, h) =
+                    painter.text_wrapped(text, *font, *size_px, *color, *w as u32, *lines, true)?;
+                let sprite = c.CreateSpriteVisual()?;
+                sprite.SetBrush(&c.CreateSurfaceBrushWithSurface(&surface)?)?;
+                sprite.SetSize(Vector2::new(*w as f32, h as f32))?;
+                Ok(Cached {
+                    visual: sprite.cast()?,
+                    size: (*w, h as i32),
+                    _image: None,
+                })
+            }
+            (
+                CacheKey::Outline { color, w, h, .. },
+                Part::Outline {
+                    radius_px,
+                    thickness_px,
+                    ..
+                },
+            ) => {
+                let v = outline(c, (*w, *h), *radius_px, *thickness_px, *color)?;
+                Ok(Cached {
+                    visual: v,
+                    size: (*w, *h),
+                    _image: None,
+                })
+            }
             _ => Err(windows::core::Error::from(
                 windows::Win32::Foundation::E_UNEXPECTED,
             )),
@@ -360,5 +458,29 @@ fn rounded(c: &Compositor, size: (i32, i32), radius: f32, fill: Rgba) -> Result<
     let visual = c.CreateShapeVisual()?;
     visual.Shapes()?.Append(&shape)?;
     visual.SetSize(sz)?;
+    visual.cast()
+}
+
+/// The outline of a rounded rectangle of `size` px, `thickness` wide, inside that size.
+fn outline(
+    c: &Compositor,
+    size: (i32, i32),
+    radius: f32,
+    thickness: f32,
+    stroke: Rgba,
+) -> Result<Visual> {
+    let geom = c.CreateRoundedRectangleGeometry()?;
+    geom.SetSize(Vector2::new(
+        size.0 as f32 - thickness,
+        size.1 as f32 - thickness,
+    ))?;
+    geom.SetOffset(Vector2::new(thickness / 2.0, thickness / 2.0))?;
+    geom.SetCornerRadius(Vector2::new(radius, radius))?;
+    let shape = c.CreateSpriteShapeWithGeometry(&geom)?;
+    shape.SetStrokeBrush(&c.CreateColorBrushWithColor(color(stroke))?)?;
+    shape.SetStrokeThickness(thickness)?;
+    let visual = c.CreateShapeVisual()?;
+    visual.Shapes()?.Append(&shape)?;
+    visual.SetSize(Vector2::new(size.0 as f32, size.1 as f32))?;
     visual.cast()
 }

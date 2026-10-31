@@ -153,10 +153,10 @@ fn text_wrapped_limits_lines() {
     let c = Rgba(255, 255, 255, 255);
     let text = "the quick brown fox jumps over the lazy dog ".repeat(10);
     let (_s1, h1) = p
-        .text_wrapped("one line", FontKind::Text, 14.0, c, 300, 3)
+        .text_wrapped("one line", FontKind::Text, 14.0, c, 300, 3, false)
         .unwrap();
     let (s3, h3) = p
-        .text_wrapped(&text, FontKind::Text, 14.0, c, 300, 3)
+        .text_wrapped(&text, FontKind::Text, 14.0, c, 300, 3, false)
         .unwrap();
     assert!(h1 > 0 && h3 > h1, "{h1} {h3}");
     assert!(h3 <= h1 * 3 + 3, "capped at 3 lines: {h1} {h3}");

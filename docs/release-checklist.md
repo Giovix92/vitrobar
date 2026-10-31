@@ -270,6 +270,16 @@ with `--debug-state` and `VITROBAR_POWER_DRY_RUN=1`: every power action is then 
     Opening and closing 20 times in a row does not make it grow.
 12. Change the colour mode or accent colour while the panel is open: it closes; the next
     open uses the new colours.
+13. Full-screen grid (`start-style = "full-screen"` in `settings.toml`, or Settings > Start menu):
+    Start (button or Windows key) opens a square-cornered, lightly frosted (12 % tint) panel
+    over the work area of that monitor, the bar's strip staying visible, with the search box
+    at the top centre and every app in a grid (48 px icon, name on up to 2 lines), fading in
+    and growing from 98 % in 180 ms (with Animation effects off it just appears). The wheel,
+    PageUp/PageDown scroll by rows; arrows move a focus ring (Enter launches the focused
+    app); typing `paint` leaves only matching apps, with Calculator/Settings/Files rows above
+    them (up from the first grid row reaches those rows); Esc clears the text, a second Esc
+    closes; so do deactivation, launching an app and a second click on Start. Memory with the
+    grid scrolled through under 60 MB, 3 s after closing under 40 MB.
 
 ## Safety net
 

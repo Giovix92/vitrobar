@@ -34,7 +34,7 @@ use vitro_core::i18n::{lang_from_tag, tr, Key, Lang};
 use vitro_core::image::BgraImage;
 use vitro_core::layout::{compute_layout, diff_monitors, metrics, BarLayout, LayoutInput, Rect};
 use vitro_core::search::ResultKind;
-use vitro_core::settings::{self, Pin, Position, Settings, ThemeChoice};
+use vitro_core::settings::{self, Pin, Position, Settings, StartStyle, ThemeChoice};
 use vitro_core::start_layout::{panel_layout, place_panel};
 use vitro_core::style::{hover_style, material_style, HoverStyle, MaterialStyle, Rgba, Theme};
 use vitro_core::tray_model::{split_promoted, TrayIcon};
@@ -134,6 +134,9 @@ const TRAY_TIP_MS: u32 = 500;
 /// it). Honoured only together with `--debug-state` (ruling R13): an environment variable
 /// alone never changes a normal run. Unset in normal use.
 const FAKE_MONITOR_ENV: &str = "VITROBAR_FAKE_MONITOR";
+
+/// The full-screen Start grid's fade-in.
+const GRID_OPEN_MS: u32 = 180;
 
 /// Debug hook for live tests of the Start panel's power menu: `1` makes every power action a
 /// dry run (recorded, never carried out). Honoured only together with `--debug-state`.
@@ -2531,7 +2534,7 @@ impl App {
 
     /// The Start button (and, later, the Windows key): opens the Start panel on monitor `k`,
     /// or closes it when it is already open there (open elsewhere, it moves to `k`).
-    /// `StartStyle::FullScreen` opens the panel too until the full-screen grid exists.
+    /// `StartStyle::FullScreen` opens the full-screen app grid instead of the panel.
     fn toggle_start(&mut self, k: usize, dirty: &mut Dirty) {
         let Some(id) = self.monitors.get(k).map(MonitorBar::id) else {
             return;
@@ -2568,7 +2571,12 @@ impl App {
             w: (r - l) as f32 / s,
             h: (b - t) as f32 / s,
         };
-        let rect = place_panel(mb.layout.start, self.settings.position, work);
+        let full_screen = self.settings.start_style == StartStyle::FullScreen;
+        let rect = if full_screen {
+            work
+        } else {
+            place_panel(mb.layout.start, self.settings.position, work)
+        };
         let layout = panel_layout(rect);
         let (id, dpi) = (mb.id(), mb.info.dpi);
         let fg_before = foreground().unwrap_or(0) as usize;
@@ -2577,22 +2585,48 @@ impl App {
         self.start_data.drain();
         let lang = ui_lang(&self.settings);
         let before_show = began.elapsed();
-        let opened = StartPanel::open(
-            &self.comp,
-            &layout,
-            to_px(rect, s),
-            dpi,
-            &self.style,
-            id,
-            tr(lang, Key::Start),
-        );
+        let opened = if full_screen {
+            // The monitor's work area exactly (the bar's strip stays visible).
+            StartPanel::open_grid(
+                &self.comp,
+                (l, t, r, b),
+                dpi,
+                &self.style,
+                id,
+                tr(lang, Key::Start),
+            )
+        } else {
+            StartPanel::open(
+                &self.comp,
+                &layout,
+                to_px(rect, s),
+                dpi,
+                &self.style,
+                id,
+                tr(lang, Key::Start),
+            )
+        };
         let shown = began.elapsed();
         let mut drawn = shown;
         match opened {
             Ok(mut sp) => {
                 sp.fg_at_open = fg_before;
                 // Query revisions continue after the last panel's.
-                sp.state = crate::start::StartState::with_rev(self.start_data.last_rev + 1);
+                let state = crate::start::StartState::with_rev(self.start_data.last_rev + 1);
+                sp.state = if full_screen {
+                    state.into_grid()
+                } else {
+                    state
+                };
+                if full_screen {
+                    // Every app is listed from the first frame.
+                    sp.research(&self.start_data, lang, true);
+                    if self.sys.animations {
+                        if let Err(e) = sp.animate_open(GRID_OPEN_MS) {
+                            eprintln!("vitrobar: the Start grid could not fade in: {e}");
+                        }
+                    }
+                }
                 self.start = Some(sp);
                 self.start_draw();
                 drawn = began.elapsed();
@@ -2987,7 +3021,9 @@ impl App {
             None => "null",
         };
         format!(
-            "{{\"open\":true,\"mode\":\"{}\",\"query\":{},\"results\":{},\"top\":{},\"search\":{},\"all_apps\":{},\"list\":{},\"power\":{},\"selected\":{},\"files\":{},\"scroll\":{},\"hwnd\":{},\"rect\":{},\"monitor\":{},\"activated\":{},\"catalog\":{},\"recent\":{},\"recent_enabled\":{},\"power_dry_run\":{}}}",
+            "{{\"open\":true,\"grid\":{},\"cols\":{},\"mode\":\"{}\",\"query\":{},\"results\":{},\"top\":{},\"search\":{},\"all_apps\":{},\"list\":{},\"power\":{},\"selected\":{},\"files\":{},\"scroll\":{},\"hwnd\":{},\"rect\":{},\"monitor\":{},\"activated\":{},\"catalog\":{},\"recent\":{},\"recent_enabled\":{},\"power_dry_run\":{}}}",
+            st.grid,
+            sp.geom.grid.as_ref().map_or(0, |g| g.cols),
             st.mode.name(),
             st.input.text().chars().count(),
             sp.results.len(),

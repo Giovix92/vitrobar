@@ -46,7 +46,8 @@ const PANEL_GAP: f32 = 12.0;
 const EDGE_MARGIN: f32 = 8.0;
 const MIN_PANEL_W: f32 = 400.0;
 const MIN_PANEL_H: f32 = 480.0;
-const GRID_GAP: f32 = 16.0;
+/// Gap between grid cells.
+pub const GRID_GAP_DIP: f32 = 16.0;
 const GRID_SIDE_MARGIN: f32 = 64.0;
 const GRID_MAX_COLS: usize = 8;
 
@@ -125,10 +126,10 @@ pub fn panel_layout(panel: Rect) -> StartLayout {
 /// Full-screen Start: a centred search box and a grid of `app_count` cells, row-major.
 /// Cells below the visible area continue downward; scrolling is the renderer's offset.
 pub fn grid_layout(work_area: Rect, app_count: usize) -> GridLayout {
-    let step = GRID_CELL_DIP + GRID_GAP;
+    let step = GRID_CELL_DIP + GRID_GAP_DIP;
     let avail_w = work_area.w - 2.0 * GRID_SIDE_MARGIN;
-    let cols = (((avail_w + GRID_GAP) / step).floor().max(1.0) as usize).min(GRID_MAX_COLS);
-    let grid_w = cols as f32 * step - GRID_GAP;
+    let cols = (((avail_w + GRID_GAP_DIP) / step).floor().max(1.0) as usize).min(GRID_MAX_COLS);
+    let grid_w = cols as f32 * step - GRID_GAP_DIP;
     let x0 = work_area.x + (work_area.w - grid_w) / 2.0;
     let search = rect(
         work_area.x + (work_area.w - 480.0) / 2.0,
@@ -152,7 +153,7 @@ pub fn grid_layout(work_area: Rect, app_count: usize) -> GridLayout {
     let rows_visible = if avail_h < GRID_CELL_DIP {
         0
     } else {
-        ((avail_h + GRID_GAP) / step).floor() as usize
+        ((avail_h + GRID_GAP_DIP) / step).floor() as usize
     };
     GridLayout {
         search,
