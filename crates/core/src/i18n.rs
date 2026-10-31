@@ -380,10 +380,10 @@ pub fn tr(lang: Lang, key: Key) -> &'static str {
         (Lang::En, Key::ClaudeWidget) => "Claude limits",
         (Lang::It, Key::ClaudeWidget) => "Limiti di Claude",
         (Lang::En, Key::ClaudeWidgetHint) => {
-            "Shows your Claude 5-hour and weekly limits from Claude Code's status line. No account, no network."
+            "Your Claude 5-hour and weekly limits, via Claude Code. No account, no network."
         }
         (Lang::It, Key::ClaudeWidgetHint) => {
-            "Mostra i limiti di 5 ore e settimanali di Claude dalla riga di stato di Claude Code. Nessun account, nessuna rete."
+            "Limiti di Claude (5 ore e settimana) via Claude Code. Nessun account, nessuna rete."
         }
         (Lang::En, Key::Language) => "Language",
         (Lang::It, Key::Language) => "Lingua",
