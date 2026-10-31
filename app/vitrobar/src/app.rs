@@ -2935,6 +2935,8 @@ impl App {
                     if self.sys.animations {
                         if let Err(e) = sp.animate_open(GRID_OPEN_MS) {
                             eprintln!("vitrobar: the Start grid could not fade in: {e}");
+                            // Never activate an invisible panel: it would hold the keyboard.
+                            sp.show_static();
                         }
                     }
                 }

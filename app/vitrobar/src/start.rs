@@ -1151,6 +1151,11 @@ impl StartPanel {
         self.panel.animate_open(ms)
     }
 
+    /// Final, fully visible state (opacity 1, scale 1): the fallback when the fade fails.
+    pub fn show_static(&self) {
+        self.panel.show_static()
+    }
+
     fn with_panel(panel: Panel, geom: Geom, monitor: u64) -> Result<Self> {
         let view = StartView::new(&panel)?;
         Ok(Self {

@@ -299,8 +299,24 @@ impl Panel {
         grow.InsertKeyFrameWithEasingFunction(1.0, Vector3::new(1.0, 1.0, 1.0), &ease)?;
         grow.SetDuration(span)?;
         self.root.SetOpacity(0.0)?;
-        self.root.StartAnimation(h!("Opacity"), &fade)?;
-        self.root.StartAnimation(h!("Scale"), &grow)
+        // Once the root is transparent, any failure must put it back: an invisible panel
+        // that still takes the foreground would hold the keyboard with nothing on screen.
+        or_restore(
+            || {
+                self.root.StartAnimation(h!("Opacity"), &fade)?;
+                self.root.StartAnimation(h!("Scale"), &grow)
+            },
+            || self.show_static(),
+        )
+    }
+
+    /// Puts the panel in its final, fully visible state: animations stopped, opacity 1,
+    /// scale 1. Best effort (each step is tried even if an earlier one fails).
+    pub fn show_static(&self) {
+        let _ = self.root.StopAnimation(h!("Opacity"));
+        let _ = self.root.StopAnimation(h!("Scale"));
+        let _ = self.root.SetOpacity(1.0);
+        let _ = self.root.SetScale(Vector3::new(1.0, 1.0, 1.0));
     }
 
     /// Makes the top `dip` band of the panel a window caption (drag to move). Default 0.
@@ -399,6 +415,11 @@ impl Panel {
     }
 }
 
+/// Runs `attempt`; if it fails, runs `restore` before handing the error back.
+fn or_restore<T>(attempt: impl FnOnce() -> Result<T>, restore: impl FnOnce()) -> Result<T> {
+    attempt().inspect_err(|_| restore())
+}
+
 impl Drop for Panel {
     fn drop(&mut self) {
         // SAFETY: destroying our own window if it still exists.
@@ -413,6 +434,23 @@ impl Drop for Panel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_animation_start_restores_the_panel() {
+        use std::cell::Cell;
+        let restored = Cell::new(false);
+        let r: Result<()> =
+            or_restore(|| Err(windows::core::Error::empty()), || restored.set(true));
+        assert!(r.is_err());
+        assert!(restored.get(), "a failure must restore opacity and scale");
+        restored.set(false);
+        let r = or_restore(|| Ok(7), || restored.set(true));
+        assert_eq!(r.unwrap(), 7);
+        assert!(
+            !restored.get(),
+            "a success must leave the animation running"
+        );
+    }
 
     #[test]
     fn drag_band_leaves_the_close_button_to_the_client() {
