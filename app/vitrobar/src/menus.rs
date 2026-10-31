@@ -20,17 +20,18 @@ use vitro_render::surfaces::Painter;
 use vitro_win::power::PowerAction;
 
 use crate::notify::keys_pending;
-use windows::Win32::Foundation::{HWND, LPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_DOWN, VK_END,
     VK_ESCAPE, VK_HOME, VK_RETURN, VK_SPACE, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetClassNameW, GetForegroundWindow, GetMessageW, PostQuitMessage,
-    SetForegroundWindow, TranslateMessage, EVENT_SYSTEM_FOREGROUND, MSG, WINEVENT_OUTOFCONTEXT,
-    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_NCLBUTTONDOWN,
-    WM_NCRBUTTONDOWN, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSCHAR, WM_SYSCOMMAND, WM_SYSKEYDOWN,
+    DispatchMessageW, GetClassNameW, GetForegroundWindow, GetMessageW, PostMessageW,
+    PostQuitMessage, SetForegroundWindow, TranslateMessage, EVENT_SYSTEM_FOREGROUND, MSG,
+    WINEVENT_OUTOFCONTEXT, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE,
+    WM_NCLBUTTONDOWN, WM_NCRBUTTONDOWN, WM_NULL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSCHAR,
+    WM_SYSCOMMAND, WM_SYSKEYDOWN,
 };
 
 /// `WM_MOUSELEAVE` (it lives in the Controls module, which nothing else here needs).
@@ -156,6 +157,11 @@ unsafe extern "system" fn on_foreground(
         let (me, _) = f.get();
         if hwnd.0 as isize != me {
             f.set((me, true));
+            // GetMessage does not return for a WinEvent callback: wake the menu's loop.
+            // SAFETY: plain post to our own window.
+            unsafe {
+                let _ = PostMessageW(Some(HWND(me as *mut _)), WM_NULL, WPARAM(0), LPARAM(0));
+            }
         }
     });
 }
@@ -223,6 +229,8 @@ fn run(owner: HWND, ctx: &MenuCtx, at: (i32, i32), entries: &[Entry]) -> u32 {
         }
     }
     let watch = ForegroundWatch::new(me);
+    // A key left pending before the menu opened is not a key pressed during it.
+    let stale_keys = keys_pending();
     let (mut tracking, mut mouse_hot) = (false, false);
     let mut quit = None;
     let mut msg = MSG::default();
@@ -329,7 +337,7 @@ fn run(owner: HWND, ctx: &MenuCtx, at: (i32, i32), entries: &[Entry]) -> u32 {
         }
         // The Win key: the hook swallowed it and left it for the app, which handles it
         // once the menu is gone (the hook gives up on a stalled UI after 500 ms).
-        if keys_pending() {
+        if !stale_keys && keys_pending() {
             break 0;
         }
     };
