@@ -34,6 +34,9 @@ use windows_numerics::{Matrix3x2, Vector2};
 
 use crate::device::GpuDevice;
 
+/// One text of [`Painter::text_boxes`]: the text, its font and its `(x, y, w, h)` px box.
+pub type TextBox<'a> = (&'a str, FontKind, (f32, f32, f32, f32));
+
 /// Which font a piece of text uses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FontKind {
@@ -228,6 +231,43 @@ impl Painter {
             for (x, layout) in &layouts {
                 dc.DrawTextLayout(
                     Vector2::new(*x, 0.0),
+                    layout,
+                    &brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                );
+            }
+            Ok(())
+        })?;
+        Ok(surface)
+    }
+
+    /// Several boxes of text in one `w` x `h` px surface: each `(text, kind, (x, y, w, h))`
+    /// is vertically centred in its px box; `Text` is left-aligned and cut with an ellipsis,
+    /// `Glyph` centred (the menus' rows and their check marks). `size` is the font size in px.
+    pub fn text_boxes(
+        &self,
+        boxes: &[TextBox],
+        size: f32,
+        color: Rgba,
+        w: u32,
+        h: u32,
+    ) -> Result<CompositionDrawingSurface> {
+        let surface = self.new_surface(w, h)?;
+        let mut layouts = Vec::with_capacity(boxes.len());
+        for &(text, kind, (x, y, bw, bh)) in boxes {
+            let layout = self.layout(text, kind, size, bw.max(1.0), bh.max(1.0))?;
+            if kind == FontKind::Text {
+                self.ellipsize(&layout)?;
+            }
+            layouts.push((x, y, layout));
+        }
+        draw(&surface, |dc| unsafe {
+            // SAFETY: `dc` is the context returned by BeginDraw, valid until EndDraw.
+            let brush = dc.CreateSolidColorBrush(&d2d_color(color), None)?;
+            dc.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+            for (x, y, layout) in &layouts {
+                dc.DrawTextLayout(
+                    Vector2::new(*x, *y),
                     layout,
                     &brush,
                     D2D1_DRAW_TEXT_OPTIONS_NONE,

@@ -5,6 +5,7 @@ pub mod compositor;
 pub mod device;
 pub mod flyout;
 pub mod material;
+pub mod menu_view;
 pub mod panel;
 pub mod settings_view;
 pub mod start_view;

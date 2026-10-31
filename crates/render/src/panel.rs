@@ -134,6 +134,12 @@ pub fn take_panel_deactivated() -> Vec<HWND> {
     PANEL_DEACTIVATED.with(|d| std::mem::take(&mut *d.borrow_mut()))
 }
 
+/// Records that panel `h` was left for another app, for a panel whose own deactivation was
+/// held back while one of the glass menus was up.
+pub fn note_deactivated(h: HWND) {
+    PANEL_DEACTIVATED.with(|d| d.borrow_mut().push(h));
+}
+
 /// Panels that got a mouse button press (or were about to be activated by one) since the
 /// last call. The owner of a fading panel drops it on the first one.
 pub fn take_panel_clicks() -> Vec<HWND> {
@@ -165,7 +171,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_ACTIVATE => {
-            if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE {
+            // `lparam` is the window taking the activation: one of our glass menus (opened
+            // from this panel) is not a click elsewhere.
+            if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE
+                && !crate::menu_view::is_menu_window(HWND(lparam.0 as *mut _))
+            {
                 PANEL_DEACTIVATED.with(|d| d.borrow_mut().push(hwnd));
             }
             // SAFETY: default handling with the arguments we were given.

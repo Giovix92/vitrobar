@@ -27,10 +27,10 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowPlacement, GetWindowRect, IsIconic,
-    IsWindow, LoadCursorW, RegisterClassExW, SetForegroundWindow, SetWindowPos, ShowWindow,
-    HWND_TOPMOST, IDC_ARROW, MA_NOACTIVATE, SWP_NOACTIVATE, SW_SHOWNOACTIVATE, WA_INACTIVE,
-    WINDOWPLACEMENT, WM_ACTIVATE, WM_MOUSEACTIVATE, WNDCLASSEXW, WS_EX_NOACTIVATE,
-    WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    IsWindow, LoadCursorW, PostMessageW, RegisterClassExW, SetForegroundWindow, SetWindowPos,
+    ShowWindow, HWND_TOPMOST, IDC_ARROW, MA_NOACTIVATE, SWP_NOACTIVATE, SW_SHOWNOACTIVATE,
+    WA_INACTIVE, WINDOWPLACEMENT, WM_ACTIVATE, WM_MOUSEACTIVATE, WM_NULL, WNDCLASSEXW,
+    WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::UI::Composition::Desktop::DesktopWindowTarget;
 use windows::UI::Composition::{ContainerVisual, SpriteVisual, Visual};
@@ -202,6 +202,17 @@ pub fn take_deactivated() -> Vec<HWND> {
     DEACTIVATED.with(|d| std::mem::take(&mut *d.borrow_mut()))
 }
 
+/// Like [`take_deactivated`] for one flyout: true if `hwnd` was deactivated since the last
+/// call. Other flyouts' entries stay queued for their owners.
+pub fn take_deactivated_of(hwnd: HWND) -> bool {
+    DEACTIVATED.with(|d| {
+        let mut d = d.borrow_mut();
+        let before = d.len();
+        d.retain(|h| *h != hwnd);
+        d.len() != before
+    })
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     // Mouse input is read by the app's message loop before dispatch.
     match msg {
@@ -209,6 +220,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_ACTIVATE => {
             if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE {
                 DEACTIVATED.with(|d| d.borrow_mut().push(hwnd));
+                // Wakes a modal loop (the glass menus') waiting in GetMessage: the
+                // activation change itself is a sent message and wakes nothing.
+                // SAFETY: plain post to our own window.
+                unsafe {
+                    let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
+                }
             }
             // SAFETY: default handling with the arguments we were given.
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -264,7 +281,6 @@ impl Flyout {
         dpi: u32,
         style: &MaterialStyle,
     ) -> Result<Self> {
-        register_class()?;
         let scale = dpi as f32 / 96.0;
         let size = (
             (size_dip.0 * scale).round() as i32,
@@ -272,6 +288,34 @@ impl Flyout {
         );
         let gap = (ANCHOR_GAP_DIP * scale).round() as i32;
         let (x, y) = place(anchor_px, position, size, gap, work_area(anchor_px));
+        Self::open(comp, (x, y), size, scale, style)
+    }
+
+    /// Opens a `size_dip` flyout with its top-left corner at `origin_px` (screen px; the
+    /// caller has already placed it, as the right-click menus do).
+    pub fn show_at(
+        comp: &Comp,
+        origin_px: (i32, i32),
+        size_dip: (f32, f32),
+        dpi: u32,
+        style: &MaterialStyle,
+    ) -> Result<Self> {
+        let scale = dpi as f32 / 96.0;
+        let size = (
+            (size_dip.0 * scale).round() as i32,
+            (size_dip.1 * scale).round() as i32,
+        );
+        Self::open(comp, origin_px, size, scale, style)
+    }
+
+    fn open(
+        comp: &Comp,
+        (x, y): (i32, i32),
+        size: (i32, i32),
+        scale: f32,
+        style: &MaterialStyle,
+    ) -> Result<Self> {
+        register_class()?;
         // SAFETY: the class is registered; static strings.
         let hwnd = unsafe {
             CreateWindowExW(

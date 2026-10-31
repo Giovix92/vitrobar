@@ -1,25 +1,29 @@
-//! The bar's right-click menus: native popup menus (they follow the system theme, keyboard
-//! and accessibility for free), shown modally with `TrackPopupMenuEx` and returning the
-//! chosen command.
+//! The bar's right-click menus: glass menus ([`MenuView`], the same material as the other
+//! flyouts) shown modally by a nested message loop, returning the chosen command.
 //!
-//! The owner is the hidden notify window. As documented for `TrackPopupMenu`, it is made the
-//! foreground window first (so a click elsewhere dismisses the menu) and is posted a
-//! `WM_NULL` afterwards (so a second right-click works at once). While the menu is open its
-//! modal loop dispatches everything else; the notify window records it in its inbox.
+//! The loop dispatches everything that is not the menu's own input, so the notify window
+//! keeps recording its inbox as it did under the native menu. The menu ends on a choice,
+//! Esc, a click anywhere outside it, losing the activation (Alt+Tab, the Win key) or
+//! `WM_QUIT` (which is posted again afterwards).
 
 use vitro_core::i18n::{tr, Key, Lang};
+use vitro_core::menu_model::{step, Entry, NavKey};
 use vitro_core::settings::Settings;
+use vitro_core::style::MaterialStyle;
+use vitro_render::compositor::Comp;
+use vitro_render::flyout::take_deactivated_of;
+use vitro_render::menu_view::MenuView;
+use vitro_render::panel::{note_deactivated, PANEL_CLASS};
+use vitro_render::surfaces::Painter;
 use vitro_win::power::PowerAction;
-use windows::core::{Result, PWSTR};
-use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
-use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+use windows::Win32::Foundation::{HWND, LPARAM};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    ReleaseCapture, SetCapture, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_RETURN, VK_SPACE, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyMenu, GetMenuItemCount, InsertMenuItemW, PostMessageW,
-    SetForegroundWindow, TrackPopupMenuEx, HMENU, MENUITEMINFOW, MENU_ITEM_STATE, MFS_CHECKED,
-    MFT_STRING, MF_SEPARATOR, MIIM_FTYPE, MIIM_ID, MIIM_STATE, MIIM_STRING, TPM_BOTTOMALIGN,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN, WM_NULL,
+    DispatchMessageW, GetClassNameW, GetForegroundWindow, GetMessageW, PostQuitMessage,
+    SetForegroundWindow, TranslateMessage, MSG, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_NCLBUTTONDOWN, WM_NCRBUTTONDOWN, WM_RBUTTONDOWN, WM_RBUTTONUP,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,128 +86,203 @@ fn choice_for(id: u32) -> Option<MenuChoice> {
     })
 }
 
-/// A popup menu, destroyed (with its attached submenus) on drop.
-struct Menu(HMENU);
+/// What the menus draw with: the app's compositor, painter and bar material, and the DPI of
+/// the monitor the menu opens on.
+pub struct MenuCtx<'a> {
+    pub comp: &'a Comp,
+    pub painter: &'a Painter,
+    pub style: &'a MaterialStyle,
+    pub dpi: u32,
+}
 
-impl Menu {
-    fn new() -> Result<Self> {
-        // SAFETY: plain creation; ownership goes to the returned value.
-        Ok(Self(unsafe { CreatePopupMenu()? }))
+fn cmd(id: u32, text: &str) -> Entry {
+    Entry::Command {
+        id,
+        text: text.to_string(),
+        checked: false,
     }
+}
 
-    /// Appends a command, with a check mark when `checked`.
-    fn item(&self, id: u32, text: &str, checked: bool) -> Result<()> {
-        let mut wide: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
-        let info = MENUITEMINFOW {
-            cbSize: size_of::<MENUITEMINFOW>() as u32,
-            fMask: MIIM_FTYPE | MIIM_ID | MIIM_STATE | MIIM_STRING,
-            fType: MFT_STRING,
-            fState: if checked {
-                MFS_CHECKED
-            } else {
-                MENU_ITEM_STATE(0)
-            },
-            wID: id,
-            dwTypeData: PWSTR(wide.as_mut_ptr()),
-            cch: (wide.len() - 1) as u32,
-            ..Default::default()
-        };
-        // SAFETY: `info` and the string it points to outlive the call; the menu copies the
-        // text. Inserting at the item count appends.
+/// Mouse position of a client-area mouse message (the signed 16-bit halves of `lparam`).
+fn client_pt(l: LPARAM) -> (i32, i32) {
+    (
+        i32::from(l.0 as u16 as i16),
+        i32::from((l.0 >> 16) as u16 as i16),
+    )
+}
+
+/// Whether `h` is one of our panels (Start, settings).
+fn is_panel(h: HWND) -> bool {
+    let mut buf = [0u16; 32];
+    // SAFETY: plain query into a local buffer; a stale handle gives 0.
+    let n = unsafe { GetClassNameW(h, &mut buf) }.max(0) as usize;
+    String::from_utf16_lossy(&buf[..n]) == PANEL_CLASS
+}
+
+/// The command id at row `i` of `view`.
+fn command_id(view: &MenuView, i: Option<usize>) -> Option<u32> {
+    match view.entries().get(i?) {
+        Some(Entry::Command { id, .. }) => Some(*id),
+        _ => None,
+    }
+}
+
+/// Shows `entries` at `at` (screen px) and runs the menu until it ends: the chosen command's
+/// id, or 0 when it was dismissed. `owner` is the window the menu belongs to; a panel (Start)
+/// gets the foreground back afterwards.
+fn run(owner: HWND, ctx: &MenuCtx, at: (i32, i32), entries: &[Entry]) -> u32 {
+    let mut view = match MenuView::show(ctx.comp, ctx.painter, ctx.style, ctx.dpi, at, entries) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("vitrobar: the menu failed: {e}");
+            return 0;
+        }
+    };
+    let me = view.hwnd();
+    let _ = take_deactivated_of(me);
+    // Without the foreground nothing would tell us about a click elsewhere: take the mouse
+    // instead, so that click reaches the menu.
+    let captured = !view.activate();
+    if captured {
+        // SAFETY: plain call on our own window.
         unsafe {
-            let at = GetMenuItemCount(Some(self.0)).max(0) as u32;
-            InsertMenuItemW(self.0, at, true, &info)
+            let _ = SetCapture(me);
         }
     }
-
-    fn separator(&self) -> Result<()> {
-        // SAFETY: plain call on our own menu.
-        unsafe { AppendMenuW(self.0, MF_SEPARATOR, 0, None) }
-    }
-
-    /// Shows the menu at `pt_px` (screen px) and waits for a choice.
-    fn track(&self, owner: HWND, pt_px: (i32, i32)) -> u32 {
-        // Opens away from the screen edge the bar sits on.
-        let mut mi = MONITORINFO {
-            cbSize: size_of::<MONITORINFO>() as u32,
-            ..Default::default()
-        };
-        let pt = POINT {
-            x: pt_px.0,
-            y: pt_px.1,
-        };
-        // SAFETY: plain queries; `mi` is a sized local.
-        let lower_half = unsafe {
-            let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
-            GetMonitorInfoW(mon, &mut mi).as_bool()
-                && pt.y > (mi.rcMonitor.top + mi.rcMonitor.bottom) / 2
-        };
-        let align = if lower_half {
-            TPM_BOTTOMALIGN
+    let mut quit = None;
+    let mut msg = MSG::default();
+    let picked = loop {
+        // SAFETY: the standard message loop on this thread; `msg` is a local.
+        let got = unsafe { GetMessageW(&mut msg, None, 0, 0) }.0;
+        if got == 0 {
+            quit = Some(msg.wParam.0 as i32);
+            break 0;
+        }
+        if got < 0 {
+            break 0;
+        }
+        if msg.hwnd == me {
+            match msg.message {
+                WM_MOUSEMOVE => {
+                    let hot = view.hit_px(client_pt(msg.lParam));
+                    let _ = view.set_hot(hot);
+                }
+                WM_LBUTTONUP | WM_RBUTTONUP => {
+                    if let Some(id) = command_id(&view, view.hit_px(client_pt(msg.lParam))) {
+                        break id;
+                    }
+                }
+                WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN => {
+                    if !view.contains_px(client_pt(msg.lParam)) {
+                        break 0;
+                    }
+                }
+                WM_KEYDOWN => {
+                    let key = msg.wParam.0 as u16;
+                    let nav = [
+                        (VK_UP.0, NavKey::Up),
+                        (VK_DOWN.0, NavKey::Down),
+                        (VK_HOME.0, NavKey::Home),
+                        (VK_END.0, NavKey::End),
+                    ]
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, n)| *n);
+                    if let Some(n) = nav {
+                        let next = step(view.entries(), view.hot(), n);
+                        let _ = view.set_hot(next);
+                    } else if key == VK_ESCAPE.0 {
+                        break 0;
+                    } else if key == VK_RETURN.0 || key == VK_SPACE.0 {
+                        if let Some(id) = command_id(&view, view.hot()) {
+                            break id;
+                        }
+                    }
+                }
+                _ => {
+                    // SAFETY: dispatching a message we just received.
+                    unsafe {
+                        let _ = TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                }
+            }
         } else {
-            TPM_TOPALIGN
-        };
-        // SAFETY: the documented TrackPopupMenu pattern on our own owner window: foreground
-        // first, WM_NULL after. With TPM_RETURNCMD the result is the command id (0 = none).
-        unsafe {
-            let _ = SetForegroundWindow(owner);
-            let id = TrackPopupMenuEx(
-                self.0,
-                (TPM_RETURNCMD | TPM_RIGHTBUTTON | align).0,
-                pt.x,
-                pt.y,
-                owner,
-                None,
-            );
-            let _ = PostMessageW(Some(owner), WM_NULL, WPARAM(0), LPARAM(0));
-            id.0 as u32
+            // SAFETY: dispatching a message we just received.
+            unsafe {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            // A click on another window of ours (a second right-click on the bar).
+            if matches!(
+                msg.message,
+                WM_LBUTTONDOWN
+                    | WM_RBUTTONDOWN
+                    | WM_MBUTTONDOWN
+                    | WM_NCLBUTTONDOWN
+                    | WM_NCRBUTTONDOWN
+            ) {
+                break 0;
+            }
+        }
+        // A click elsewhere, Alt+Tab, the Win key. Only our own entry is taken: the overflow
+        // flyout's deactivation stays queued for the app.
+        if take_deactivated_of(me) {
+            break 0;
+        }
+    };
+    // SAFETY: plain calls on windows of this process.
+    unsafe {
+        if captured {
+            let _ = ReleaseCapture();
+        }
+        if is_panel(owner) {
+            let fg = GetForegroundWindow();
+            if fg == me || fg.is_invalid() || fg == owner {
+                // Dismissed from inside: the panel gets back what the menu took.
+                let _ = SetForegroundWindow(owner);
+            } else {
+                // Another app took the foreground: the panel was left for it (and was told
+                // nothing while the menu was up).
+                note_deactivated(owner);
+            }
         }
     }
-}
-
-impl Drop for Menu {
-    fn drop(&mut self) {
-        // SAFETY: destroys the menu this value owns, with its attached submenus.
-        unsafe {
-            let _ = DestroyMenu(self.0);
-        }
+    drop(view);
+    let _ = take_deactivated_of(me);
+    if let Some(code) = quit {
+        // SAFETY: posts again the quit this loop swallowed.
+        unsafe { PostQuitMessage(code) };
     }
-}
-
-fn report<T>(what: &str, r: Result<T>) -> Option<T> {
-    r.inspect_err(|e| eprintln!("vitrobar: the {what} menu failed: {e}"))
-        .ok()
+    picked
 }
 
 /// The menu of an app on the bar.
 pub fn app_menu(
+    ctx: &MenuCtx,
     owner: HWND,
     pt_px: (i32, i32),
     pinned: bool,
     has_windows: bool,
     lang: Lang,
 ) -> Option<MenuChoice> {
-    let build = || -> Result<Menu> {
-        let m = Menu::new()?;
-        m.item(ID_NEW_WINDOW, tr(lang, Key::NewWindow), false)?;
-        if pinned {
-            m.item(ID_UNPIN, tr(lang, Key::Unpin), false)?;
-        } else {
-            m.item(ID_PIN, tr(lang, Key::Pin), false)?;
-        }
-        if has_windows {
-            m.separator()?;
-            m.item(ID_CLOSE_ALL, tr(lang, Key::CloseAllWindows), false)?;
-        }
-        Ok(m)
-    };
-    let menu = report("app", build())?;
-    choice_for(menu.track(owner, pt_px))
+    let mut e = vec![cmd(ID_NEW_WINDOW, tr(lang, Key::NewWindow))];
+    if pinned {
+        e.push(cmd(ID_UNPIN, tr(lang, Key::Unpin)));
+    } else {
+        e.push(cmd(ID_PIN, tr(lang, Key::Pin)));
+    }
+    if has_windows {
+        e.push(Entry::Separator);
+        e.push(cmd(ID_CLOSE_ALL, tr(lang, Key::CloseAllWindows)));
+    }
+    choice_for(run(owner, ctx, pt_px, &e))
 }
 
 /// The menu of an app in the Start panel (a pin or an All-apps entry). `owner` is the panel,
-/// so the menu does not take its activation away.
+/// which gets the foreground back afterwards.
 pub fn start_item_menu(
+    ctx: &MenuCtx,
     owner: HWND,
     pt_px: (i32, i32),
     in_start: bool,
@@ -211,26 +290,22 @@ pub fn start_item_menu(
     has_location: bool,
     lang: Lang,
 ) -> Option<MenuChoice> {
-    let build = || -> Result<Menu> {
-        let m = Menu::new()?;
-        if in_start {
-            m.item(ID_UNPIN_FROM_START, tr(lang, Key::UnpinFromStart), false)?;
-        } else {
-            m.item(ID_PIN_TO_START, tr(lang, Key::PinToStart), false)?;
-        }
-        if in_bar {
-            m.item(ID_UNPIN, tr(lang, Key::Unpin), false)?;
-        } else {
-            m.item(ID_PIN, tr(lang, Key::Pin), false)?;
-        }
-        if has_location {
-            m.separator()?;
-            m.item(ID_OPEN_LOCATION, tr(lang, Key::OpenFileLocation), false)?;
-        }
-        Ok(m)
-    };
-    let menu = report("Start item", build())?;
-    choice_for(menu.track(owner, pt_px))
+    let mut e = Vec::new();
+    if in_start {
+        e.push(cmd(ID_UNPIN_FROM_START, tr(lang, Key::UnpinFromStart)));
+    } else {
+        e.push(cmd(ID_PIN_TO_START, tr(lang, Key::PinToStart)));
+    }
+    if in_bar {
+        e.push(cmd(ID_UNPIN, tr(lang, Key::Unpin)));
+    } else {
+        e.push(cmd(ID_PIN, tr(lang, Key::Pin)));
+    }
+    if has_location {
+        e.push(Entry::Separator);
+        e.push(cmd(ID_OPEN_LOCATION, tr(lang, Key::OpenFileLocation)));
+    }
+    choice_for(run(owner, ctx, pt_px, &e))
 }
 
 /// The power action behind a command id of the power menu.
@@ -239,38 +314,44 @@ fn power_for(id: u32) -> Option<PowerAction> {
 }
 
 /// The Start panel's power menu (Lock, Sleep, Restart, Shut down, Sign out, Switch user).
-pub fn power_menu(owner: HWND, pt_px: (i32, i32), lang: Lang) -> Option<PowerAction> {
-    let build = || -> Result<Menu> {
-        let m = Menu::new()?;
-        for (i, (_, key)) in POWER.iter().enumerate() {
-            if i == 2 {
-                m.separator()?;
-            }
-            m.item(ID_POWER + i as u32, tr(lang, *key), false)?;
+pub fn power_menu(
+    ctx: &MenuCtx,
+    owner: HWND,
+    pt_px: (i32, i32),
+    lang: Lang,
+) -> Option<PowerAction> {
+    let mut e = Vec::new();
+    for (i, (_, key)) in POWER.iter().enumerate() {
+        if i == 2 {
+            e.push(Entry::Separator);
         }
-        Ok(m)
-    };
-    let menu = report("power", build())?;
-    power_for(menu.track(owner, pt_px))
+        e.push(cmd(ID_POWER + i as u32, tr(lang, *key)));
+    }
+    power_for(run(owner, ctx, pt_px, &e))
 }
 
 /// The bar's own menu: the settings window, "Start with Windows" (checked when on) and Exit.
-pub fn bar_menu(owner: HWND, pt_px: (i32, i32), s: &Settings, lang: Lang) -> Option<MenuChoice> {
-    let menu = report("bar", build_bar_menu(s, lang))?;
-    choice_for(menu.track(owner, pt_px))
+pub fn bar_menu(
+    ctx: &MenuCtx,
+    owner: HWND,
+    pt_px: (i32, i32),
+    s: &Settings,
+    lang: Lang,
+) -> Option<MenuChoice> {
+    choice_for(run(owner, ctx, pt_px, &bar_entries(s, lang)))
 }
 
-fn build_bar_menu(s: &Settings, lang: Lang) -> Result<Menu> {
-    let m = Menu::new()?;
-    m.item(ID_SETTINGS, tr(lang, Key::SettingsEllipsis), false)?;
-    m.separator()?;
-    m.item(
-        ID_START_WITH_WINDOWS,
-        tr(lang, Key::StartWithWindows),
-        s.start_with_windows,
-    )?;
-    m.item(ID_EXIT, tr(lang, Key::ExitVitrobar), false)?;
-    Ok(m)
+fn bar_entries(s: &Settings, lang: Lang) -> Vec<Entry> {
+    vec![
+        cmd(ID_SETTINGS, tr(lang, Key::SettingsEllipsis)),
+        Entry::Separator,
+        Entry::Command {
+            id: ID_START_WITH_WINDOWS,
+            text: tr(lang, Key::StartWithWindows).to_string(),
+            checked: s.start_with_windows,
+        },
+        cmd(ID_EXIT, tr(lang, Key::ExitVitrobar)),
+    ]
 }
 
 #[cfg(test)]
@@ -312,12 +393,10 @@ mod tests {
 
     #[test]
     fn menus_build_in_both_languages() {
-        // Building (not showing) exercises every item.
+        // Building (not showing) exercises every item: 3 commands and a separator.
         for lang in [Lang::En, Lang::It] {
             let s = Settings::default();
-            let m = build_bar_menu(&s, lang).unwrap();
-            // SAFETY: plain query on our own menu.
-            assert_eq!(unsafe { GetMenuItemCount(Some(m.0)) }, 4);
+            assert_eq!(bar_entries(&s, lang).len(), 4);
         }
     }
 }

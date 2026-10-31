@@ -105,7 +105,7 @@ use crate::keys::{
     Step, Zone,
 };
 use crate::launcher::{Job, Launcher};
-use crate::menus::{app_menu, bar_menu, power_menu, start_item_menu, MenuChoice};
+use crate::menus::{app_menu, bar_menu, power_menu, start_item_menu, MenuChoice, MenuCtx};
 use crate::notify::{
     inbox_pending, take_inbox, Inbox, NotifyWindow, TIMER_CLOCK, TIMER_GPU_RETRY, TIMER_HOVER_HIDE,
     TIMER_HOVER_SHOW, TIMER_MARGIN_COLLAPSE, TIMER_REASSERT, TIMER_START_CLOSED,
@@ -996,6 +996,24 @@ impl App {
     /// DPI of the tray bar's monitor (for the overflow and the tooltip).
     fn tray_dpi(&self) -> u32 {
         self.tray_monitor().map_or(96, |m| m.info.dpi)
+    }
+
+    /// What a right-click menu opened at `pt` (screen px) is drawn with.
+    fn menu_ctx(&self, pt: (i32, i32)) -> MenuCtx<'_> {
+        let dpi = self
+            .monitors
+            .iter()
+            .find(|m| {
+                let r = m.info.rect_px;
+                pt.0 >= r.0 && pt.0 < r.2 && pt.1 >= r.1 && pt.1 < r.3
+            })
+            .map_or_else(|| self.tray_dpi(), |m| m.info.dpi);
+        MenuCtx {
+            comp: &self.comp,
+            painter: &self.painter,
+            style: &self.style,
+            dpi,
+        }
     }
 
     /// Tray icons are drawn at this many px.
@@ -3235,7 +3253,8 @@ impl App {
                 let Some(sp) = &self.start else { return };
                 let (l, t, _, _) = sp.rect_px();
                 let lang = ui_lang(&self.settings);
-                let choice = power_menu(sp.hwnd(), (l + pt.0, t + pt.1), lang);
+                let at = (l + pt.0, t + pt.1);
+                let choice = power_menu(&self.menu_ctx(at), sp.hwnd(), at, lang);
                 if let Some(a) = choice {
                     self.start_action(StartAction::Power(a), dirty);
                 }
@@ -3268,9 +3287,11 @@ impl App {
         let location = file_location(&pin);
         let (l, t, _, _) = sp.rect_px();
         let lang = ui_lang(&self.settings);
+        let at = (l + pt.0, t + pt.1);
         let choice = start_item_menu(
+            &self.menu_ctx(at),
             sp.hwnd(),
-            (l + pt.0, t + pt.1),
+            at,
             in_start,
             in_bar,
             location.is_some(),
@@ -3488,7 +3509,15 @@ impl App {
                 let Some(g) = self.cur_groups().get(i).cloned() else {
                     return;
                 };
-                let choice = app_menu(owner, pt, g.pin.is_some(), !g.windows.is_empty(), lang);
+                let ctx = self.menu_ctx(pt);
+                let choice = app_menu(
+                    &ctx,
+                    owner,
+                    pt,
+                    g.pin.is_some(),
+                    !g.windows.is_empty(),
+                    lang,
+                );
                 if self.opts.debug_state {
                     eprintln!("vitrobar-menu app {i} {choice:?}");
                 }
@@ -3497,7 +3526,7 @@ impl App {
                 }
             }
             None => {
-                let choice = bar_menu(owner, pt, &self.settings, lang);
+                let choice = bar_menu(&self.menu_ctx(pt), owner, pt, &self.settings, lang);
                 if self.opts.debug_state {
                     eprintln!("vitrobar-menu bar {choice:?}");
                 }

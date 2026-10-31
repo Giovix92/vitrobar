@@ -53,14 +53,14 @@ pub fn grid_layout(n: usize, slot: f32) -> ((f32, f32), Vec<Rect>) {
 }
 
 /// A rounded rectangle shape (hover plate, placeholder).
-struct RoundRect {
-    visual: ShapeVisual,
+pub(crate) struct RoundRect {
+    pub(crate) visual: ShapeVisual,
     geom: CompositionRoundedRectangleGeometry,
     brush: CompositionColorBrush,
 }
 
 impl RoundRect {
-    fn new(comp: &Compositor) -> Result<Self> {
+    pub(crate) fn new(comp: &Compositor) -> Result<Self> {
         let geom = comp.CreateRoundedRectangleGeometry()?;
         let brush = comp.CreateColorBrush()?;
         let shape = comp.CreateSpriteShapeWithGeometry(&geom)?;
@@ -74,7 +74,7 @@ impl RoundRect {
         })
     }
 
-    fn set(&self, r: PxRect, radius: f32, c: Rgba) -> Result<()> {
+    pub(crate) fn set(&self, r: PxRect, radius: f32, c: Rgba) -> Result<()> {
         let (w, h) = ((r.2 - r.0).max(0) as f32, (r.3 - r.1).max(0) as f32);
         self.visual
             .SetOffset(Vector3::new(r.0 as f32, r.1 as f32, 0.0))?;
