@@ -3770,6 +3770,10 @@ impl App {
                 self.on_hook_output(out, dirty);
             }
         }
+        if inbox.debug_open_start && self.opts.debug_state {
+            // Debug hook (perf check): toggles Start on the primary monitor's bar.
+            self.toggle_start(0, dirty);
+        }
         dirty.theme |= inbox.theme;
         dirty.clock |= inbox.clock;
         dirty.icons |= inbox.icons;
@@ -3977,6 +3981,10 @@ fn apply_autostart(enabled: bool) {
 /// Immediate passes allowed in a row before the loop waits again.
 const MAX_IMMEDIATE_PASSES: u32 = 8;
 
+/// Consecutive [`Next::WakeLater`] rounds (each with the inbox still non-empty) after which
+/// the loop falls back to an ordinary blocking wait.
+const MAX_WAKE_ROUNDS: u32 = 4;
+
 /// What the event loop does after a flush.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Next {
@@ -3989,12 +3997,21 @@ enum Next {
     WakeLater,
 }
 
-fn after_flush(pending: bool, spins: u32) -> Next {
+/// `wakes` counts the wake-later rounds in a row; a persistent refill (a producer that keeps
+/// the inbox non-empty) ends in a blocking [`Next::Wait`] after [`MAX_WAKE_ROUNDS`] of them,
+/// which resets the counter. Any `Wait` or `Again` resets it too.
+fn after_flush(pending: bool, spins: u32, wakes: &mut u32) -> Next {
     if !pending {
+        *wakes = 0;
         Next::Wait
     } else if spins < MAX_IMMEDIATE_PASSES {
+        *wakes = 0;
         Next::Again
+    } else if *wakes >= MAX_WAKE_ROUNDS {
+        *wakes = 0;
+        Next::Wait
     } else {
+        *wakes += 1;
         Next::WakeLater
     }
 }
@@ -4065,6 +4082,8 @@ pub fn run(opts: Options) -> Result<()> {
     let mut msg = MSG::default();
     // Immediate passes in a row because the inbox still held something after a flush.
     let mut spins = 0u32;
+    // Wake-later rounds in a row (see `after_flush`).
+    let mut wakes = 0u32;
     'event: loop {
         let removed = app.gpu.removed_event();
         let mut handles = [removed, HANDLE::default()];
@@ -4123,7 +4142,7 @@ pub fn run(opts: Options) -> Result<()> {
         // Nested message loops inside absorb / flush (the COM modal loop of the virtual
         // desktop calls, sent SHAppBarMessage calls) dispatch to the notify window, so the
         // inbox may hold events again that no queued message will announce.
-        match after_flush(inbox_pending(), spins) {
+        match after_flush(inbox_pending(), spins, &mut wakes) {
             Next::Wait => spins = 0,
             Next::Again => spins += 1,
             Next::WakeLater => {
@@ -4156,13 +4175,17 @@ mod tests {
 
     #[test]
     fn a_non_empty_inbox_runs_again_then_yields() {
-        assert_eq!(after_flush(false, 0), Next::Wait);
-        assert_eq!(after_flush(false, MAX_IMMEDIATE_PASSES), Next::Wait);
+        let mut wakes = 0;
+        assert_eq!(after_flush(false, 0, &mut wakes), Next::Wait);
+        assert_eq!(
+            after_flush(false, MAX_IMMEDIATE_PASSES, &mut wakes),
+            Next::Wait
+        );
         let mut spins = 0;
         let mut passes = 0;
         // An inbox that never empties: bounded immediate passes, then a posted wake-up.
         loop {
-            match after_flush(true, spins) {
+            match after_flush(true, spins, &mut wakes) {
                 Next::Again => {
                     spins += 1;
                     passes += 1;
@@ -4172,6 +4195,30 @@ mod tests {
             }
         }
         assert_eq!(passes, MAX_IMMEDIATE_PASSES);
+    }
+
+    #[test]
+    fn persistent_refill_falls_back_to_blocking_wait() {
+        let mut wakes = 0;
+        // The inbox never empties and the passes are always used up: wake-later rounds,
+        // then a blocking wait, then the cycle starts over.
+        for _ in 0..2 {
+            for _ in 0..MAX_WAKE_ROUNDS {
+                assert_eq!(
+                    after_flush(true, MAX_IMMEDIATE_PASSES, &mut wakes),
+                    Next::WakeLater
+                );
+            }
+            assert_eq!(
+                after_flush(true, MAX_IMMEDIATE_PASSES, &mut wakes),
+                Next::Wait
+            );
+            assert_eq!(wakes, 0);
+        }
+        // An empty inbox in between resets the count.
+        after_flush(true, MAX_IMMEDIATE_PASSES, &mut wakes);
+        assert_eq!(after_flush(false, 0, &mut wakes), Next::Wait);
+        assert_eq!(wakes, 0);
     }
 
     #[test]

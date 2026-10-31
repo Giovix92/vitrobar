@@ -11,6 +11,13 @@
       - size: of the exe.
     Budgets: memory < 40 MB, CPU <= 50 ms in 30 s, exe < 5 MB (and with -MeasureStartup,
     bar window on screen < 300 ms after the launch).
+    With -StartPanel the check runs a different scenario: Vitrobar starts with --debug-state,
+    the check posts the debug message "Vitrobar.Debug.OpenStart" to its VitrobarNotify window
+    (honoured only with --debug-state; it toggles Start on the primary monitor), times the
+    post until a visible VitrobarPanel window exists (polled every 5 ms, 2 s at most), samples
+    the memory while the panel is open, toggles it closed with the same message, waits 3 s
+    and samples again. Budgets: open < 150 ms, memory open < 60 MB, 3 s after close < 40 MB
+    (and the exe size). The idle CPU figure is not measured in this mode.
     Prints one line of JSON and exits 1 when a budget is missed.
 
     Desktop safety: it only closes the windows and processes it started itself, never uses
@@ -36,6 +43,9 @@
     How many app windows to open (default 10, at most 10).
 .PARAMETER MeasureStartup
     Also time the launch until the bar window (class VitrobarBar) is visible.
+.PARAMETER StartPanel
+    Measure the Start panel (open time, memory open and after closing) instead of the idle
+    figures; see above.
 .PARAMETER MemoryReportOnly
     Report the memory but do not fail on it (CI: see .github/workflows/ci.yml).
 #>
@@ -43,6 +53,7 @@ param(
     [Parameter(Mandatory = $true)][string]$Exe,
     [ValidateRange(0, 10)][int]$Apps = 10,
     [switch]$MeasureStartup,
+    [switch]$StartPanel,
     [switch]$MemoryReportOnly
 )
 
@@ -55,6 +66,9 @@ $ExeBudgetMB = 5
 $StartupBudgetMs = 300
 $SettleSeconds = 10
 $SampleSeconds = 30
+$StartOpenBudgetMs = 150
+$StartOpenMemoryBudgetMB = 60
+$StartClosedMemoryBudgetMB = 40
 
 Add-Type -TypeDefinition @'
 using System;
@@ -134,6 +148,35 @@ public static class VitroPerf {
                 }
             }
             return new long[] { p.Id, ms };
+        } finally { timeEndPeriod(1); }
+    }
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern uint RegisterWindowMessageW(string s);
+
+    static bool PanelVisible(HashSet<uint> pids) {
+        foreach (var w in Windows()) if (w.Visible && w.Class == "VitrobarPanel" && pids.Contains(w.Pid)) return true;
+        return false;
+    }
+
+    // Posts the debug "toggle Start" message to the VitrobarNotify window of one of `pids`.
+    // Returns the stopwatch start tick (or -1 when there is no such window), then waits until
+    // a visible VitrobarPanel of those processes exists (want = true) or none does (want =
+    // false); returns the elapsed ms (-1 on timeout, -2 when the notify window is missing).
+    public static long ToggleStart(uint[] pidList, bool want, int timeoutMs) {
+        var pids = new HashSet<uint>(pidList);
+        IntPtr target = IntPtr.Zero;
+        foreach (var w in Windows()) if (w.Class == "VitrobarNotify" && pids.Contains(w.Pid)) target = w.Hwnd;
+        if (target == IntPtr.Zero) return -2;
+        uint msg = RegisterWindowMessageW("Vitrobar.Debug.OpenStart");
+        timeBeginPeriod(1);
+        try {
+            var sw = Stopwatch.StartNew();
+            PostMessageW(target, msg, IntPtr.Zero, IntPtr.Zero);
+            while (sw.ElapsedMilliseconds < timeoutMs) {
+                if (PanelVisible(pids) == want) return sw.ElapsedMilliseconds;
+                Thread.Sleep(5);
+            }
+            return -1;
         } finally { timeEndPeriod(1); }
     }
 
@@ -385,7 +428,8 @@ try {
     $result.exe_mb = [math]::Round($exeMB, 2)
     if ($exeMB -ge $ExeBudgetMB) { $failures.Add('exe_size') }
 
-    $launch = [VitroPerf]::StartAndWait($exePath, '', 'VitrobarBar', 5000, [bool]$MeasureStartup)
+    $launchArgs = if ($StartPanel) { '--debug-state' } else { '' }
+    $launch = [VitroPerf]::StartAndWait($exePath, $launchArgs, 'VitrobarBar', 5000, [bool]$MeasureStartup)
     [void]$vitroPids.Add([int]$launch[0])
     if ($MeasureStartup) {
         $result.startup_ms = $launch[1]
@@ -400,25 +444,51 @@ try {
 
     Start-Sleep -Seconds $SettleSeconds
 
-    $procs = @(Get-VitroProcesses)
-    $cpu0 = ($procs | Measure-Object -Property { $_.TotalProcessorTime.TotalMilliseconds } -Sum).Sum
-    $samples = [System.Collections.Generic.List[double]]::new()
-    $end = (Get-Date).AddSeconds($SampleSeconds)
-    while ((Get-Date) -lt $end) {
+    if ($StartPanel) {
+        $ids = [uint32[]]@($vitroPids | ForEach-Object { [uint32]$_ })
+        $openMs = [VitroPerf]::ToggleStart($ids, $true, 2000)
+        $result.start_open_ms = $openMs
+        if ($openMs -lt 0 -or $openMs -ge $StartOpenBudgetMs) { $failures.Add('start_open_time') }
+        if ($openMs -ge 0) {
+            Start-Sleep -Milliseconds 1500   # let the data workers and the first search settle
+            $openSamples = [System.Collections.Generic.List[double]]::new()
+            for ($i = 0; $i -lt 5; $i++) {
+                $openSamples.Add(((@(Get-VitroProcesses) | Measure-Object -Property PrivateMemorySize64 -Sum).Sum) / 1MB)
+                Start-Sleep -Milliseconds 200
+            }
+            $result.start_open_memory_mb = [math]::Round(($openSamples | Measure-Object -Maximum).Maximum, 2)
+            if ($result.start_open_memory_mb -ge $StartOpenMemoryBudgetMB) { $failures.Add('start_open_memory') }
+            $closeMs = [VitroPerf]::ToggleStart($ids, $false, 2000)
+            $result.start_close_ms = $closeMs
+            if ($closeMs -lt 0) { $failures.Add('start_not_closed') }
+        }
+        Start-Sleep -Seconds 3
         $procs = @(Get-VitroProcesses)
-        $samples.Add((($procs | Measure-Object -Property PrivateMemorySize64 -Sum).Sum) / 1MB)
-        Start-Sleep -Seconds 1
+        $result.processes = $procs.Count
+        $result.start_closed_memory_mb = [math]::Round((($procs | Measure-Object -Property PrivateMemorySize64 -Sum).Sum) / 1MB, 2)
+        $result.memory_detail = (@($procs | Sort-Object Id | ForEach-Object { "$($_.Id):$([math]::Round($_.PrivateMemorySize64 / 1MB, 2))" }) -join ' ')
+        if ($result.start_closed_memory_mb -ge $StartClosedMemoryBudgetMB) { $failures.Add('start_closed_memory') }
+    } else {
+        $procs = @(Get-VitroProcesses)
+        $cpu0 = ($procs | Measure-Object -Property { $_.TotalProcessorTime.TotalMilliseconds } -Sum).Sum
+        $samples = [System.Collections.Generic.List[double]]::new()
+        $end = (Get-Date).AddSeconds($SampleSeconds)
+        while ((Get-Date) -lt $end) {
+            $procs = @(Get-VitroProcesses)
+            $samples.Add((($procs | Measure-Object -Property PrivateMemorySize64 -Sum).Sum) / 1MB)
+            Start-Sleep -Seconds 1
+        }
+        $procs = @(Get-VitroProcesses)
+        $cpu1 = ($procs | Measure-Object -Property { $_.TotalProcessorTime.TotalMilliseconds } -Sum).Sum
+        $result.processes = $procs.Count
+        $result.memory_mb = [math]::Round(($samples | Measure-Object -Maximum).Maximum, 2)
+        $result.memory_detail = (@($procs | Sort-Object Id | ForEach-Object { "$($_.Id):$([math]::Round($_.PrivateMemorySize64 / 1MB, 2))" }) -join ' ')
+        $result.cpu_ms = [math]::Round($cpu1 - $cpu0, 1)
+        if ($result.memory_mb -ge $MemoryBudgetMB) {
+            if ($MemoryReportOnly) { $result.memory_enforced = $false } else { $failures.Add('memory') }
+        }
+        if ($result.cpu_ms -gt $CpuBudgetMs) { $failures.Add('cpu') }
     }
-    $procs = @(Get-VitroProcesses)
-    $cpu1 = ($procs | Measure-Object -Property { $_.TotalProcessorTime.TotalMilliseconds } -Sum).Sum
-    $result.processes = $procs.Count
-    $result.memory_mb = [math]::Round(($samples | Measure-Object -Maximum).Maximum, 2)
-    $result.memory_detail = (@($procs | Sort-Object Id | ForEach-Object { "$($_.Id):$([math]::Round($_.PrivateMemorySize64 / 1MB, 2))" }) -join ' ')
-    $result.cpu_ms = [math]::Round($cpu1 - $cpu0, 1)
-    if ($result.memory_mb -ge $MemoryBudgetMB) {
-        if ($MemoryReportOnly) { $result.memory_enforced = $false } else { $failures.Add('memory') }
-    }
-    if ($result.cpu_ms -gt $CpuBudgetMs) { $failures.Add('cpu') }
 } catch {
     $failures.Add("error: $($_.Exception.Message)")
 } finally {

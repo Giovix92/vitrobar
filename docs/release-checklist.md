@@ -419,6 +419,20 @@ folder name, Character Map and Paint by the process the check started.
    - `shell_ok` true: afterwards Explorer's `Shell_TrayWnd` is the only one and visible.
    `failures` names every budget missed, and every test window left open. Run it 3 times;
    all 3 must pass.
+   The Start panel, measured on its own (stage 2, Task 10):
+   `pwsh scripts/perf-check.ps1 -Exe targeteleaseitrobar.exe -StartPanel` -> one line
+   of JSON with `"pass": true`. It starts Vitrobar with `--debug-state`, posts the debug
+   message `Vitrobar.Debug.OpenStart` (a registered window message to the `VitrobarNotify`
+   window, ignored without `--debug-state`; it toggles Start on the primary monitor) and
+   times it until a visible `VitrobarPanel` window exists (polled every 5 ms):
+   - `start_open_ms` < 150;
+   - `start_open_memory_mb` < 60: largest sum of private bytes with the panel open;
+   - `start_close_ms` >= 0: a second message closes it;
+   - `start_closed_memory_mb` < 40: 3 s after closing;
+   - `shell_ok` true, as above. The idle CPU figure is not measured in this mode.
+   The time runs from the posted message to the visible window, not from a physical click;
+   the click-to-visible time is the `ms=` of the `vitrobar-start-open` line (Start menu,
+   step 1).
 2. GPU idle: with the bar idle and no panel open, Task Manager › Details › "GPU" column shows
    0 for `vitrobar.exe` for 60 s. Repeat for each material (`material = "frosted"`,
    `"liquid"`, `"smoked"`, `"solid-black"`, `"solid-white"` in `settings.toml`, restart the

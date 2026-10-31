@@ -50,6 +50,18 @@ pub const WM_APP_FILE_SEARCH: u32 = WM_APP + 0x25;
 /// The Start panel's app catalog or recent files were read (payload-free wake-up).
 pub const WM_APP_START_DATA: u32 = WM_APP + 0x26;
 
+/// The registered window message that toggles the Start panel on the primary monitor. The
+/// app honours it only when it runs with `--debug-state` (the perf check posts it).
+pub fn open_start_msg() -> u32 {
+    static ID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    // SAFETY: plain registration call with a static string.
+    *ID.get_or_init(|| unsafe {
+        windows::Win32::UI::WindowsAndMessaging::RegisterWindowMessageW(windows::core::w!(
+            "Vitrobar.Debug.OpenStart"
+        ))
+    })
+}
+
 /// Timers on the notify window (ids distinct from the tracker's 0x5601/0x5602).
 pub const TIMER_CLOCK: usize = 0x5701;
 pub const TIMER_GPU_RETRY: usize = 0x5702;
@@ -104,6 +116,8 @@ pub struct Inbox {
     pub start_data: bool,
     /// `WM_VITRO_KEY`: drain the keyboard hook's outputs.
     pub keys: bool,
+    /// The debug message [`open_start_msg`] arrived (only acted on with `--debug-state`).
+    pub debug_open_start: bool,
 }
 
 thread_local! {
@@ -248,6 +262,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_DWMCOLORIZATIONCOLORCHANGED | WM_THEMECHANGED => with_inbox(|i| i.theme = true),
         WM_TIMECHANGE => with_inbox(|i| i.clock = true),
+        m if m == open_start_msg() => {
+            // Payload-free; ignored by the app unless it runs with --debug-state.
+            with_inbox(|i| i.debug_open_start = true);
+            return LRESULT(0);
+        }
         m if m == taskbar_created_msg() => {
             with_inbox(|i| i.taskbar_created = true);
             return LRESULT(0);

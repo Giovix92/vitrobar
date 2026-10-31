@@ -16,6 +16,11 @@ use std::sync::Mutex;
 pub const QUEUE_CAP: usize = 10_000;
 
 /// A FIFO with a "wake-up already posted" flag, so a burst costs one window message.
+///
+/// Single producer per queue: the wake-up flag is a hand-off between one pushing thread and
+/// the consumer (the key hook's queue has exactly one producer, the hook thread). Several
+/// producers would still be memory safe, but each queue should keep to one so the ordering
+/// and the wake-up accounting stay simple.
 pub struct WakeQueue<T> {
     items: Mutex<VecDeque<T>>,
     wake_pending: AtomicBool,
