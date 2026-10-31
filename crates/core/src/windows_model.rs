@@ -50,7 +50,27 @@ pub enum ClickAction {
 }
 
 pub fn is_taskbar_window(w: &WindowInfo) -> bool {
-    w.visible && !w.cloaked_by_app && (w.app_window || (!w.tool_window && !w.has_owner))
+    w.visible
+        && !w.cloaked_by_app
+        && (w.app_window || (!w.tool_window && !w.has_owner))
+        && !w.exe_path.as_deref().is_some_and(is_shell_surface)
+}
+
+/// Windows' own shell surfaces (Start, search, notification centre and calendar, the
+/// touch keyboard, the lock screen): some report themselves as plain app windows, but the
+/// stock taskbar never lists them.
+fn is_shell_surface(exe_path: &str) -> bool {
+    const SHELL: &[&str] = &[
+        "shellexperiencehost.exe",
+        "shellhost.exe",
+        "startmenuexperiencehost.exe",
+        "searchhost.exe",
+        "searchapp.exe",
+        "textinputhost.exe",
+        "lockapp.exe",
+    ];
+    let name = exe_path.rsplit(['\\', '/']).next().unwrap_or(exe_path);
+    SHELL.iter().any(|s| name.eq_ignore_ascii_case(s))
 }
 
 pub fn group_key(w: &WindowInfo) -> GroupKey {
@@ -268,6 +288,27 @@ mod tests {
     #[test]
     fn plain_window_shown() {
         assert!(is_taskbar_window(&w()));
+    }
+
+    #[test]
+    fn shell_surfaces_hidden_even_as_app_windows() {
+        // The stock notification centre / calendar reports itself as a plain app window.
+        for exe in [
+            r"C:\Windows\SystemApps\ShellExperienceHost_cw5n1h2txyewy\ShellExperienceHost.exe",
+            r"C:\Windows\SystemApps\MicrosoftWindows.Client.CBS_cw5n1h2txyewy\ShellHost.exe",
+            r"C:\WINDOWS\SystemApps\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\StartMenuExperienceHost.exe",
+            r"C:\Windows\SystemApps\MicrosoftWindows.Client.CBS_cw5n1h2txyewy\SearchHost.exe",
+            r"C:\Windows\SystemApps\MicrosoftWindows.Client.CBS_cw5n1h2txyewy\TextInputHost.exe",
+            r"C:\Windows\SystemApps\Microsoft.LockApp_cw5n1h2txyewy\LockApp.exe",
+        ] {
+            let mut x = w().app_window();
+            x.exe_path = Some(exe.into());
+            assert!(!is_taskbar_window(&x), "{exe}");
+        }
+        // Other system programs still show (File Explorer windows, Settings, Notepad).
+        let mut x = w();
+        x.exe_path = Some(r"C:\Windows\explorer.exe".into());
+        assert!(is_taskbar_window(&x));
     }
 
     #[test]
