@@ -21,10 +21,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetForegroundWindow, GetWindowLongPtrW,
     GetWindowRect, IsIconic, IsWindow, LoadCursorW, LoadIconW, RegisterClassExW,
     SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
-    GWLP_USERDATA, GWL_EXSTYLE, HTCAPTION, HTCLIENT, HWND_TOPMOST, IDC_ARROW, MA_ACTIVATE,
-    SWP_NOACTIVATE, SWP_NOZORDER, SW_RESTORE, SW_SHOW, WA_INACTIVE, WM_ACTIVATE, WM_CLOSE,
-    WM_DPICHANGED, WM_MOUSEACTIVATE, WM_NCHITTEST, WNDCLASSEXW, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
-    WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    GWLP_USERDATA, HTCAPTION, HTCLIENT, HWND_TOPMOST, IDC_ARROW, MA_ACTIVATE, SWP_NOACTIVATE,
+    SWP_NOZORDER, SW_RESTORE, SW_SHOW, WA_INACTIVE, WM_ACTIVATE, WM_CLOSE, WM_DPICHANGED,
+    WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEACTIVATE, WM_NCHITTEST, WM_RBUTTONDOWN, WNDCLASSEXW,
+    WS_EX_APPWINDOW, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::UI::Composition::Desktop::DesktopWindowTarget;
 use windows::UI::Composition::{
@@ -108,6 +108,8 @@ thread_local! {
     /// Panels asked to close (`WM_CLOSE`: Alt+F4, a taskbar's "Close window") since the last
     /// [`take_panel_close_requests`].
     static PANEL_CLOSE: RefCell<Vec<HWND>> = const { RefCell::new(Vec::new()) };
+    /// Panels that got a mouse button press since the last [`take_panel_clicks`].
+    static PANEL_CLICKS: RefCell<Vec<HWND>> = const { RefCell::new(Vec::new()) };
     /// Panels moved to a monitor of another DPI: (window, new DPI, suggested rect).
     static PANEL_DPI: RefCell<Vec<(HWND, u32, PxRect)>> = const { RefCell::new(Vec::new()) };
 }
@@ -132,6 +134,12 @@ pub fn take_panel_deactivated() -> Vec<HWND> {
     PANEL_DEACTIVATED.with(|d| std::mem::take(&mut *d.borrow_mut()))
 }
 
+/// Panels that got a mouse button press (or were about to be activated by one) since the
+/// last call. The owner of a fading panel drops it on the first one.
+pub fn take_panel_clicks() -> Vec<HWND> {
+    PANEL_CLICKS.with(|d| std::mem::take(&mut *d.borrow_mut()))
+}
+
 /// Panels that were asked to close since the last call. A panel never destroys itself on
 /// `WM_CLOSE`: its owner drops it (and its visuals) instead.
 pub fn take_panel_close_requests() -> Vec<HWND> {
@@ -147,7 +155,15 @@ pub fn take_panel_dpi_changes() -> Vec<(HWND, u32, PxRect)> {
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         // The panel takes focus when clicked.
-        WM_MOUSEACTIVATE => LRESULT(MA_ACTIVATE as isize),
+        WM_MOUSEACTIVATE => {
+            PANEL_CLICKS.with(|d| d.borrow_mut().push(hwnd));
+            LRESULT(MA_ACTIVATE as isize)
+        }
+        WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN => {
+            PANEL_CLICKS.with(|d| d.borrow_mut().push(hwnd));
+            // SAFETY: default handling with the arguments we were given.
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
         WM_ACTIVATE => {
             if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE {
                 PANEL_DEACTIVATED.with(|d| d.borrow_mut().push(hwnd));
@@ -334,24 +350,21 @@ impl Panel {
     }
 
     /// The reverse of [`Panel::animate_open`]: fades the panel out over `ms` while it slides
-    /// back / shrinks, and stops it taking input at once (clicks pass through to what is
-    /// behind, and it can no longer be activated). The owner drops it once `ms` has passed.
+    /// back / shrinks, starting from what is on screen now (a close during the open
+    /// animation does not pop). The window still takes mouse input while it fades: the owner
+    /// drops it on the first click ([`take_panel_clicks`]) and once `ms` has passed.
     pub fn animate_close(&self, ms: u32, motion: Motion) -> Result<()> {
-        // SAFETY: plain calls on our own window.
-        unsafe {
-            let ex = GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE);
-            SetWindowLongPtrW(
-                self.hwnd,
-                GWL_EXSTYLE,
-                ex | (WS_EX_TRANSPARENT.0 | WS_EX_NOACTIVATE.0) as isize,
-            );
-        }
+        // Stop the open animation where it is; the close starts from that state.
+        let _ = self.root.StopAnimation(h!("Opacity"));
+        let _ = self.root.StopAnimation(h!("Scale"));
+        let _ = self.root.StopAnimation(h!("Offset"));
+        let opacity = self.root.Opacity()?;
         let comp = self.root.Compositor()?;
         let ease =
             comp.CreateCubicBezierEasingFunction(Vector2::new(0.4, 0.0), Vector2::new(1.0, 1.0))?;
         let span = duration(ms);
         let fade = comp.CreateScalarKeyFrameAnimation()?;
-        fade.InsertKeyFrame(0.0, 1.0)?;
+        fade.InsertKeyFrame(0.0, opacity)?;
         fade.InsertKeyFrameWithEasingFunction(1.0, 0.0, &ease)?;
         fade.SetDuration(span)?;
         let mv = self.motion_animation(&comp, motion, false, &ease, span)?;
@@ -382,16 +395,26 @@ impl Panel {
                 )
             }
             Motion::Rise { from } => {
-                let base = self.root.Offset()?;
+                // The root never sits anywhere but 0 (as `show_static` assumes).
                 let (dx, dy) = rise_offset(from, self.scale);
                 (
                     h!("Offset"),
-                    base,
-                    Vector3::new(base.X + dx, base.Y + dy, base.Z),
+                    Vector3::new(0.0, 0.0, 0.0),
+                    Vector3::new(dx, dy, 0.0),
                 )
             }
         };
-        let (start, end) = if opening { (away, rest) } else { (rest, away) };
+        let (start, end) = if opening {
+            (away, rest)
+        } else {
+            // From the current state (an open animation may have been cut short).
+            let now = if prop == h!("Scale") {
+                self.root.Scale()?
+            } else {
+                self.root.Offset()?
+            };
+            (now, away)
+        };
         anim.InsertKeyFrame(0.0, start)?;
         anim.InsertKeyFrameWithEasingFunction(1.0, end, ease)?;
         anim.SetDuration(span)?;

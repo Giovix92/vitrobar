@@ -56,7 +56,8 @@ use vitro_render::compositor::{init_compositor, Comp};
 use vitro_render::device::{create_gpu_device, GpuDevice};
 use vitro_render::flyout::{live_thumbnails, take_deactivated, Flyout, ThumbnailStrip};
 use vitro_render::panel::{
-    take_panel_close_requests, take_panel_deactivated, take_panel_dpi_changes, Motion,
+    take_panel_clicks, take_panel_close_requests, take_panel_deactivated, take_panel_dpi_changes,
+    Motion,
 };
 use vitro_render::settings_view::{SettingsLook, WINDOW_H_DIP, WINDOW_W_DIP};
 use vitro_render::surfaces::{FontKind, Painter};
@@ -90,9 +91,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetCursorPos, GetForegroundWindow, GetMessagePos, GetWindowThreadProcessId,
     IsWindow, KillTimer, MsgWaitForMultipleObjectsEx, PeekMessageW, PostMessageW, PostQuitMessage,
-    PostThreadMessageW, SetTimer, TranslateMessage, MSG, MWMO_INPUTAVAILABLE, PM_REMOVE,
-    QS_ALLINPUT, WM_CHAR, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_NULL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
+    PostThreadMessageW, SetForegroundWindow, SetTimer, TranslateMessage, MSG, MWMO_INPUTAVAILABLE,
+    PM_REMOVE, QS_ALLINPUT, WM_CHAR, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_NULL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
 };
 
 use crate::bar_window::{
@@ -359,6 +360,24 @@ fn foreground() -> Option<Hwnd> {
     // SAFETY: plain query.
     let h = unsafe { GetForegroundWindow() };
     (!h.0.is_null()).then_some(h.0 as usize as Hwnd)
+}
+
+/// A panel that fades out must not keep the keyboard: if it is the foreground window, hands
+/// the foreground back to the window that had it before Start opened. False when it cannot
+/// (that window is gone, or Windows refuses): the caller then drops the panel at once, so
+/// Windows picks the next window.
+fn give_back_foreground(sp: &StartPanel) -> bool {
+    // SAFETY: plain queries and a foreground request for a window handle we only test.
+    unsafe {
+        if GetForegroundWindow() != sp.hwnd() {
+            return true;
+        }
+        let prev = HWND(sp.fg_at_open as *mut _);
+        sp.fg_at_open != 0
+            && IsWindow(Some(prev)).as_bool()
+            && SetForegroundWindow(prev).as_bool()
+            && GetForegroundWindow() != sp.hwnd()
+    }
 }
 
 /// `h` belongs to this process (a bar, the Start panel, a flyout). Read while it exists.
@@ -2880,10 +2899,12 @@ impl App {
             return;
         };
         if let Some(open) = self.start.as_ref().map(|s| s.monitor) {
-            self.close_start();
             if open == id {
+                self.close_start();
                 return;
             }
+            // Moving to another monitor: no fade for a panel that is about to reappear.
+            self.close_start_now();
         }
         self.open_start(k, dirty);
     }
@@ -3041,7 +3062,7 @@ impl App {
         let srcs = sp.icon_srcs.clone();
         // The next panel's query revisions continue after this one's.
         self.start_data.last_rev = self.start_data.last_rev.max(sp.state.query_rev);
-        if animate && self.sys.animations {
+        if animate && self.sys.animations && give_back_foreground(&sp) {
             let (ms, motion) = if sp.state.grid {
                 (GRID_CLOSE_MS, Motion::Grow)
             } else {
@@ -3917,6 +3938,15 @@ impl App {
         {
             // A click elsewhere or a switch to another app.
             self.close_start();
+        }
+        // A click on the fading panel: it goes now (that click is lost; accepted).
+        let clicked = take_panel_clicks();
+        if self
+            .start_closing
+            .as_ref()
+            .is_some_and(|s| clicked.contains(&s.hwnd()))
+        {
+            self.drop_start_closing();
         }
         for h in take_panel_close_requests() {
             // Alt+F4 through the system menu, or "Close window" on a bar's app menu.
