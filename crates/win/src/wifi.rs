@@ -324,6 +324,10 @@ unsafe extern "system" fn on_notification(data: *mut L2_NOTIFICATION_DATA, ctx: 
                 } else if failed_code {
                     // No usable payload: the empty SSID means "the attempt we started".
                     shared.wake(Change::ConnectFailed(String::new()));
+                } else {
+                    // Connected, payload missing: the only pending attempt is the one done.
+                    lock(&shared.created).take();
+                    lock(&shared.foreign).take();
                 }
             }
             _ => {}
@@ -397,26 +401,30 @@ impl Wifi {
     /// A failed attempt removes the profile *this service* created for it (never any other);
     /// a failed attempt through a pre-existing profile adds `Error(HandOff)`.
     pub fn drain_changes(&self) -> Vec<Change> {
-        let mut changes = self.shared.queue.drain();
-        let mut extra = Vec::new();
-        for c in &changes {
-            if let Change::ConnectFailed(ssid) = c {
+        let mut out = Vec::new();
+        for c in self.shared.queue.drain() {
+            let Change::ConnectFailed(ssid) = &c else {
+                out.push(c);
+                continue;
+            };
+            {
                 let mut created = lock(&self.shared.created);
                 if created.as_deref().is_some_and(|n| ssid.is_empty() || n == ssid) {
                     if let Some(name) = created.take() {
                         self.delete_profile(&name);
                     }
                 }
-                drop(created);
-                let mut foreign = lock(&self.shared.foreign);
-                if foreign.as_deref().is_some_and(|n| ssid.is_empty() || n == ssid) {
-                    foreign.take();
-                    extra.push(Change::Error(WifiError::HandOff));
-                }
+            }
+            let mut foreign = lock(&self.shared.foreign);
+            if foreign.as_deref().is_some_and(|n| ssid.is_empty() || n == ssid) {
+                // One outcome for the panel: hand off to Windows.
+                foreign.take();
+                out.push(Change::Error(WifiError::HandOff));
+            } else {
+                out.push(c);
             }
         }
-        changes.extend(extra);
-        changes
+        out
     }
 
     /// Deletes a profile this service created.
@@ -482,6 +490,8 @@ impl Wifi {
             .max_by_key(|e| (e.known, e.signal))
             .ok_or(WifiError::Failed)?;
         if entry.known {
+            // A stale attempt of ours is forgotten (not deleted: its outcome may be pending).
+            lock(&self.shared.created).take();
             return self.start_connect(&entry.profile);
         }
         let (auth, pw) = match entry.kind {
@@ -649,10 +659,9 @@ struct RawEntry {
 impl Drop for Wifi {
     fn drop(&mut self) {
         self.shared.closed.store(true, Ordering::Release);
-        // A connect that never completed leaves no profile of ours behind.
-        if let Some(name) = lock(&self.shared.created).take() {
-            self.delete_profile(&name);
-        }
+        // A pending attempt keeps its profile (the user may have clicked away right after
+        // Connect); only one whose failure is already queued is cleaned up.
+        let _ = self.drain_changes();
         // SAFETY: unregistering waits for a running callback to finish, so the context can
         // be released afterwards; the radio worker ends when `jobs` is dropped.
         unsafe {
