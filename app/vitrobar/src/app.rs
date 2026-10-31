@@ -3601,7 +3601,7 @@ impl App {
             return;
         };
         let (rect, dpi) = (sw.rect_px(), sw.dpi);
-        if let Err(e) = sw.reshape(&self.comp, rect, dpi, &self.style) {
+        if let Err(e) = sw.reshape(&self.comp, rect, dpi, &self.style, &self.settings) {
             eprintln!("vitrobar: the settings window could not be restyled: {e}");
         }
     }
@@ -3728,7 +3728,7 @@ impl App {
         let Some(sw) = self.settings_win.as_mut() else {
             return;
         };
-        if let Err(e) = sw.reshape(&self.comp, rect, dpi, &self.style) {
+        if let Err(e) = sw.reshape(&self.comp, rect, dpi, &self.style, &self.settings) {
             eprintln!("vitrobar: the settings window could not follow the DPI: {e}");
         }
         self.settings_render();

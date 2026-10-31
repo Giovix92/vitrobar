@@ -18,7 +18,7 @@ use vitro_render::flyout::PxRect;
 use vitro_render::panel::Panel;
 use vitro_render::settings_view::{
     close_rect, hit, max_scroll, reveal, viewport_h, Interaction, SettingsLook, SettingsView, Spot,
-    CLOSE_W_DIP, DRAG_DIP, RADIUS_DIP, WINDOW_W_DIP,
+    CLOSE_W_DIP, DRAG_DIP, RADIUS_DIP,
 };
 use vitro_render::surfaces::Painter;
 use windows::core::Result;
@@ -124,6 +124,9 @@ pub struct SettingsCtl {
     pub keyboard: bool,
     /// px per DIP.
     pub scale: f32,
+    /// Window width, DIP: [`vitro_render::settings_view::WINDOW_W_DIP`], or less on a narrow work area. The controls and
+    /// the close button are laid out for it.
+    pub width_dip: f32,
     /// Window height, DIP.
     pub height_dip: f32,
     /// The last pointer position (client px), to find the hover again after a scroll.
@@ -131,14 +134,15 @@ pub struct SettingsCtl {
 }
 
 impl SettingsCtl {
-    pub fn new(s: &Settings, scale: f32, height_dip: f32) -> Self {
+    pub fn new(s: &Settings, scale: f32, width_dip: f32, height_dip: f32) -> Self {
         Self {
-            model: build_model(s, WINDOW_W_DIP),
+            model: build_model(s, width_dip),
             scroll: 0.0,
             hover: None,
             pressed: None,
             keyboard: false,
             scale,
+            width_dip,
             height_dip,
             last_pt: None,
         }
@@ -147,7 +151,7 @@ impl SettingsCtl {
     /// The settings changed: show them (focus and scroll stay).
     pub fn rebuild(&mut self, s: &Settings) {
         let focus = self.model.focus;
-        self.model = build_model(s, WINDOW_W_DIP);
+        self.model = build_model(s, self.width_dip);
         self.model.focus = focus.min(self.model.controls.len().saturating_sub(1));
         self.scroll = self.scroll.clamp(0.0, self.max_scroll());
     }
@@ -171,7 +175,7 @@ impl SettingsCtl {
     /// The part under client px `pt`.
     pub fn spot_at(&self, pt: (i32, i32)) -> Option<Spot> {
         let (x, y) = (pt.0 as f32 / self.scale, pt.1 as f32 / self.scale);
-        let close = close_rect(WINDOW_W_DIP);
+        let close = close_rect(self.width_dip);
         if x >= close.x && x < close.right() && y >= close.y && y < close.bottom() {
             return Some(Spot::Close);
         }
@@ -375,11 +379,12 @@ impl SettingsWindow {
         panel.set_drag_exclude_right(CLOSE_W_DIP);
         let view = SettingsView::new(&panel)?;
         let scale = panel.scale();
+        let width_dip = (rect_px.2 - rect_px.0) as f32 / scale;
         let height_dip = (rect_px.3 - rect_px.1) as f32 / scale;
         Ok(Self {
             view,
             panel,
-            ctl: SettingsCtl::new(settings, scale, height_dip),
+            ctl: SettingsCtl::new(settings, scale, width_dip, height_dip),
             dpi,
             tracking: false,
         })
@@ -402,19 +407,22 @@ impl SettingsWindow {
         self.panel.set_title(title);
     }
 
-    /// Moves / resizes the window (a DPI change) or only redraws its glass (`style`).
+    /// Moves / resizes the window (a DPI change) or only redraws its glass (`style`); the
+    /// controls of `settings` are laid out again for the new width.
     pub fn reshape(
         &mut self,
         comp: &Comp,
         rect_px: PxRect,
         dpi: u32,
         style: &MaterialStyle,
+        settings: &Settings,
     ) -> Result<()> {
         self.panel.move_to(comp, rect_px, dpi, style)?;
         self.dpi = dpi;
         self.ctl.scale = self.panel.scale();
+        self.ctl.width_dip = (rect_px.2 - rect_px.0) as f32 / self.ctl.scale;
         self.ctl.height_dip = (rect_px.3 - rect_px.1) as f32 / self.ctl.scale;
-        self.ctl.scroll = self.ctl.scroll.clamp(0.0, self.ctl.max_scroll());
+        self.ctl.rebuild(settings);
         Ok(())
     }
 
@@ -437,10 +445,10 @@ impl SettingsWindow {
 mod tests {
     use super::*;
     use vitro_core::settings::{Material, Shape};
-    use vitro_render::settings_view::{parts, WINDOW_H_DIP};
+    use vitro_render::settings_view::{parts, WINDOW_H_DIP, WINDOW_W_DIP};
 
     fn ctl() -> SettingsCtl {
-        SettingsCtl::new(&Settings::default(), 1.5, WINDOW_H_DIP)
+        SettingsCtl::new(&Settings::default(), 1.5, WINDOW_W_DIP, WINDOW_H_DIP)
     }
 
     fn index(c: &SettingsCtl, id: ControlId) -> usize {
@@ -588,6 +596,34 @@ mod tests {
     }
 
     #[test]
+    fn a_narrow_window_lays_out_and_hit_tests_at_its_own_width() {
+        // A 600 DIP work area (less than the 720 DIP the window wants), at 150 %.
+        let mut c = SettingsCtl::new(&Settings::default(), 1.5, 600.0, WINDOW_H_DIP);
+        // Every control fits the window, none is clipped at 720.
+        for ctrl in &c.model.controls {
+            assert!(ctrl.rect.right() <= 600.0, "{:?} is clipped", ctrl.id);
+            for (_, r) in parts(ctrl, 0) {
+                assert!(r.right() <= 600.0, "a part of {:?} is clipped", ctrl.id);
+            }
+        }
+        // The close button is where the view draws it: at the right edge of 600 DIP ...
+        let close = close_rect(600.0);
+        let pt = (
+            ((close.x + close.w / 2.0) * c.scale) as i32,
+            ((close.h / 2.0) * c.scale) as i32,
+        );
+        assert_eq!(c.spot_at(pt), Some(Spot::Close));
+        assert_eq!(click(&mut c, pt), SettingsAction::Close);
+        // ... and just left of it is the drag band (the window's own width, not 720 DIP,
+        // decides where the button starts).
+        let x = ((close.x - 4.0) * c.scale) as i32;
+        assert_eq!(c.spot_at((x, pt.1)), None);
+        // A setting change keeps the narrow layout.
+        c.rebuild(&Settings::default());
+        assert!(c.model.controls.iter().all(|k| k.rect.right() <= 600.0));
+    }
+
+    #[test]
     fn effects_follow_the_brief() {
         let s = Settings {
             start_with_windows: false,
@@ -655,7 +691,7 @@ mod tests {
             accent: Some(0x123456),
             ..Settings::default()
         };
-        let mut c = SettingsCtl::new(&s, 1.0, WINDOW_H_DIP);
+        let mut c = SettingsCtl::new(&s, 1.0, WINDOW_W_DIP, WINDOW_H_DIP);
         c.model.focus = index(&c, ControlId::Accent);
         assert_eq!(
             key(&mut c, VK_RIGHT),
