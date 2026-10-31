@@ -1,10 +1,10 @@
 //! Display monitors in physical pixels (the process is Per-Monitor-V2 DPI aware).
 
 use windows::core::BOOL;
-use windows::Win32::Foundation::{LPARAM, POINT, RECT};
+use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, HDC, HMONITOR, MONITORINFO,
-    MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
+    EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, HDC, HMONITOR,
+    MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL,
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::MONITORINFOF_PRIMARY;
@@ -69,6 +69,19 @@ unsafe extern "system" fn collect(hmon: HMONITOR, _: HDC, _: *mut RECT, data: LP
 /// The [`MonitorInfo::id`] of a monitor handle (what `WindowInfo::monitor` holds).
 pub fn monitor_id(hmon: HMONITOR) -> Option<u64> {
     info(hmon).map(|m| m.id)
+}
+
+/// The [`MonitorInfo::id`] of the monitor showing (most of) window `h`.
+pub fn window_monitor(h: HWND) -> Option<u64> {
+    if h.is_invalid() {
+        return None;
+    }
+    // SAFETY: plain query; a stale handle yields a null monitor.
+    let hmon = unsafe { MonitorFromWindow(h, MONITOR_DEFAULTTONULL) };
+    if hmon.is_invalid() {
+        return None;
+    }
+    monitor_id(hmon)
 }
 
 /// The work area (the monitor minus the space appbars reserve) of the monitor whose

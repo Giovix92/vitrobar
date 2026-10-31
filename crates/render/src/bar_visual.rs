@@ -8,6 +8,9 @@
 //! Hover effects ([`HoverStyle`]) are composition animations on the app items: the
 //! compositor runs them, so a hover costs one `update` and no surface redraw. With
 //! [`VisualEnv::animations`] off, the final values are set without animation.
+//!
+//! Keyboard focus mode (Win+T / Win+B) draws a 2 DIP accent ring around the focused item
+//! ([`BarVisual::set_focus`]), above everything else on the bar.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,8 +23,8 @@ use windows::core::{h, Interface, Result, HSTRING};
 use windows::Foundation::TimeSpan;
 use windows::UI::Composition::{
     CompositionColorBrush, CompositionDrawingSurface, CompositionEasingFunction,
-    CompositionMappingMode, CompositionRoundedRectangleGeometry, Compositor, ContainerVisual,
-    ShapeVisual, SpriteVisual, Visual, VisualCollection,
+    CompositionMappingMode, CompositionRoundedRectangleGeometry, CompositionSpriteShape,
+    Compositor, ContainerVisual, ShapeVisual, SpriteVisual, Visual, VisualCollection,
 };
 use windows_numerics::{Vector2, Vector3};
 
@@ -29,6 +32,19 @@ use crate::compositor::Comp;
 use crate::device::GpuDevice;
 use crate::material::{backdrop_visual, color};
 use crate::surfaces::{FontKind, Painter};
+
+/// The bar item keyboard focus mode is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BarFocus {
+    /// `layout.apps[i]`.
+    App(usize),
+    /// `layout.tray[i]`.
+    Tray(usize),
+    Chevron,
+}
+
+/// Width of the focus ring.
+pub const FOCUS_RING_DIP: f32 = 2.0;
 
 /// What an app item shows. `dots` is the number of running windows, capped at 3.
 /// The icon is shared with the icon store, never copied; a different `Arc` counts as a
@@ -814,6 +830,65 @@ fn sync(
     }
 }
 
+/// The focus ring: an accent-stroked rounded rectangle in a visual the size of the surface.
+struct FocusRing {
+    visual: ShapeVisual,
+    geom: CompositionRoundedRectangleGeometry,
+    shape: CompositionSpriteShape,
+    brush: CompositionColorBrush,
+    /// Outer edge (surface px), corner radius, width and colour while shown.
+    shown: Option<(PxRect, i32, i32, Rgba)>,
+}
+
+impl FocusRing {
+    fn new(comp: &Compositor, parent: &VisualCollection) -> Result<Self> {
+        let geom = comp.CreateRoundedRectangleGeometry()?;
+        let brush = comp.CreateColorBrush()?;
+        let shape = comp.CreateSpriteShapeWithGeometry(&geom)?;
+        shape.SetStrokeBrush(&brush)?;
+        let visual = comp.CreateShapeVisual()?;
+        visual.Shapes()?.Append(&shape)?;
+        parent.InsertAtTop(&visual)?;
+        Ok(Self {
+            visual,
+            geom,
+            shape,
+            brush,
+            shown: None,
+        })
+    }
+
+    /// `outer`: the ring's outer edge (surface px), `t` its width.
+    fn set(&mut self, size: Vector2, outer: PxRect, radius: i32, t: i32, c: Rgba) -> Result<()> {
+        let t = t.max(1);
+        let key = (outer, radius, t, c);
+        if self.shown == Some(key) {
+            return Ok(());
+        }
+        let half = t as f32 / 2.0;
+        self.visual.SetSize(size)?;
+        // The stroke is centred on the geometry: inset by half its width.
+        self.geom
+            .SetOffset(Vector2::new(outer.x as f32 + half, outer.y as f32 + half))?;
+        self.geom.SetSize(Vector2::new(
+            (outer.w - t).max(0) as f32,
+            (outer.h - t).max(0) as f32,
+        ))?;
+        let r = (radius as f32 - half).max(0.0);
+        self.geom.SetCornerRadius(Vector2::new(r, r))?;
+        self.shape.SetStrokeThickness(t as f32)?;
+        self.brush.SetColor(color(c))?;
+        self.visual.SetIsVisible(true)?;
+        self.shown = Some(key);
+        Ok(())
+    }
+
+    fn hide(&mut self) -> Result<()> {
+        self.shown = None;
+        self.visual.SetIsVisible(false)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct BackdropKey {
     size: (i32, i32),
@@ -838,6 +913,8 @@ pub struct BarVisual {
     clock: Option<Cell>,
     tray_items: Vec<TrayItemState>,
     chevron_state: ChevronState,
+    focus: Option<BarFocus>,
+    ring: Option<FocusRing>,
     surfaces_drawn: u64,
 }
 
@@ -875,6 +952,8 @@ impl BarVisual {
             clock: None,
             tray_items: Vec::new(),
             chevron_state: ChevronState::default(),
+            focus: None,
+            ring: None,
             surfaces_drawn: 0,
         })
     }
@@ -929,6 +1008,18 @@ impl BarVisual {
     pub fn set_tray(&mut self, items: Vec<TrayItemState>, chevron: ChevronState) {
         self.tray_items = items;
         self.chevron_state = chevron;
+    }
+
+    /// The item keyboard focus mode is on (`None`: no focus ring); takes effect on the next
+    /// [`BarVisual::update`]. An item on another surface of the bar shows no ring here.
+    pub fn set_focus(&mut self, focus: Option<BarFocus>) {
+        self.focus = focus;
+    }
+
+    /// The focus ring's outer edge in surface px while it shows (diagnostics and tests).
+    pub fn focus_ring(&self) -> Option<(i32, i32, i32, i32)> {
+        let (r, ..) = self.ring.as_ref()?.shown?;
+        Some((r.x, r.y, r.x + r.w, r.y + r.h))
     }
 
     /// Number of tray icons currently in the tree (diagnostics and tests).
@@ -1202,6 +1293,36 @@ impl BarVisual {
         drawn += sync(&mut self.quick, quick, comp, painter, &parent, anim)?;
         drawn += sync(&mut self.clock, clock_spec, comp, painter, &parent, anim)?;
         self.surfaces_drawn += u64::from(drawn);
+
+        // Around the item's plate (the same inset and corner radius).
+        let focused = self.focus.and_then(|f| match f {
+            BarFocus::App(i) => layout.apps.get(i),
+            BarFocus::Tray(i) => layout.tray.get(i),
+            BarFocus::Chevron => cs.shown.then_some(&layout.overflow_chevron),
+        });
+        match focused.filter(|r| owns(&surface, r) && r.w > 0.0) {
+            Some(r) => {
+                let c = cell_rect(r);
+                let outer = PxRect {
+                    x: c.x + plate_inset,
+                    y: c.y + plate_inset,
+                    w: c.w - 2 * plate_inset,
+                    h: c.h - 2 * plate_inset,
+                };
+                if self.ring.is_none() {
+                    self.ring = Some(FocusRing::new(&self.comp, &self.root.Children()?)?);
+                }
+                let size_v = Vector2::new(size.0 as f32, size.1 as f32);
+                if let Some(ring) = self.ring.as_mut() {
+                    ring.set(size_v, outer, plate_radius, px(FOCUS_RING_DIP), accent)?;
+                }
+            }
+            None => {
+                if let Some(ring) = self.ring.as_mut().filter(|r| r.shown.is_some()) {
+                    ring.hide()?;
+                }
+            }
+        }
         Ok(())
     }
 }

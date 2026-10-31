@@ -281,6 +281,54 @@ with `--debug-state` and `VITROBAR_POWER_DRY_RUN=1`: every power action is then 
     closes; so do deactivation, launching an app and a second click on Start. Memory with the
     grid scrolled through under 60 MB, 3 s after closing under 40 MB.
 
+## Keyboard
+
+Introduced by stage 2, Task 8. A low-level keyboard hook (its own thread, `vitrobar-keys`)
+gives the Windows key to Vitrobar: a lone tap opens Vitrobar's Start, Win+1…9 act on the bar's
+apps, Win+T / Win+B put a focus ring on the bar's apps / tray. Every other Windows shortcut
+stays exactly stock. The hook never stores or logs keys (`--debug-state` shows only
+`"keys":{"hook","enabled","focus","calls","max_us"}`). The actions apply to the bar of the
+monitor showing the foreground window. These steps need a real keyboard: injected keys are
+ignored by the hook by design.
+
+1. Tap the Windows key (left, then right): Vitrobar's Start opens on the monitor of the
+   foreground window and takes the keyboard (the caret blinks in the search box; type at
+   once). Tap again: it closes. The stock Start never flashes. With the full-screen grid
+   (`start-style = "full-screen"`) the grid opens instead.
+2. Stock shortcuts, each exactly as without Vitrobar: Win+E (Explorer), Win+R (Run), Win+D
+   (desktop, again to come back), Win+Shift+S (snipping), Win+I (Settings), Win+V (clipboard
+   history), Win+. (emoji), Win+Tab, Win+←/→ (snap), Ctrl+Win+D / Ctrl+Win+←/→ (virtual
+   desktops), Shift+Win+3 (new instance of the 3rd app, Windows' own). After each, the Windows
+   key is not stuck: type a letter, it arrives as itself.
+3. Win+L locks (user does this). After unlocking, press `3`: a plain 3 is typed (no app
+   launches). Same after Ctrl+Alt+Del → Esc.
+4. Win+1 with the first bar app not running: it starts. Win+1 again: it comes to the front;
+   again while it is in front: it minimizes. An app with several windows: each Win+n brings
+   the next of its windows to the front (no thumbnail strip). Win+9 with fewer than 9 apps:
+   nothing happens. Holding Win+2 starts the app once, not repeatedly.
+5. Win+T: an accent ring (2 DIP) goes around the first app of the bar. ←/→ move it (wrapping),
+   Home/End jump, Enter or Space click the app, the menu key opens the app's menu (Shift and
+   the other modifiers end the mode), Tab moves to the tray and back, Esc leaves. Typing any
+   other key leaves the mode and the key reaches the app in front (e.g. `a` in an editor);
+   clicking anywhere on the bar or switching apps leaves it too. While the ring shows, the
+   arrows do not reach the app in front.
+6. Win+B: the ring goes on the first promoted tray icon (or the overflow chevron when none is
+   promoted). Enter on an icon is a left click on it, the menu key a right click; Enter on the
+   chevron opens the overflow.
+7. With two monitors: with a window in front on the second monitor, Win tap opens Start there,
+   Win+1 acts on that bar's first app, Win+T rings that bar (Win+B always rings the primary
+   bar, which has the tray).
+8. Turn "Windows key opens Vitrobar Start" off (Settings window, Task 9; or
+   `win-key-opens-start = false` in `settings.toml` before starting): the Windows key opens
+   the stock Start again and Win+1…9 / Win+T / Win+B behave as Windows does; the hook stays
+   installed (`"hook":true,"enabled":false`).
+9. Quit Vitrobar (bar menu › Exit) while holding nothing: no key is stuck afterwards (Win+E
+   still opens Explorer once, letters type normally). Kill `vitrobar.exe --bar` in Task
+   Manager: Windows removes the hook with the process; the watchdog's new bar installs it
+   again (`"hook":true` in its dump).
+10. Busy bar: while the bar is busy (e.g. opening All apps the first time) typing in another
+    app never lags; with `--debug-state`, `"max_us"` stays in single or low double digits.
+
 ## Safety net
 
 Introduced by stage 1, Task 15. `vitrobar.exe` with no arguments is a small watchdog (no

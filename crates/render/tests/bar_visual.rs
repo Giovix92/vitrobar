@@ -7,7 +7,7 @@ use vitro_core::layout::{compute_layout, BarLayout, LayoutInput, Rect};
 use vitro_core::settings::{HoverEffect, IconSize, Material, Position, Shape};
 use vitro_core::style::{hover_style, material_style, Rgba, Theme};
 use vitro_render::bar_visual::{
-    hover_timing, BarVisual, ChevronState, ItemState, TrayItemState, VisualEnv,
+    hover_timing, BarFocus, BarVisual, ChevronState, ItemState, TrayItemState, VisualEnv,
 };
 use vitro_render::compositor::init_compositor;
 use vitro_render::device::create_gpu_device;
@@ -422,4 +422,93 @@ fn a_dpi_change_redraws_every_cell_at_the_new_scale() {
     bar.set_env(VisualEnv { dpi: 144, ..env });
     bar.update(&l, &[], "12:34", &style, &hover).unwrap();
     assert_eq!(bar.surfaces_drawn(), 2 * first);
+}
+
+#[test]
+fn focus_ring_follows_the_focused_item_without_redrawing() {
+    let comp = init_compositor().unwrap();
+    let gpu = create_gpu_device(&comp).unwrap();
+    let mut bar = BarVisual::new(&comp, &gpu, 0).unwrap();
+    bar.set_env(VisualEnv {
+        animations: false,
+        dpi: 144,
+        ..Default::default()
+    });
+    let style = material_style(Material::Frosted, Theme::Dark, true);
+    let hover = hover_style(HoverEffect::Plate);
+    let mut input = LayoutInput {
+        monitor: Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 1536.0,
+            h: 864.0,
+        },
+        shape: Shape::Pill,
+        position: Position::Bottom,
+        icon_size: IconSize::Medium,
+        app_count: 3,
+        tray_count: 1,
+        clock_w: 72.0,
+        reserve_floating: true,
+        tray_area: true,
+    };
+    let l = compute_layout(&input);
+    let items = icons(3);
+    let chevron = ChevronState {
+        shown: true,
+        ..Default::default()
+    };
+    bar.set_tray(vec![TrayItemState::default()], chevron);
+    bar.update(&l, &items, "12:34", &style, &hover).unwrap();
+    assert_eq!(bar.focus_ring(), None);
+    let drawn = bar.surfaces_drawn();
+
+    let scale = 1.5;
+    let surface = l.surfaces[0];
+    let inside = |ring: (i32, i32, i32, i32), r: Rect| {
+        let (ox, oy) = (surface.x * scale, surface.y * scale);
+        let (l, t) = (r.x * scale - ox, r.y * scale - oy);
+        let (rr, b) = (r.right() * scale - ox, r.bottom() * scale - oy);
+        ring.0 as f32 >= l - 1.0
+            && ring.1 as f32 >= t - 1.0
+            && ring.2 as f32 <= rr + 1.0
+            && ring.3 as f32 <= b + 1.0
+            && ring.2 > ring.0
+            && ring.3 > ring.1
+    };
+    for (focus, rect) in [
+        (BarFocus::App(1), l.apps[1]),
+        (BarFocus::App(2), l.apps[2]),
+        (BarFocus::Tray(0), l.tray[0]),
+        (BarFocus::Chevron, l.overflow_chevron),
+    ] {
+        bar.set_focus(Some(focus));
+        bar.update(&l, &items, "12:34", &style, &hover).unwrap();
+        let ring = bar.focus_ring().unwrap_or_else(|| panic!("{focus:?}"));
+        assert!(inside(ring, rect), "{focus:?}: {ring:?} vs {rect:?}");
+    }
+    assert_eq!(
+        bar.surfaces_drawn(),
+        drawn,
+        "the ring is a shape: nothing redrawn"
+    );
+
+    // An item that is not there shows no ring.
+    bar.set_focus(Some(BarFocus::App(9)));
+    bar.update(&l, &items, "12:34", &style, &hover).unwrap();
+    assert_eq!(bar.focus_ring(), None);
+    bar.set_focus(Some(BarFocus::App(0)));
+    bar.update(&l, &items, "12:34", &style, &hover).unwrap();
+    assert!(bar.focus_ring().is_some());
+    bar.set_focus(None);
+    bar.update(&l, &items, "12:34", &style, &hover).unwrap();
+    assert_eq!(bar.focus_ring(), None);
+
+    // No chevron (empty overflow): focusing it shows nothing.
+    input.tray_count = 1;
+    let l = compute_layout(&input);
+    bar.set_tray(vec![TrayItemState::default()], ChevronState::default());
+    bar.set_focus(Some(BarFocus::Chevron));
+    bar.update(&l, &items, "12:34", &style, &hover).unwrap();
+    assert_eq!(bar.focus_ring(), None);
 }

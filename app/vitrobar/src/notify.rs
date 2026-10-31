@@ -17,6 +17,7 @@ use std::sync::Mutex;
 
 use vitro_core::tray_wire::TrayMessage;
 use vitro_win::appbar::WM_VITRO_APPBAR;
+use vitro_win::key_hook::WM_VITRO_KEY;
 use vitro_win::stock_taskbar::taskbar_created_msg;
 use vitro_win::tray_host::{drain_tray_messages, WM_VITRO_TRAY};
 use vitro_win::window_tracker::{
@@ -43,7 +44,7 @@ pub const WM_APP_ICON: u32 = WM_APP + 0x22;
 /// Posted once after the first frame: take the stock taskbar over now (R12: the bar shows
 /// first, the slow `ABM_SETSTATE` round trip to Explorer comes after).
 pub const WM_APP_TAKE_OVER: u32 = WM_APP + 0x23;
-// WM_APP + 0x24 is the keyboard hook's wake-up (ruling S2).
+// WM_APP + 0x24 = `WM_VITRO_KEY`, the keyboard hook's wake-up (ruling S2).
 /// File-search results are waiting (payload-free wake-up from the search worker, ruling S2).
 pub const WM_APP_FILE_SEARCH: u32 = WM_APP + 0x25;
 /// The Start panel's app catalog or recent files were read (payload-free wake-up).
@@ -101,6 +102,8 @@ pub struct Inbox {
     pub files: bool,
     /// [`WM_APP_START_DATA`]: drain the Start panel's data worker.
     pub start_data: bool,
+    /// `WM_VITRO_KEY`: drain the keyboard hook's outputs.
+    pub keys: bool,
 }
 
 thread_local! {
@@ -191,6 +194,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_APP_START_DATA => {
             // A wake-up: wParam / lParam are ignored (anyone may post this id).
             with_inbox(|i| i.start_data = true);
+            return LRESULT(0);
+        }
+        WM_VITRO_KEY => {
+            // A wake-up: wParam / lParam are ignored (anyone may post this id); the outputs
+            // are in the hook's own queue.
+            with_inbox(|i| i.keys = true);
             return LRESULT(0);
         }
         WM_VITRO_APPBAR => {
@@ -450,6 +459,7 @@ mod tests {
         // SAFETY: plain messages to our own window.
         unsafe {
             PostMessageW(Some(n.hwnd), WM_APP_ICON, WPARAM(0), LPARAM(0)).unwrap();
+            PostMessageW(Some(n.hwnd), WM_VITRO_KEY, WPARAM(3), LPARAM(0x41)).unwrap();
             // Forged wake-ups with garbage parameters between real ones change nothing.
             PostMessageW(Some(n.hwnd), WM_VITRO_TRAY, WPARAM(9), LPARAM(0x55)).unwrap();
             PostMessageW(Some(n.hwnd), WM_VITRO_WINDOW_EVENT, WPARAM(9), LPARAM(0x55)).unwrap();
@@ -504,7 +514,7 @@ mod tests {
             inbox.events,
             vec![WindowEvent::Flash(42), WindowEvent::Destroyed(7)]
         );
-        assert!(inbox.icons && inbox.clock && inbox.theme);
+        assert!(inbox.icons && inbox.clock && inbox.theme && inbox.keys);
         assert!(inbox.shell && inbox.display && inbox.taskbar_created);
         assert!(inbox.dpi && inbox.workarea && inbox.session);
         assert!(inbox.fullscreen && inbox.appbar_pos);

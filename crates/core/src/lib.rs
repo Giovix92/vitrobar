@@ -5,6 +5,7 @@ pub mod calc;
 pub mod clock;
 pub mod i18n;
 pub mod image;
+pub mod key_hook;
 pub mod layout;
 pub mod restart;
 pub mod search;

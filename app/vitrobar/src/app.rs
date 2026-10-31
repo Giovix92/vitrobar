@@ -22,6 +22,11 @@
 //! the clock. Display, DPI, work-area and session changes re-read the monitors; bars are
 //! created, destroyed or laid out again only for monitors that actually changed
 //! ([`App::reconcile_monitors`]).
+//!
+//! The Windows key ([`Keys`], `keys.rs`): a low-level keyboard hook on its own thread
+//! reports a lone Windows-key tap (Start), Win+1…9 (the bar's apps) and Win+T / Win+B (the
+//! bar's keyboard focus mode); every other shortcut stays with Windows. The actions apply
+//! to the bar of the monitor showing the foreground window.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
@@ -32,6 +37,7 @@ use std::time::{Duration, Instant};
 use vitro_core::clock::ms_until_next_minute;
 use vitro_core::i18n::{lang_from_tag, tr, Key, Lang};
 use vitro_core::image::BgraImage;
+use vitro_core::key_hook::HookOutput;
 use vitro_core::layout::{compute_layout, diff_monitors, metrics, BarLayout, LayoutInput, Rect};
 use vitro_core::search::ResultKind;
 use vitro_core::settings::{self, Pin, Position, Settings, StartStyle, ThemeChoice};
@@ -42,7 +48,8 @@ use vitro_core::windows_model::{
     build_groups, click_action, AppGroup, ClickAction, GroupKey, Hwnd,
 };
 use vitro_render::bar_visual::{
-    hover_timing, BarVisual, ChevronState, ItemState, TrayItemState, VisualEnv, TRAY_ICON_DIP,
+    hover_timing, BarFocus, BarVisual, ChevronState, ItemState, TrayItemState, VisualEnv,
+    TRAY_ICON_DIP,
 };
 use vitro_render::compositor::{init_compositor, Comp};
 use vitro_render::device::{create_gpu_device, GpuDevice};
@@ -53,8 +60,11 @@ use vitro_render::tray_flyout::{grid_layout, Tooltip, TrayGrid};
 use vitro_win::appbar::{is_fullscreen_on_rect, reserved_rect, AppBar};
 use vitro_win::catalog::{bar_pin, file_location};
 use vitro_win::desktops::Desktops;
+use vitro_win::key_hook::inject_mask_key;
 use vitro_win::launch::{activate_window, close_window, minimize_window, open_stock_start};
-use vitro_win::monitors::{list_monitors, parse_monitor_spec, work_area_px, MonitorInfo};
+use vitro_win::monitors::{
+    list_monitors, parse_monitor_spec, window_monitor, work_area_px, MonitorInfo,
+};
 use vitro_win::pins_import::{import_promoted_tray, import_windows_pins};
 use vitro_win::system_theme::{read_system_theme, user_ui_language_tag, SystemTheme};
 use vitro_win::time_format::clock_now;
@@ -85,6 +95,7 @@ use crate::bar_window::{
     create_bar_window, hit_test, mouse_pos, track_leave, BarWindow, Hit, MarginMode, PxRect,
 };
 use crate::icon_loader::{IconLoader, IconSrc, Lookup, TrayImage, MAX_ICON_PX};
+use crate::keys::{first_in, launch_action, step, Counts, Focus, Keys, Step, Zone};
 use crate::launcher::{Job, Launcher};
 use crate::menus::{app_menu, bar_menu, power_menu, start_item_menu, MenuChoice};
 use crate::notify::{
@@ -505,7 +516,9 @@ struct App {
     // Explorer), the flyouts, the monitors' bars (each appbar unregistered before its window
     // goes), then the tracker (before its notify window), then the notify window (drains
     // queued events), then the GPU objects, the compositor, and last the stock taskbar guard
-    // (the shell is restored after the appbars are gone).
+    // (the shell is restored after the appbars are gone). The keyboard hook goes before all
+    // of it: nothing reaches a half-dropped app.
+    keys: Keys,
     tray: Option<TrayHost>,
     tooltip: Option<Tooltip>,
     overflow: Option<Overflow>,
@@ -619,7 +632,8 @@ impl App {
             IconLoader::start(notify.hwnd).map_err(|e| Error::new(E_FAIL, e.to_string()))?;
         let launcher = Launcher::start(None).map_err(|e| Error::new(E_FAIL, e.to_string()))?;
         let mut app = Self {
-            // Started with the take-over, after the first frame (`finish_start`).
+            // Both started with the take-over, after the first frame (`finish_start`).
+            keys: Keys::default(),
             tray: None,
             tooltip: None,
             overflow: None,
@@ -717,6 +731,9 @@ impl App {
         // Explorer applies the auto-hide change of the takeover asynchronously and can show
         // a secondary taskbar again meanwhile: hide once more a little later.
         self.arm_reassert();
+        // The Windows key is ours from here on (disabled: installed, but every key passes).
+        self.keys
+            .start(self.notify.hwnd, self.settings.win_key_opens_start);
         // Registers the appbars and draws the tray area.
         dirty.visuals = true;
     }
@@ -1067,6 +1084,11 @@ impl App {
             (Vec::new(), ChevronState::default())
         };
         let env = self.env(k);
+        let focus = self
+            .keys
+            .focus()
+            .filter(|f| f.monitor == self.monitors[k].id())
+            .map(|f| f.item);
         let mb = &mut self.monitors[k];
         let mut raised = layout.surfaces != mb.layout.surfaces;
         while mb.bars.len() > layout.surfaces.len() {
@@ -1087,6 +1109,7 @@ impl App {
                 .set_rect(to_px(layout.surfaces[i], scale), margin)?;
             bar.visual.set_env(env);
             bar.visual.set_tray(tray_items.clone(), chevron);
+            bar.visual.set_focus(focus);
             if let Err(e) = bar.visual.update(
                 &layout,
                 &items,
@@ -1479,8 +1502,10 @@ impl App {
         );
         let pins: Vec<String> = st.pins.iter().map(|p| json_str(&p.name)).collect();
         let start = self.dump_start();
+        let keys = self.keys.dump();
         let dump = format!(
-            "{{\"start\":{},\"settings\":{},\"pins\":[{}],\"tray_host\":{},\"chevron\":{},\"tray\":[{}],\"overflow\":{},\"tooltip\":{},\"fullscreen\":{},\"stock_taken\":{},\"appbar\":{},\"hover\":{},\"strip\":{},\"live_thumbnails\":{},\"bars\":[{}],\"groups\":{},\"shown\":{},\"start_button\":{},\"quick\":{},\"clock\":{},\"clock_text\":{},\"more\":{},\"apps\":[{}],\"cur\":{},\"monitors\":[{}]}}",
+            "{{\"keys\":{},\"start\":{},\"settings\":{},\"pins\":[{}],\"tray_host\":{},\"chevron\":{},\"tray\":[{}],\"overflow\":{},\"tooltip\":{},\"fullscreen\":{},\"stock_taken\":{},\"appbar\":{},\"hover\":{},\"strip\":{},\"live_thumbnails\":{},\"bars\":[{}],\"groups\":{},\"shown\":{},\"start_button\":{},\"quick\":{},\"clock\":{},\"clock_text\":{},\"more\":{},\"apps\":[{}],\"cur\":{},\"monitors\":[{}]}}",
+            keys,
             start,
             settings,
             pins.join(","),
@@ -1538,7 +1563,11 @@ impl App {
                 if let Some(h) = fg {
                     dirty.regroup |= self.windows.set_flashing(h, false);
                 }
-                dirty.regroup |= self.foreground != fg;
+                if self.foreground != fg {
+                    dirty.regroup = true;
+                    // Another window in front ends the keyboard focus mode.
+                    self.leave_focus(dirty);
+                }
                 self.foreground = fg;
                 dirty.fullscreen = true;
                 self.start_foreground_changed(fg);
@@ -1658,6 +1687,10 @@ impl App {
 
     /// Mouse input on a bar window or a flyout; returns true if the message was handled.
     fn on_mouse(&mut self, msg: &MSG, dirty: &mut Dirty) -> bool {
+        if matches!(msg.message, WM_LBUTTONDOWN | WM_RBUTTONDOWN) {
+            // Any click ends the keyboard focus mode.
+            self.leave_focus(dirty);
+        }
         let had_overflow = self.overflow.is_some();
         let handled = self.on_mouse_inner(msg, dirty);
         if had_overflow != self.overflow.is_some() {
@@ -2510,6 +2543,8 @@ impl App {
     /// Ends every transient interaction (strip, overflow, tooltip, hover, presses, margin
     /// expansion): before a modal menu and before the bar is laid out anew.
     fn reset_interaction(&mut self) {
+        // Every caller but `open_start` redraws all bars (which drops the ring).
+        self.keys.set_focus(None);
         self.close_start();
         self.close_strip();
         self.close_overflow();
@@ -2526,6 +2561,214 @@ impl App {
         for b in self.all_bars_mut() {
             b.window.set_expanded(false);
         }
+    }
+
+    // -----------------------------------------------------------------------------------
+    // The Windows key (hook and focus-mode navigation in `keys.rs`; here the actions)
+    // -----------------------------------------------------------------------------------
+
+    /// The bar Windows-key actions apply to: the monitor showing the foreground window,
+    /// else the primary monitor's.
+    fn key_monitor(&self) -> usize {
+        // SAFETY: plain query.
+        let fg = unsafe { GetForegroundWindow() };
+        window_monitor(fg)
+            .and_then(|id| self.mon_index(id))
+            .or_else(|| self.monitors.iter().position(|m| m.tray))
+            .unwrap_or(0)
+    }
+
+    fn on_hook_output(&mut self, out: HookOutput, dirty: &mut Dirty) {
+        // Never logged: what the user typed stays between the hook and this match.
+        match out {
+            HookOutput::OpenStart => {
+                self.leave_focus(dirty);
+                let k = self.key_monitor();
+                // SAFETY: plain query (the open time is measured from the Windows-key up).
+                self.input_time = unsafe { GetTickCount() };
+                self.toggle_start(k, dirty);
+                if let Some(sp) = self.start.as_mut().filter(|s| !s.activated) {
+                    // The mask key the hook injected is normally the latest input, which
+                    // permits the foreground change. If Windows still refused: one more
+                    // mask key, one more try (bounded); else the panel takes the foreground
+                    // on its first click (carry 12).
+                    inject_mask_key();
+                    if !sp.activate() {
+                        eprintln!("vitrobar: the Start panel could not take the foreground");
+                    }
+                }
+            }
+            HookOutput::LaunchNth(n) => {
+                self.leave_focus(dirty);
+                let k = self.key_monitor();
+                let i = usize::from(n.max(1)) - 1;
+                if i < self.focus_counts(k).apps {
+                    self.close_start();
+                    self.launch_app(k, i);
+                }
+            }
+            HookOutput::FocusApps => self.enter_focus(Zone::Apps, dirty),
+            HookOutput::FocusTray => self.enter_focus(Zone::Tray, dirty),
+            HookOutput::FocusKey(vk) => self.focus_key(vk, dirty),
+            HookOutput::ExitFocus => self.leave_focus(dirty),
+        }
+    }
+
+    /// What focus mode can land on in bar `k`.
+    fn focus_counts(&self, k: usize) -> Counts {
+        let mb = &self.monitors[k];
+        Counts {
+            apps: mb.layout.apps.len().min(mb.groups.len()),
+            tray: if mb.tray {
+                self.tray_bar.len().min(mb.layout.tray.len())
+            } else {
+                0
+            },
+            chevron: mb.tray && !self.tray_over.is_empty(),
+        }
+    }
+
+    /// Win+T / Win+B: the focus ring goes on the first app / tray icon of the bar of the
+    /// foreground window's monitor (the tray: of the primary bar, which has the tray area).
+    fn enter_focus(&mut self, zone: Zone, dirty: &mut Dirty) {
+        self.leave_focus(dirty);
+        self.close_start();
+        self.close_strip();
+        if self.close_overflow() {
+            dirty.visuals = true;
+        }
+        let mut k = self.key_monitor();
+        if zone == Zone::Tray && !self.monitors[k].tray {
+            k = self.monitors.iter().position(|m| m.tray).unwrap_or(k);
+        }
+        let item = if self.monitors[k].fullscreen {
+            None
+        } else {
+            first_in(zone, self.focus_counts(k))
+        };
+        if let Some(item) = item {
+            let monitor = self.monitors[k].id();
+            self.keys.set_focus(Some(Focus {
+                monitor,
+                zone,
+                item,
+            }));
+            dirty.bars.insert(monitor);
+        }
+        // Nothing to focus: `leave_focus` above already told the hook (which entered focus
+        // mode by itself) to leave it.
+    }
+
+    /// Ends the keyboard focus mode (also tells the hook, which may have entered it alone).
+    fn leave_focus(&mut self, dirty: &mut Dirty) {
+        if let Some(f) = self.keys.focus() {
+            dirty.bars.insert(f.monitor);
+        }
+        self.keys.set_focus(None);
+    }
+
+    fn focus_key(&mut self, vk: u32, dirty: &mut Dirty) {
+        let Some(f) = self.keys.focus() else {
+            // The hook entered focus mode, the app never did (nothing to focus).
+            self.keys.set_focus(None);
+            return;
+        };
+        let Some(k) = self.mon_index(f.monitor) else {
+            self.leave_focus(dirty);
+            return;
+        };
+        match step(f.zone, f.item, vk, self.focus_counts(k)) {
+            Step::Move(zone, item) => {
+                self.keys.set_focus(Some(Focus { zone, item, ..f }));
+                dirty.bars.insert(f.monitor);
+            }
+            Step::Click(item) => {
+                self.leave_focus(dirty);
+                self.focus_click(k, item, false, dirty);
+            }
+            Step::Menu(item) => {
+                self.leave_focus(dirty);
+                self.focus_click(k, item, true, dirty);
+            }
+            Step::Stay => {}
+            Step::Exit => self.leave_focus(dirty),
+        }
+    }
+
+    /// Screen px of the centre of `r` (DIP) on bar `k`.
+    fn centre_px(&self, k: usize, r: Rect) -> (i32, i32) {
+        let s = self.monitors[k].scale();
+        (
+            ((r.x + r.w / 2.0) * s).round() as i32,
+            ((r.y + r.h / 2.0) * s).round() as i32,
+        )
+    }
+
+    /// Enter / Space (`menu` false) or the Apps key (`menu` true) on a focused item: what a
+    /// left / right click on it does.
+    fn focus_click(&mut self, k: usize, item: BarFocus, menu: bool, dirty: &mut Dirty) {
+        let layout = &self.monitors[k].layout;
+        match item {
+            BarFocus::App(i) => {
+                let Some(r) = layout.apps.get(i).copied() else {
+                    return;
+                };
+                if menu {
+                    let id = self.monitors[k].id();
+                    self.switch_cur(id, dirty);
+                    self.msg_pt = self.centre_px(k, r);
+                    self.context_menu(Some(i), dirty);
+                } else {
+                    self.launch_app(k, i);
+                }
+            }
+            BarFocus::Tray(i) => {
+                let Some(r) = layout.tray.get(i).copied() else {
+                    return;
+                };
+                self.msg_pt = self.centre_px(k, r);
+                let idx = self.tray_bar.get(i).copied();
+                let kind = if menu {
+                    TrayClick::Right
+                } else {
+                    TrayClick::Left
+                };
+                self.tray_click(idx, kind);
+            }
+            BarFocus::Chevron => {
+                if !self.close_overflow() {
+                    self.open_overflow();
+                }
+                dirty.bars.insert(self.monitors[k].id());
+            }
+        }
+    }
+
+    /// Win+n / Enter on app `i` of bar `k`: launch, activate (the next window of a group
+    /// with several) or minimize.
+    fn launch_app(&mut self, k: usize, i: usize) {
+        let Some(g) = self.monitors[k].groups.get(i) else {
+            return;
+        };
+        match launch_action(g, foreground()) {
+            ClickAction::Launch(p) => {
+                if let Some(pin) = self.settings.pins.get(p) {
+                    self.launcher.launch(Job::Pin(pin.clone()));
+                }
+            }
+            ClickAction::Activate(h) => {
+                // As for the Start panel: one more mask key and one more try, bounded.
+                if !activate_window(hwnd_of(h)) {
+                    inject_mask_key();
+                    if !activate_window(hwnd_of(h)) {
+                        eprintln!("vitrobar: SetForegroundWindow refused for {h}");
+                    }
+                }
+            }
+            ClickAction::Minimize(h) => minimize_window(hwnd_of(h)),
+            ClickAction::ShowThumbnails => {}
+        }
+        self.close_strip();
     }
 
     // -----------------------------------------------------------------------------------
@@ -2550,7 +2793,10 @@ impl App {
 
     fn open_start(&mut self, k: usize, dirty: &mut Dirty) {
         let began = Instant::now();
-        // Strip, overflow and tooltip close; the hover on the bar ends.
+        if let Some(f) = self.keys.focus() {
+            dirty.bars.insert(f.monitor);
+        }
+        // Strip, overflow, tooltip and the keyboard focus mode close; the hover ends.
         self.reset_interaction();
         dirty.bars.insert(self.monitors[k].id());
         if !self.settings.start_pins_initialized {
@@ -3188,6 +3434,12 @@ impl App {
         }
         for id in inbox.timers {
             self.on_timer(id, dirty);
+        }
+        if inbox.keys {
+            // Always drained: a pending wake-up blocks the next one.
+            for out in self.keys.drain() {
+                self.on_hook_output(out, dirty);
+            }
         }
         dirty.theme |= inbox.theme;
         dirty.clock |= inbox.clock;

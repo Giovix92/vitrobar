@@ -9,6 +9,7 @@ pub mod desktops;
 pub mod event_queue;
 pub mod file_search;
 pub mod icons;
+pub mod key_hook;
 pub mod launch;
 pub mod monitors;
 pub mod pins_import;
