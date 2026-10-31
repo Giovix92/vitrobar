@@ -18,8 +18,8 @@ use windows::Win32::UI::Shell::{
     SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    IsIconic, PostMessageW, SetForegroundWindow, ShowWindowAsync, SW_MINIMIZE, SW_RESTORE,
-    SW_SHOWNORMAL, WM_CLOSE,
+    IsIconic, PostMessageW, SetForegroundWindow, ShowWindowAsync, SC_CLOSE, SW_MINIMIZE,
+    SW_RESTORE, SW_SHOWNORMAL, WM_CLOSE, WM_SYSCOMMAND,
 };
 
 /// One way of starting a pin, in the order [`launch_plan`] tries them.
@@ -143,6 +143,15 @@ pub fn close_window(h: HWND) {
     // SAFETY: posting never blocks on the receiver.
     unsafe {
         let _ = PostMessageW(Some(h), WM_CLOSE, WPARAM(0), LPARAM(0));
+    }
+}
+
+/// Asks the window to close the way the stock taskbar does (`SC_CLOSE`, posted): the window
+/// may ask to save or refuse. Never forces it and never ends the task.
+pub fn request_close(h: HWND) {
+    // SAFETY: posting never blocks on the receiver; it fails harmlessly on a stale handle.
+    unsafe {
+        let _ = PostMessageW(Some(h), WM_SYSCOMMAND, WPARAM(SC_CLOSE as usize), LPARAM(0));
     }
 }
 

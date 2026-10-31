@@ -69,6 +69,7 @@ use vitro_win::desktops::Desktops;
 use vitro_win::key_hook::inject_mask_key;
 use vitro_win::launch::{
     activate_window, close_window, dismiss_foreground_flyout, minimize_window, open_stock_start,
+    request_close,
 };
 use vitro_win::monitors::{
     list_monitors, parse_monitor_spec, window_monitor, work_area_px, MonitorInfo,
@@ -96,8 +97,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowThreadProcessId, IsWindow, KillTimer, MsgWaitForMultipleObjectsEx, PeekMessageW,
     PostMessageW, PostQuitMessage, PostThreadMessageW, SetForegroundWindow, SetTimer,
     TranslateMessage, GWL_EXSTYLE, MSG, MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT, WM_CHAR,
-    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NULL, WM_QUIT,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WS_EX_TOPMOST,
+    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_NULL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WS_EX_TOPMOST,
 };
 
 use crate::bar_window::{
@@ -628,6 +629,9 @@ struct App {
     over_flyout: bool,
     /// Thumbnail under the button press in the flyout.
     flyout_pressed: Option<HWND>,
+    /// The close button / the thumbnail a middle press went down on.
+    flyout_close_pressed: Option<HWND>,
+    flyout_mid_pressed: Option<HWND>,
     /// A click on the hovered app: no strip opens until the cursor moves to another item.
     show_suppressed: bool,
     gpu_lost: bool,
@@ -735,6 +739,8 @@ impl App {
             collapse_pending: false,
             over_flyout: false,
             flyout_pressed: None,
+            flyout_close_pressed: None,
+            flyout_mid_pressed: None,
             show_suppressed: false,
             gpu_lost: false,
             shell_ready: false,
@@ -2316,24 +2322,61 @@ impl App {
         true
     }
 
+    /// A middle press or release on the thumbnail strip (it closes the window under it).
+    fn on_strip_middle(&mut self, msg: &MSG) -> bool {
+        self.strip
+            .as_ref()
+            .is_some_and(|s| s.flyout.hwnd() == msg.hwnd)
+            && self.on_flyout_mouse(msg)
+    }
+
+    fn reset_flyout_press(&mut self) {
+        self.flyout_pressed = None;
+        self.flyout_close_pressed = None;
+        self.flyout_mid_pressed = None;
+    }
+
     /// Mouse input on the flyout: hovering keeps the strip open, a click on a thumbnail
-    /// switches to that window.
+    /// switches to that window, the close button or a middle click closes it.
     fn on_flyout_mouse(&mut self, msg: &MSG) -> bool {
         let pt = mouse_pos(msg.lParam);
         let hit = self.strip.as_ref().and_then(|s| s.thumbs.hit(pt));
+        let close = self.strip.as_ref().and_then(|s| s.thumbs.hit_close(pt));
         match msg.message {
             WM_MOUSEMOVE => {
                 if !self.over_flyout {
                     track_leave(msg.hwnd);
                     self.over_flyout = true;
                 }
+                if let Some(s) = self.strip.as_mut() {
+                    let _ = s.thumbs.set_close_hot(close);
+                }
             }
             WM_MOUSELEAVE => {
                 self.over_flyout = false;
-                self.flyout_pressed = None;
+                self.reset_flyout_press();
             }
-            WM_LBUTTONDOWN => self.flyout_pressed = hit,
+            WM_LBUTTONDOWN => {
+                self.flyout_close_pressed = close;
+                self.flyout_pressed = hit.filter(|_| close.is_none());
+            }
+            WM_MBUTTONDOWN => self.flyout_mid_pressed = hit,
+            WM_MBUTTONUP => {
+                let pressed = self.flyout_mid_pressed.take();
+                if let Some(h) = hit.filter(|_| pressed == hit) {
+                    request_close(h);
+                }
+            }
             WM_LBUTTONUP => {
+                let pressed_close = self.flyout_close_pressed.take();
+                if close.is_some() || pressed_close.is_some() {
+                    // The strip stays up: the closed window drops out of it by itself.
+                    self.flyout_pressed = None;
+                    if let Some(h) = close.filter(|_| pressed_close == close) {
+                        request_close(h);
+                    }
+                    return true;
+                }
                 let pressed = self.flyout_pressed.take();
                 if let Some(h) = hit.filter(|_| pressed == hit) {
                     if self.opts.debug_state {
@@ -2586,7 +2629,7 @@ impl App {
                 let old = self.strip.replace(strip);
                 drop(old);
                 self.over_flyout = false;
-                self.flyout_pressed = None;
+                self.reset_flyout_press();
             }
             Err(e) => eprintln!("vitrobar: thumbnail strip failed: {e}"),
         }
@@ -2599,7 +2642,7 @@ impl App {
         self.cancel_hide();
         if self.strip.take().is_some() {
             self.over_flyout = false;
-            self.flyout_pressed = None;
+            self.reset_flyout_press();
             if self.opts.debug_state {
                 self.dump_state();
             }
@@ -4348,6 +4391,7 @@ pub fn run(opts: Options) -> Result<()> {
                 WM_MOUSEMOVE | WM_MOUSELEAVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN
                 | WM_RBUTTONUP
                     if app.on_mouse(&msg, &mut dirty) => {}
+                WM_MBUTTONDOWN | WM_MBUTTONUP if app.on_strip_middle(&msg) => {}
                 // Then translated, so the Start panel's characters follow as WM_CHAR.
                 WM_KEYDOWN if app.on_key(&msg, &mut dirty) => unsafe {
                     let _ = TranslateMessage(&msg);

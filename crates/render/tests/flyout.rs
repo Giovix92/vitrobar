@@ -71,12 +71,12 @@ fn strip_registers_live_thumbnails_and_hit_tests() {
     let raw: Vec<HWND> = windows.iter().map(|(h, _)| *h).collect();
     let size = ThumbnailStrip::size_dip(&raw);
     // 320 x 200 = 1.6: two 200 x 120 boxes (DPI 96).
-    assert_eq!(size, (428.0, 162.0));
+    assert_eq!(size, (428.0, 166.0));
 
     let anchor = (500, 900, 540, 948);
     let flyout = Flyout::show(&comp, anchor, Position::Bottom, size, 96, &style).unwrap();
     let (l, t, r, bottom) = flyout.rect_px();
-    assert_eq!((r - l, bottom - t), (428, 162));
+    assert_eq!((r - l, bottom - t), (428, 166));
     assert_eq!(bottom, 900 - 8, "8 DIP above the anchor");
     // SAFETY: plain queries.
     unsafe {
@@ -107,6 +107,11 @@ fn strip_registers_live_thumbnails_and_hit_tests() {
     assert_eq!(strip.hit((20, 145)), Some(a.0));
     assert_eq!(strip.hit((2, 2)), None);
     assert_eq!(strip.hit((214, 60)), None);
+    // The close button sits at the right end of the title row (x 190..210, y 136..156).
+    assert_eq!(strip.hit_close((200, 146)), Some(a.0));
+    assert_eq!(strip.hit_close((408, 146)), Some(b.0));
+    assert_eq!(strip.hit_close((20, 146)), None);
+    assert_eq!(strip.hit_close((200, 60)), None);
 
     drop(strip);
     assert_eq!(

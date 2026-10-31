@@ -33,12 +33,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::UI::Composition::Desktop::DesktopWindowTarget;
-use windows::UI::Composition::{ContainerVisual, SpriteVisual, Visual};
+use windows::UI::Composition::{CompositionSurfaceBrush, ContainerVisual, SpriteVisual, Visual};
 use windows_numerics::{Vector2, Vector3};
 
 use crate::compositor::{window_target, Comp};
 use crate::material::backdrop_visual;
-use crate::surfaces::Painter;
+use crate::surfaces::{FontKind, Painter};
+use crate::tray_flyout::RoundRect;
 
 /// Window class of the flyout (found by tests and tools with `FindWindow`).
 pub const FLYOUT_CLASS: PCWSTR = w!("VitrobarFlyout");
@@ -55,7 +56,15 @@ const THUMB_MIN_H_DIP: f32 = 40.0;
 pub const STRIP_GAP_DIP: f32 = 8.0;
 pub const STRIP_PAD_DIP: f32 = 10.0;
 const TITLE_GAP_DIP: f32 = 6.0;
-const TITLE_H_DIP: f32 = 16.0;
+/// The title row is as tall as the close button that sits at its right end.
+const TITLE_H_DIP: f32 = 20.0;
+/// The close button's square, and the gap between it and the title text.
+pub const CLOSE_DIP: f32 = 20.0;
+const CLOSE_GAP_DIP: f32 = 4.0;
+const CLOSE_RADIUS_DIP: f32 = 4.0;
+const CLOSE_FONT_DIP: f32 = 10.0;
+/// Segoe Fluent Icons "ChromeClose".
+const CLOSE_GLYPH: &str = "\u{E8BB}";
 const TITLE_FONT_DIP: f32 = 12.0;
 /// When a window's size cannot be read.
 const DEFAULT_ASPECT: f32 = 16.0 / 10.0;
@@ -79,6 +88,9 @@ pub struct StripLayout {
     pub boxes: Vec<Rect>,
     /// The title line under each box.
     pub titles: Vec<Rect>,
+    /// The close button, right-aligned in each title row (never on the thumbnail: DWM
+    /// thumbnails draw above composition content). The titles stop short of it.
+    pub closes: Vec<Rect>,
 }
 
 /// Lays out one thumbnail per window, `aspects` being width / height of each window.
@@ -97,6 +109,7 @@ pub fn strip_layout(aspects: &[f32]) -> StripLayout {
         .fold(THUMB_MIN_H_DIP, f32::max);
     let mut boxes = Vec::with_capacity(n);
     let mut titles = Vec::with_capacity(n);
+    let mut closes = Vec::with_capacity(n);
     for k in 0..n {
         let x = STRIP_PAD_DIP + k as f32 * (THUMB_W_DIP + STRIP_GAP_DIP);
         boxes.push(Rect {
@@ -108,8 +121,14 @@ pub fn strip_layout(aspects: &[f32]) -> StripLayout {
         titles.push(Rect {
             x,
             y: STRIP_PAD_DIP + row_h + TITLE_GAP_DIP,
-            w: THUMB_W_DIP,
+            w: THUMB_W_DIP - CLOSE_DIP - CLOSE_GAP_DIP,
             h: TITLE_H_DIP,
+        });
+        closes.push(Rect {
+            x: x + THUMB_W_DIP - CLOSE_DIP,
+            y: STRIP_PAD_DIP + row_h + TITLE_GAP_DIP + (TITLE_H_DIP - CLOSE_DIP) / 2.0,
+            w: CLOSE_DIP,
+            h: CLOSE_DIP,
         });
     }
     let w =
@@ -119,6 +138,7 @@ pub fn strip_layout(aspects: &[f32]) -> StripLayout {
         size: (w, h),
         boxes,
         titles,
+        closes,
     }
 }
 
@@ -521,6 +541,20 @@ struct Thumb {
 pub struct ThumbnailStrip {
     thumbs: Vec<Thumb>,
     titles: Option<(ContainerVisual, SpriteVisual)>,
+    closes: Vec<CloseBtn>,
+    /// The hot button's red plate (below the glyphs), hidden while none is hot.
+    plate: Option<RoundRect>,
+    hot: Option<HWND>,
+    scale: f32,
+    root: Option<ContainerVisual>,
+}
+
+/// One window's close button: its px rectangle and its two glyph looks.
+struct CloseBtn {
+    hwnd: HWND,
+    rect: PxRect,
+    normal: SpriteVisual,
+    hot: SpriteVisual,
 }
 
 fn px_rect(r: &Rect, s: f32) -> PxRect {
@@ -549,6 +583,11 @@ impl ThumbnailStrip {
         let mut strip = Self {
             thumbs: Vec::with_capacity(windows.len()),
             titles: None,
+            closes: Vec::new(),
+            plate: None,
+            hot: None,
+            scale: s,
+            root: None,
         };
         for (k, (h, _)) in windows.iter().enumerate() {
             let boxed = px_rect(&layout.boxes[k], s);
@@ -645,7 +684,94 @@ impl ThumbnailStrip {
             owner.root.Children()?.InsertAtTop(&sprite)?;
             strip.titles = Some((owner.root.clone(), sprite));
         }
+        strip.add_closes(owner, painter, text, windows, &layout)?;
         Ok(strip)
+    }
+
+    /// The close buttons: the plate (hidden), then per window its two glyph sprites, drawn
+    /// once (`text` at 70 %, and white for the hot look).
+    fn add_closes(
+        &mut self,
+        owner: &Flyout,
+        painter: &Painter,
+        text: Rgba,
+        windows: &[(HWND, String)],
+        layout: &StripLayout,
+    ) -> Result<()> {
+        let s = self.scale;
+        let comp = owner.root.Compositor()?;
+        let children = owner.root.Children()?;
+        let plate = RoundRect::new(&comp)?;
+        plate.visual.SetIsVisible(false)?;
+        children.InsertAtTop(&plate.visual)?;
+        self.plate = Some(plate);
+        self.root = Some(owner.root.clone());
+
+        let side = (CLOSE_DIP * s).round() as u32;
+        let glyph = |c: Rgba| {
+            let b = [(
+                CLOSE_GLYPH,
+                FontKind::Glyph,
+                (0.0, 0.0, side as f32, side as f32),
+            )];
+            painter.text_boxes(&b, CLOSE_FONT_DIP * s, c, side, side)
+        };
+        let rest = Rgba(text.0, text.1, text.2, (text.3 as f32 * 0.7).round() as u8);
+        let normal = comp.CreateSurfaceBrushWithSurface(&glyph(rest)?)?;
+        let hot = comp.CreateSurfaceBrushWithSurface(&glyph(Rgba(255, 255, 255, 255))?)?;
+        for ((h, _), r) in windows.iter().zip(&layout.closes) {
+            let rect = px_rect(r, s);
+            let sprite = |brush: &CompositionSurfaceBrush, visible: bool| -> Result<SpriteVisual> {
+                let v = comp.CreateSpriteVisual()?;
+                v.SetBrush(brush)?;
+                v.SetSize(Vector2::new(side as f32, side as f32))?;
+                v.SetOffset(Vector3::new(rect.0 as f32, rect.1 as f32, 0.0))?;
+                v.SetIsVisible(visible)?;
+                children.InsertAtTop(&v)?;
+                Ok(v)
+            };
+            self.closes.push(CloseBtn {
+                hwnd: *h,
+                rect,
+                normal: sprite(&normal, true)?,
+                hot: sprite(&hot, false)?,
+            });
+        }
+        Ok(())
+    }
+
+    /// The window whose close button is at `pt_px` (flyout client px).
+    pub fn hit_close(&self, pt_px: (i32, i32)) -> Option<HWND> {
+        let (x, y) = pt_px;
+        self.closes
+            .iter()
+            .find(|c| x >= c.rect.0 && x < c.rect.2 && y >= c.rect.1 && y < c.rect.3)
+            .map(|c| c.hwnd)
+    }
+
+    /// Shows `h`'s close button hot (red plate, white glyph) and every other one at rest.
+    pub fn set_close_hot(&mut self, h: Option<HWND>) -> Result<()> {
+        if self.hot == h {
+            return Ok(());
+        }
+        self.hot = h;
+        for c in &self.closes {
+            let on = Some(c.hwnd) == h;
+            c.normal.SetIsVisible(!on)?;
+            c.hot.SetIsVisible(on)?;
+        }
+        if let Some(plate) = &self.plate {
+            match self.closes.iter().find(|c| Some(c.hwnd) == h) {
+                Some(c) => {
+                    // #C42B1C at 90 %.
+                    let red = Rgba(0xC4, 0x2B, 0x1C, 230);
+                    plate.set(c.rect, CLOSE_RADIUS_DIP * self.scale, red)?;
+                    plate.visual.SetIsVisible(true)?;
+                }
+                None => plate.visual.SetIsVisible(false)?,
+            }
+        }
+        Ok(())
     }
 
     /// The window whose thumbnail or title is at `pt_px` (flyout client px).
@@ -675,6 +801,17 @@ impl Drop for ThumbnailStrip {
                 let _ = children.Remove(&sprite);
             }
         }
+        if let Some(root) = self.root.take() {
+            if let Ok(children) = root.Children() {
+                for c in self.closes.drain(..) {
+                    let _ = children.Remove(&c.normal);
+                    let _ = children.Remove(&c.hot);
+                }
+                if let Some(plate) = self.plate.take() {
+                    let _ = children.Remove(&plate.visual);
+                }
+            }
+        }
     }
 }
 
@@ -692,7 +829,8 @@ mod tests {
         assert_eq!(l.boxes[0].x, 10.0);
         assert_eq!(l.boxes[1].x, 10.0 + 200.0 + 8.0);
         assert_eq!(l.size.0, 10.0 + 200.0 + 8.0 + 200.0 + 10.0);
-        assert_eq!(l.size.1, 10.0 + 120.0 + 6.0 + 16.0 + 10.0);
+        // The title row is 20 DIP tall: it holds the close button.
+        assert_eq!(l.size.1, 10.0 + 120.0 + 6.0 + 20.0 + 10.0);
         // A wide window gives a lower row; the row follows the tallest thumbnail.
         let wide = strip_layout(&[4.0]);
         assert_eq!(wide.boxes[0].h, 50.0);
@@ -702,6 +840,19 @@ mod tests {
         // Nonsense aspects fall back instead of producing NaN.
         let odd = strip_layout(&[0.0, f32::NAN]);
         assert!(odd.size.1.is_finite());
+    }
+
+    #[test]
+    fn close_buttons_sit_at_the_right_of_each_title() {
+        let l = strip_layout(&[1.6, 1.6]);
+        assert_eq!(l.closes.len(), 2);
+        assert_eq!(l.closes[0].right(), l.boxes[0].right());
+        assert_eq!(l.closes[0].w, 20.0);
+        assert!(l.titles[0].right() <= l.closes[0].x - 4.0);
+        assert_eq!(
+            l.closes[1].y + l.closes[1].h / 2.0,
+            l.titles[1].y + l.titles[1].h / 2.0
+        );
     }
 
     #[test]
