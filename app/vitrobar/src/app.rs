@@ -877,6 +877,15 @@ impl App {
         items
     }
 
+    /// Whether some bar (or the tray) shows icons of `src`.
+    fn bar_shows(&self, src: &IconSrc) -> bool {
+        matches!(src, IconSrc::Tray(_))
+            || self
+                .monitors
+                .iter()
+                .any(|m| m.groups.iter().any(|g| icon_sources(g).contains(src)))
+    }
+
     /// Keeps the icon cache bounded to what some bar (or the tray, or the open Start panel)
     /// still shows.
     fn trim_icons(&mut self) {
@@ -1529,6 +1538,7 @@ impl App {
                 dirty.regroup |= self.foreground != fg;
                 self.foreground = fg;
                 dirty.fullscreen = true;
+                self.start_foreground_changed(fg);
                 // A foreground change is when the shell reorders the topmost band: keep our
                 // Shell_TrayWnd above Explorer's (async, never waits).
                 if let Some(t) = &self.tray {
@@ -2540,9 +2550,13 @@ impl App {
         // Strip, overflow and tooltip close; the hover on the bar ends.
         self.reset_interaction();
         dirty.bars.insert(self.monitors[k].id());
-        if self.settings.start_pins.is_empty() && !self.settings.pins.is_empty() {
-            // First open: Start begins with the bar's pins.
-            self.settings.start_pins = self.settings.pins.clone();
+        if !self.settings.start_pins_initialized {
+            // First open: Start begins with the bar's pins (a file from before the flag that
+            // already lists Start pins keeps them). Unpinning everything later stays empty.
+            if self.settings.start_pins.is_empty() {
+                self.settings.start_pins = self.settings.pins.clone();
+            }
+            self.settings.start_pins_initialized = true;
             self.save_settings();
         }
         let mb = &self.monitors[k];
@@ -2557,6 +2571,7 @@ impl App {
         let rect = place_panel(mb.layout.start, self.settings.position, work);
         let layout = panel_layout(rect);
         let (id, dpi) = (mb.id(), mb.info.dpi);
+        let fg_before = foreground().unwrap_or(0) as usize;
         // Cached data draws the first frame; the workers refresh it in the background.
         self.start_data.refresh(self.notify.hwnd);
         self.start_data.drain();
@@ -2574,7 +2589,10 @@ impl App {
         let shown = began.elapsed();
         let mut drawn = shown;
         match opened {
-            Ok(sp) => {
+            Ok(mut sp) => {
+                sp.fg_at_open = fg_before;
+                // Query revisions continue after the last panel's.
+                sp.state = crate::start::StartState::with_rev(self.start_data.last_rev + 1);
                 self.start = Some(sp);
                 self.start_draw();
                 drawn = began.elapsed();
@@ -2615,6 +2633,8 @@ impl App {
             return false;
         };
         let srcs = sp.icon_srcs.clone();
+        // The next panel's query revisions continue after this one's.
+        self.start_data.last_rev = self.start_data.last_rev.max(sp.state.query_rev);
         drop(sp);
         let monitors = &self.monitors;
         self.icons.forget(|src| {
@@ -2900,7 +2920,11 @@ impl App {
                         };
                         char::decode_utf16([hi, u]).next().and_then(|r| r.ok())
                     }
-                    _ => char::from_u32(u32::from(u)),
+                    _ => {
+                        // A lone high surrogate is dropped by anything but its low half.
+                        self.surrogate = None;
+                        char::from_u32(u32::from(u))
+                    }
                 };
                 // Control characters (Ctrl+letters, Backspace, Esc, DEL) come as keys.
                 if let Some(c) = c.filter(|c| *c >= ' ' && *c != '\u{7F}') {
@@ -2919,6 +2943,25 @@ impl App {
                 true
             }
             _ => false,
+        }
+    }
+
+    /// The foreground window changed. When the panel never got the foreground (activation
+    /// refused), it cannot hear its deactivation: it closes as soon as the foreground moves
+    /// away from the window that had it at open (fallback for carry 12). Getting the
+    /// foreground itself (a click on it) makes it a normal activated panel.
+    fn start_foreground_changed(&mut self, fg: Option<Hwnd>) {
+        let Some(sp) = self.start.as_mut() else {
+            return;
+        };
+        if sp.activated {
+            return;
+        }
+        let fg = fg.unwrap_or(0) as usize;
+        if fg == sp.hwnd().0 as usize {
+            sp.activated = true;
+        } else if fg != sp.fg_at_open {
+            self.close_start();
         }
     }
 
@@ -3093,6 +3136,8 @@ impl App {
     }
 
     fn on_device_removed(&mut self, dirty: &mut Dirty) {
+        // Its surfaces belonged to the lost device.
+        self.close_start();
         // GPU device removed (TDR, driver update): recreate, then redraw everything.
         self.gpu_lost = true;
         if self.recover_gpu() {
@@ -3231,9 +3276,23 @@ impl App {
         if d.clock {
             redraw |= self.tick_clock();
         }
-        if d.icons && self.icons.drain() {
-            redraw = true;
-            self.start_render();
+        if d.icons {
+            let arrived = self.icons.drain();
+            if !arrived.is_empty() {
+                let for_panel = |src: &IconSrc| {
+                    self.start
+                        .as_ref()
+                        .is_some_and(|s| s.icon_srcs.contains(src))
+                };
+                let panel = arrived.iter().any(for_panel);
+                // Icons only the Start panel shows redraw the panel, not every bar.
+                redraw |= arrived
+                    .iter()
+                    .any(|src| !for_panel(src) || self.bar_shows(src));
+                if panel {
+                    self.start_render();
+                }
+            }
         }
         if redraw {
             self.refresh()?;

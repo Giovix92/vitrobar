@@ -147,18 +147,19 @@ impl IconLoader {
         }
     }
 
-    /// Takes the finished loads; true if any arrived.
-    pub fn drain(&mut self) -> bool {
-        let mut any = false;
+    /// Takes the finished loads; returns the sources that arrived (so the caller redraws
+    /// only what shows them).
+    pub fn drain(&mut self) -> Vec<IconSrc> {
+        let mut arrived = Vec::new();
         while let Ok((key, image)) = self.rx.try_recv() {
             let slot = match image {
                 Some(img) => Slot::Ready(Arc::new(img)),
                 None => Slot::Failed(Instant::now()),
             };
+            arrived.push(key.0.clone());
             self.slots.insert(key, slot);
-            any = true;
         }
-        any
+        arrived
     }
 
     /// Forgets the finished entries (loaded or failed) of every source `drop` selects: a

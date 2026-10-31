@@ -88,8 +88,11 @@ pub struct Settings {
     pub start_style: StartStyle,
     /// The Windows key opens the Vitrobar Start instead of the stock one.
     pub win_key_opens_start: bool,
-    /// Start-panel pins. Empty means "fill from `pins` on first open".
+    /// Start-panel pins. Filled from `pins` on the first open (see `start_pins_initialized`).
     pub start_pins: Vec<Pin>,
+    /// The Start pins were set up once (copied from the bar on the first open): an empty
+    /// list then means the user unpinned everything, not "fill from the bar".
+    pub start_pins_initialized: bool,
 }
 
 impl Default for Settings {
@@ -114,6 +117,7 @@ impl Default for Settings {
             start_style: StartStyle::default(),
             win_key_opens_start: true,
             start_pins: Vec::new(),
+            start_pins_initialized: false,
         }
     }
 }
@@ -207,6 +211,7 @@ fn from_table(t: &toml::Table) -> Settings {
         start_style: get(t, "start-style", d.start_style),
         win_key_opens_start: get(t, "win-key-opens-start", d.win_key_opens_start),
         start_pins: get_list(t, "start-pins"),
+        start_pins_initialized: get(t, "start-pins-initialized", d.start_pins_initialized),
     }
 }
 
@@ -538,6 +543,7 @@ name = 3
                 name: "X".into(),
                 ..Pin::default()
             }],
+            start_pins_initialized: true,
             ..Settings::default()
         };
         save(&p, &o).unwrap();

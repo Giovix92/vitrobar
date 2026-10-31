@@ -203,6 +203,8 @@ pub struct Geom {
     pub account: PxRect,
     pub power: PxRect,
     pub results: Vec<PxRect>,
+    /// The search results' scrolling viewport (from the first result row to the footer).
+    pub results_view: PxRect,
     /// The All-apps list viewport.
     pub list: PxRect,
     pub row_h: i32,
@@ -228,6 +230,10 @@ impl Geom {
             account: r(l.account),
             power: r(l.power),
             results: l.results.iter().map(|&p| r(p)).collect(),
+            results_view: {
+                let v = r(l.list_view);
+                (search.0, v.1, search.2, footer.1)
+            },
             list: (
                 search.0,
                 pins_title.3 + (8.0 * scale).round() as i32,
@@ -241,6 +247,40 @@ impl Geom {
     fn list_h(&self) -> i32 {
         (self.list.3 - self.list.1).max(0)
     }
+
+    fn results_h(&self) -> i32 {
+        (self.results_view.3 - self.results_view.1).max(0)
+    }
+
+    /// Whole result rows that fit the results viewport (at least 1).
+    pub fn result_rows(&self) -> usize {
+        ((self.results_h() / self.row_h.max(1)) as usize).max(1)
+    }
+}
+
+/// Makes sure the first screenful of results shows some files when there are any: if fewer
+/// than `min(2, files)` file results fall within the first `rows`, app results are dropped
+/// from the end of the apps until they do (the rest stays reachable by scrolling).
+pub fn fit_results(mut items: Vec<ResultKind>, rows: usize) -> Vec<ResultKind> {
+    let files = items
+        .iter()
+        .filter(|k| matches!(k, ResultKind::File(_)))
+        .count();
+    let want = files.min(2);
+    loop {
+        let visible = items
+            .iter()
+            .take(rows)
+            .filter(|k| matches!(k, ResultKind::File(_)))
+            .count();
+        if visible >= want {
+            return items;
+        }
+        let Some(last_app) = items.iter().rposition(|k| matches!(k, ResultKind::App(_))) else {
+            return items;
+        };
+        items.remove(last_app);
+    }
 }
 
 /// What [`StartState::handle`] needs to know besides the input: geometry and content.
@@ -251,7 +291,7 @@ pub struct StartCtx<'a> {
     pub rows: &'a [ListRow],
     pub recent: &'a [RecentFile],
     pub files: &'a [FileHit],
-    /// The results shown (at most one per result row).
+    /// The results, in display order (the list scrolls).
     pub results: &'a [ResultKind],
     pub lang: Lang,
 }
@@ -261,8 +301,14 @@ impl StartCtx<'_> {
         self.start_pins.len().min(self.geom.pins.len())
     }
 
-    fn max_scroll(&self) -> f32 {
-        (self.rows.len() as i32 * self.geom.row_h - self.geom.list_h()).max(0) as f32
+    /// How far the current mode's list can scroll.
+    fn max_scroll(&self, mode: StartMode) -> f32 {
+        let g = self.geom;
+        let (n, h) = match mode {
+            StartMode::Search => (self.results.len(), g.results_h()),
+            _ => (self.rows.len(), g.list_h()),
+        };
+        (n as i32 * g.row_h - h).max(0) as f32
     }
 }
 
@@ -273,7 +319,7 @@ pub struct StartState {
     pub input: TextInput,
     /// The highlighted search result (Enter runs it).
     pub selected: usize,
-    /// All-apps scroll offset, px.
+    /// Scroll offset of the All-apps list or of the search results, px.
     pub scroll: f32,
     pub hover: Option<Target>,
     /// Bumped on every change of the query text; file results carry the revision they
@@ -292,16 +338,36 @@ impl Default for StartState {
 
 impl StartState {
     pub fn new() -> Self {
+        Self::with_rev(0)
+    }
+
+    /// A fresh state whose query revisions continue after `rev` (revisions keep growing
+    /// across panels, so a late file result for an earlier panel never matches).
+    pub fn with_rev(rev: u64) -> Self {
         Self {
             mode: StartMode::Home,
             input: TextInput::new(),
             selected: 0,
             scroll: 0.0,
             hover: None,
-            query_rev: 0,
+            query_rev: rev,
             files_rev: 0,
             files: 0,
         }
+    }
+
+    /// Scrolls the results so the selected row is fully visible.
+    pub fn reveal_selected(&mut self, ctx: &StartCtx) {
+        let g = ctx.geom;
+        let top = (self.selected as i32 * g.row_h) as f32;
+        let bottom = top + g.row_h as f32;
+        let h = g.results_h() as f32;
+        if top < self.scroll {
+            self.scroll = top;
+        } else if bottom > self.scroll + h {
+            self.scroll = bottom - h;
+        }
+        self.scroll = self.scroll.clamp(0.0, ctx.max_scroll(StartMode::Search));
     }
 
     /// File results for revision `rev` arrived: accepted (true) only if they answer the
@@ -348,7 +414,7 @@ impl StartState {
             }
             StartInput::Key(vk, ctrl) => self.key(vk, ctrl, ctx),
             StartInput::Wheel(delta) => {
-                if self.mode != StartMode::AllApps {
+                if self.mode == StartMode::Home {
                     return StartAction::None;
                 }
                 let step = WHEEL_ROWS * ctx.geom.row_h as f32 * delta as f32 / 120.0;
@@ -461,6 +527,7 @@ impl StartState {
                     StartAction::None
                 } else {
                     self.selected = next;
+                    self.reveal_selected(ctx);
                     StartAction::Redraw
                 }
             }
@@ -474,7 +541,7 @@ impl StartState {
                     VK_PRIOR => self.scroll - page,
                     VK_NEXT => self.scroll + page,
                     VK_HOME => 0.0,
-                    _ => ctx.max_scroll(),
+                    _ => ctx.max_scroll(self.mode),
                 };
                 self.scroll_to(to, ctx)
             }
@@ -483,7 +550,7 @@ impl StartState {
     }
 
     fn scroll_to(&mut self, y: f32, ctx: &StartCtx) -> StartAction {
-        let y = y.clamp(0.0, ctx.max_scroll());
+        let y = y.clamp(0.0, ctx.max_scroll(self.mode));
         if y == self.scroll {
             StartAction::None
         } else {
@@ -549,11 +616,13 @@ impl StartState {
                 (y >= 0 && i < ctx.rows.len()).then_some(Target::Row(i))
             }
             StartMode::Search => {
-                let n = ctx.results.len().min(g.results.len());
-                g.results[..n]
-                    .iter()
-                    .position(|&r| contains(r, pt))
-                    .map(Target::Result)
+                let v = g.results_view;
+                if !contains(v, pt) {
+                    return None;
+                }
+                let y = pt.1 - v.1 + self.scroll.round() as i32;
+                let i = (y / g.row_h.max(1)) as usize;
+                (y >= 0 && i < ctx.results.len()).then_some(Target::Result(i))
             }
         }
     }
@@ -674,6 +743,9 @@ pub struct StartData {
     pub account: String,
     worker: Option<DataWorker>,
     pub files: Option<FileSearch>,
+    /// The last query revision a panel used: the next panel continues after it, so file
+    /// results of a closed panel can never match a new one.
+    pub last_rev: u64,
 }
 
 impl Default for StartData {
@@ -694,6 +766,7 @@ impl StartData {
             account: String::new(),
             worker: None,
             files: None,
+            last_rev: 0,
         }
     }
 
@@ -775,7 +848,10 @@ pub struct StartPanel {
     pub monitor: u64,
     /// `Panel::activate` succeeded (it hears the keyboard).
     pub activated: bool,
-    /// Results for the current query (at most one per result row).
+    /// The foreground window when it opened (if activation failed, the next change of the
+    /// foreground away from it closes the panel).
+    pub fg_at_open: usize,
+    /// Results for the current query, in display order (the list scrolls).
     pub results: Vec<ResultKind>,
     /// File hits of the last accepted file search.
     pub files: Vec<FileHit>,
@@ -785,6 +861,8 @@ pub struct StartPanel {
     pub tracking: bool,
     /// Icon sources requested while open (kept by the icon trim, forgotten on close).
     pub icon_srcs: HashSet<IconSrc>,
+    /// First query character shown in the search box (scrolled so the caret stays inside).
+    text_first: std::cell::Cell<usize>,
 }
 
 impl StartPanel {
@@ -808,11 +886,13 @@ impl StartPanel {
             geom,
             monitor,
             activated: false,
+            fg_at_open: 0,
             results: Vec::new(),
             files: Vec::new(),
             searched: u64::MAX,
             tracking: false,
             icon_srcs: HashSet::new(),
+            text_first: std::cell::Cell::new(0),
         })
     }
 
@@ -853,6 +933,30 @@ impl StartPanel {
     /// The query text changed (or the catalog did): search again. Returns the query to hand
     /// to the file search when the text changed since the last search.
     pub fn research(&mut self, data: &StartData, lang: Lang, force: bool) -> Option<(u64, String)> {
+        let keep = self.key_of(self.state.selected, data);
+        self.research_keeping(data, lang, force, keep)
+    }
+
+    /// Identity of result `i` (stable when the results are ranked again).
+    fn key_of(&self, i: usize, data: &StartData) -> Option<String> {
+        Some(match self.results.get(i)? {
+            ResultKind::Math(_) => "m".into(),
+            ResultKind::App(a) => {
+                let p = data.apps.get(*a)?;
+                format!("a:{}:{}", p.aumid.as_deref().unwrap_or(""), p.name)
+            }
+            ResultKind::Setting(s) => format!("s:{s}"),
+            ResultKind::File(f) => format!("f:{}", self.files.get(*f)?.path),
+        })
+    }
+
+    fn research_keeping(
+        &mut self,
+        data: &StartData,
+        lang: Lang,
+        force: bool,
+        keep: Option<String>,
+    ) -> Option<(u64, String)> {
         let rev = self.state.query_rev;
         let changed = rev != self.searched;
         if !changed && !force {
@@ -864,12 +968,35 @@ impl StartPanel {
         }
         self.searched = rev;
         let text = self.state.input.text();
-        let mut items = search(&text, &data.apps, &self.files, lang).items;
-        items.truncate(self.geom.results.len());
-        self.results = items;
+        let items = search(&text, &data.apps, &self.files, lang).items;
+        self.results = fit_results(items, self.geom.result_rows());
+        if !changed {
+            // Same query ranked again (files or the catalog arrived): the selection stays
+            // on the same item.
+            if let Some(k) = keep {
+                let found = (0..self.results.len())
+                    .find(|&i| self.key_of(i, data).as_deref() == Some(k.as_str()));
+                if let Some(i) = found {
+                    self.state.selected = i;
+                }
+            }
+        }
         let n = self.results.len();
         if self.state.selected >= n {
             self.state.selected = n.saturating_sub(1);
+        }
+        if self.state.mode == StartMode::Search {
+            let ctx = StartCtx {
+                geom: &self.geom,
+                start_pins: &[],
+                apps: &data.apps,
+                rows: &data.rows,
+                recent: &data.recent,
+                files: &self.files,
+                results: &self.results,
+                lang,
+            };
+            self.state.reveal_selected(&ctx);
         }
         changed.then_some((rev, text))
     }
@@ -885,8 +1012,9 @@ impl StartPanel {
         if !self.state.files_arrived(rev, hits.len()) {
             return false;
         }
+        let keep = self.key_of(self.state.selected, data);
         self.files = hits;
-        self.research(data, lang, true);
+        self.research_keeping(data, lang, true, keep);
         true
     }
 
@@ -921,13 +1049,21 @@ impl StartPanel {
                 let (page, list) = self.all_apps_items(icons, data, look);
                 (page, Some(list))
             }
-            StartMode::Search => (self.search_items(icons, data, look), None),
+            StartMode::Search => {
+                let (page, list) = self.search_items(icons, data, look);
+                (page, Some(list))
+            }
         };
         self.view.set_layer(Layer::Chrome, painter, chrome)?;
         self.view.set_layer(Layer::Page, painter, page)?;
         match list {
             Some(list) => {
-                self.view.set_viewport(Some(self.geom.list))?;
+                let viewport = if self.state.mode == StartMode::Search {
+                    self.geom.results_view
+                } else {
+                    self.geom.list
+                };
+                self.view.set_viewport(Some(viewport))?;
                 self.view.set_scroll(self.state.scroll)?;
                 self.view.set_layer(Layer::List, painter, list)?;
             }
@@ -1028,8 +1164,29 @@ impl StartPanel {
         ));
         let tx = s.0 + 2 * pad + glyph_w;
         let text_box = (tx, s.1, s.2 - pad, s.3);
-        let query = self.state.input.text();
-        if query.is_empty() {
+        let full = self.state.input.text();
+        // Scroll the text so the caret stays in the box: drop leading characters until the
+        // part before the caret fits, and bring them back when there is room again.
+        let caret = self.state.input.caret();
+        let box_w = (text_box.2 - text_box.0 - self.px(2.0)).max(1) as f32;
+        let chars: Vec<char> = full.chars().collect();
+        let width = |from: usize| -> f32 {
+            let s: String = chars[from..].iter().collect();
+            painter
+                .caret_x(&s, FontKind::Text, self.sz(14.0), caret - from)
+                .unwrap_or(0.0)
+        };
+        let mut first = self.text_first.get().min(caret);
+        while first < caret && width(first) > box_w {
+            first += 1;
+        }
+        while first > 0 && width(first - 1) <= box_w {
+            first -= 1;
+        }
+        self.text_first.set(first);
+        let query: String = chars[first..].iter().collect();
+        let caret_in_shown = caret - first;
+        if full.is_empty() {
             items.push(self.text(
                 tr(look.lang, Key::SearchPlaceholder),
                 text_box,
@@ -1042,12 +1199,7 @@ impl StartPanel {
         }
         // Non-blinking caret (no timers).
         let x = painter
-            .caret_x(
-                &query,
-                FontKind::Text,
-                self.sz(14.0),
-                self.state.input.caret(),
-            )
+            .caret_x(&query, FontKind::Text, self.sz(14.0), caret_in_shown)
             .unwrap_or(0.0)
             .round() as i32;
         let cx = (tx + x).min(text_box.2);
@@ -1177,19 +1329,31 @@ impl StartPanel {
         ]
     }
 
-    fn search_items(&mut self, icons: &mut IconLoader, data: &StartData, look: &Look) -> Vec<Item> {
+    /// The page ("No results" when empty) and the result rows (content px of the scrolling
+    /// results viewport).
+    fn search_items(
+        &mut self,
+        icons: &mut IconLoader,
+        data: &StartData,
+        look: &Look,
+    ) -> (Vec<Item>, Vec<Item>) {
         let t = look.style.text;
         let dim = Rgba(t.0, t.1, t.2, 150);
         let g = self.geom.clone();
+        let mut page = Vec::new();
         let mut items = Vec::new();
         if self.results.is_empty() {
             if let Some(r) = g.results.first() {
-                items.push(self.text(tr(look.lang, Key::NoResults), *r, 14.0, dim, false));
+                page.push(self.text(tr(look.lang, Key::NoResults), *r, 14.0, dim, false));
             }
-            return items;
+            return (page, items);
         }
         let results = self.results.clone();
-        for (i, (r, kind)) in g.results.iter().zip(&results).enumerate() {
+        let w = g.results_view.2 - g.results_view.0;
+        let rows: Vec<PxRect> = (0..results.len() as i32)
+            .map(|i| (0, i * g.row_h, w, (i + 1) * g.row_h))
+            .collect();
+        for (i, (r, kind)) in rows.iter().zip(&results).enumerate() {
             if i == self.state.selected {
                 items.push(self.plate(*r, Rgba(t.0, t.1, t.2, 30), 6.0));
             } else if let Some(p) = self.hover_plate(Target::Result(i), *r, look) {
@@ -1252,7 +1416,7 @@ impl StartPanel {
                 }
             }
         }
-        items
+        (page, items)
     }
 
     /// The page (title and Back button) and the list layer's rows near the viewport.
@@ -1532,7 +1696,7 @@ mod tests {
             s.handle(StartInput::Wheel(120), &f.ctx()),
             StartAction::None
         );
-        let max = f.ctx().max_scroll();
+        let max = f.ctx().max_scroll(StartMode::AllApps);
         assert!(max > 0.0);
         s.handle(StartInput::Wheel(-120 * 1000), &f.ctx());
         assert_eq!(s.scroll, max);
@@ -1658,6 +1822,122 @@ mod tests {
         assert_eq!(s.hover, Some(Target::Pin(0)));
         assert_eq!(s.handle(StartInput::Leave, &f.ctx()), StartAction::Redraw);
         assert_eq!(s.hover, None);
+    }
+
+    /// A panel whose results viewport holds exactly 8 rows (at 1x).
+    fn short_geom() -> Geom {
+        let l = panel_layout(Rect {
+            x: 0.0,
+            y: 0.0,
+            w: PANEL_W_DIP,
+            h: 500.0,
+        });
+        Geom::new(&l, 1.0)
+    }
+
+    fn sixteen_results() -> Vec<ResultKind> {
+        let mut r = vec![ResultKind::Math(4.0)];
+        r.extend((0..6).map(ResultKind::App));
+        r.extend((0..3).map(ResultKind::Setting));
+        r.extend((0..6).map(ResultKind::File));
+        r
+    }
+
+    #[test]
+    fn every_result_is_reachable_and_the_selection_stays_visible() {
+        let mut f = Fixture::new();
+        f.geom = short_geom();
+        assert_eq!(f.geom.result_rows(), 8);
+        f.files = (0..6)
+            .map(|i| FileHit {
+                name: format!("f{i}.txt"),
+                path: format!("C:\\f{i}.txt"),
+            })
+            .collect();
+        f.results = sixteen_results();
+        let mut s = StartState::new();
+        s.handle(StartInput::Char('a'), &f.ctx());
+        let h = f.geom.results_h() as f32;
+        let row = f.geom.row_h as f32;
+        for i in 1..16 {
+            assert_eq!(
+                s.handle(StartInput::Key(VK_DOWN, false), &f.ctx()),
+                StartAction::Redraw
+            );
+            assert_eq!(s.selected, i);
+            let top = i as f32 * row;
+            assert!(
+                top >= s.scroll && top + row <= s.scroll + h,
+                "row {i} hidden"
+            );
+        }
+        // The last one (a file) runs, and is under the cursor at its scrolled position.
+        assert_eq!(
+            s.handle(StartInput::Key(VK_RETURN, false), &f.ctx()),
+            StartAction::Open("C:\\f5.txt".into())
+        );
+        let v = f.geom.results_view;
+        let y = (15.0 * row - s.scroll) as i32 + v.1 + 5;
+        assert_eq!(s.hit((v.0 + 20, y), &f.ctx()), Some(Target::Result(15)));
+        // Back up to the top scrolls back.
+        for _ in 0..15 {
+            s.handle(StartInput::Key(VK_UP, false), &f.ctx());
+        }
+        assert_eq!((s.selected, s.scroll), (0, 0.0));
+        // The wheel scrolls the results too, clamped.
+        s.handle(StartInput::Wheel(-120 * 10), &f.ctx());
+        assert_eq!(s.scroll, f.ctx().max_scroll(StartMode::Search));
+        assert_eq!(s.scroll, 16.0 * row - h);
+    }
+
+    #[test]
+    fn files_show_on_a_short_panel() {
+        let fitted = fit_results(sixteen_results(), 8);
+        let files_visible = fitted
+            .iter()
+            .take(8)
+            .filter(|k| matches!(k, ResultKind::File(_)))
+            .count();
+        assert_eq!(files_visible, 2);
+        // Four apps made room (math and 3 settings precede the files); every file is kept.
+        assert_eq!(
+            fitted
+                .iter()
+                .filter(|k| matches!(k, ResultKind::App(_)))
+                .count(),
+            2
+        );
+        assert_eq!(fitted.len(), 12);
+        assert!(fitted.contains(&ResultKind::Setting(2)));
+        assert!(fitted.contains(&ResultKind::File(5)));
+        // Room enough, or no files: unchanged.
+        assert_eq!(fit_results(sixteen_results(), 16), sixteen_results());
+        let no_files: Vec<ResultKind> = (0..12).map(ResultKind::App).collect();
+        assert_eq!(fit_results(no_files.clone(), 4), no_files);
+        // One file needs one row.
+        let one = vec![
+            ResultKind::App(0),
+            ResultKind::App(1),
+            ResultKind::App(2),
+            ResultKind::File(0),
+        ];
+        assert_eq!(
+            fit_results(one, 2),
+            vec![ResultKind::App(0), ResultKind::File(0)]
+        );
+    }
+
+    #[test]
+    fn revisions_continue_across_panels() {
+        let f = Fixture::new();
+        let mut old = StartState::new();
+        old.handle(StartInput::Char('x'), &f.ctx());
+        let stale = old.query_rev;
+        let mut s = StartState::with_rev(stale + 1);
+        assert!(!s.files_arrived(stale, 2));
+        s.handle(StartInput::Char('y'), &f.ctx());
+        assert!(s.query_rev > stale + 1);
+        assert!(s.files_arrived(s.query_rev, 2));
     }
 
     #[test]
