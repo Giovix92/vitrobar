@@ -32,6 +32,7 @@ const HEADER_H: f32 = 36.0;
 pub enum Section {
     Appearance,
     Behaviour,
+    Widgets,
     Language,
     About,
 }
@@ -41,6 +42,7 @@ impl Section {
         match self {
             Section::Appearance => Key::Appearance,
             Section::Behaviour => Key::Behaviour,
+            Section::Widgets => Key::Widgets,
             Section::Language => Key::Language,
             Section::About => Key::About,
         }
@@ -76,6 +78,9 @@ pub enum ControlId {
     StartWithWindows,
     ReserveFloating,
     StockTaskbar,
+    WidgetMusic,
+    WidgetClaude,
+    ClaudeWidgetHint,
     Language,
     AboutVersion,
     AboutLicense,
@@ -275,6 +280,25 @@ pub fn build_model(s: &Settings, width_dip: f32) -> SettingsModel {
     );
 
     add(
+        ControlId::WidgetMusic,
+        Widgets,
+        Key::MusicWidget,
+        ControlKind::Toggle(s.widget_music),
+    );
+    add(
+        ControlId::WidgetClaude,
+        Widgets,
+        Key::ClaudeWidget,
+        ControlKind::Toggle(s.widget_claude),
+    );
+    add(
+        ControlId::ClaudeWidgetHint,
+        Widgets,
+        Key::ClaudeWidgetHint,
+        ControlKind::Text(Key::ClaudeWidgetHint),
+    );
+
+    add(
         ControlId::Language,
         Language,
         Key::Language,
@@ -345,6 +369,8 @@ pub fn apply(s: &mut Settings, id: ControlId, choice: usize) -> bool {
         ControlId::StartWithWindows => set_bool(&mut s.start_with_windows, choice),
         ControlId::ReserveFloating => set_bool(&mut s.reserve_space_floating, choice),
         ControlId::StockTaskbar => set(&mut s.stock_taskbar, &STOCKS, choice),
+        ControlId::WidgetMusic => set_bool(&mut s.widget_music, choice),
+        ControlId::WidgetClaude => set_bool(&mut s.widget_claude, choice),
         ControlId::Language => {
             let new = match choice {
                 0 => None,
@@ -359,7 +385,10 @@ pub fn apply(s: &mut Settings, id: ControlId, choice: usize) -> bool {
                 true
             }
         }
-        ControlId::AboutVersion | ControlId::AboutLicense | ControlId::AboutSource => false,
+        ControlId::ClaudeWidgetHint
+        | ControlId::AboutVersion
+        | ControlId::AboutLicense
+        | ControlId::AboutSource => false,
     }
 }
 
@@ -451,6 +480,32 @@ mod tests {
     }
 
     #[test]
+    fn widget_toggles_set_the_widget_settings() {
+        let mut s = Settings::default();
+        assert!(apply(&mut s, ControlId::WidgetMusic, 1));
+        assert!(s.widget_music && !s.widget_claude);
+        assert!(!apply(&mut s, ControlId::WidgetMusic, 1));
+        assert!(apply(&mut s, ControlId::WidgetClaude, 1));
+        assert!(s.widget_claude);
+        assert!(!apply(&mut s, ControlId::ClaudeWidgetHint, 1));
+        let m = build_model(&s, 600.0);
+        assert!(matches!(
+            find(&m, ControlId::WidgetMusic).kind,
+            ControlKind::Toggle(true)
+        ));
+        let ids: Vec<_> = m.controls.iter().map(|c| (c.id, c.section)).collect();
+        let at = |id| ids.iter().position(|(i, _)| *i == id).unwrap();
+        assert_eq!(ids[at(ControlId::WidgetMusic)].1, Section::Widgets);
+        assert!(at(ControlId::StockTaskbar) < at(ControlId::WidgetMusic));
+        assert!(at(ControlId::ClaudeWidgetHint) == at(ControlId::WidgetClaude) + 1);
+        assert!(at(ControlId::ClaudeWidgetHint) < at(ControlId::Language));
+        assert_eq!(
+            find(&m, ControlId::ClaudeWidgetHint).kind,
+            ControlKind::Text(Key::ClaudeWidgetHint)
+        );
+    }
+
+    #[test]
     fn language_maps_to_option() {
         let mut s = Settings::default();
         assert!(!apply(&mut s, ControlId::Language, 0));
@@ -499,9 +554,9 @@ mod tests {
     fn model_order_and_geometry() {
         let m = build_model(&Settings::default(), 600.0);
         let ids: Vec<_> = m.controls.iter().map(|c| c.id).collect();
-        assert_eq!(ids.len(), 16);
+        assert_eq!(ids.len(), 19);
         assert_eq!(ids[0], ControlId::Shape);
-        assert_eq!(ids[15], ControlId::AboutSource);
+        assert_eq!(ids[18], ControlId::AboutSource);
         assert_eq!(m.focus, 0);
         // 24 padding, then a 36 header, then 48 rows.
         assert_eq!(m.controls[0].rect.y, 24.0 + 36.0);

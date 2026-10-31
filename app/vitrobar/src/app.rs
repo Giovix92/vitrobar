@@ -245,6 +245,7 @@ fn empty_layout() -> BarLayout {
         clock_w: CLOCK_MIN_DIP,
         reserve_floating: false,
         tray_area: false,
+        widgets: [0.0; 2],
     })
 }
 
@@ -864,6 +865,7 @@ impl App {
             clock_w: self.clock_w,
             reserve_floating: self.settings.reserve_space_floating,
             tray_area: mb.tray,
+            widgets: [0.0; 2],
         })
     }
 
@@ -2734,6 +2736,8 @@ impl App {
                 }
             }
             // The overflow menu and show-desktop arrive in later tasks.
+            // The Music and Claude-limits pills open their panels in the widget tasks.
+            Hit::Widget(_) => {}
             Hit::More | Hit::ShowDesktop => {}
         }
     }

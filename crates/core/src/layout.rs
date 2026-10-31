@@ -61,6 +61,9 @@ pub struct LayoutInput {
     /// Only the primary monitor's bar does; the others show Start, their apps and the clock.
     /// Without it `overflow_chevron` and `quick` are zero-width and `tray_count` is ignored.
     pub tray_area: bool,
+    /// DIP widths of the Music and Claude-limits pills (0 = hidden). Only the bar with the tray
+    /// area shows them, just left of the tray.
+    pub widgets: [f32; 2],
 }
 
 #[derive(Clone, Debug)]
@@ -75,6 +78,8 @@ pub struct BarLayout {
     pub tray: Vec<Rect>,
     pub quick: Rect,
     pub clock: Rect,
+    /// The Music and Claude pills, `None` when hidden or on a bar without the tray area.
+    pub widgets: [Option<Rect>; 2],
     pub show_desktop: Rect,
     /// DIPs to reserve at the screen edge.
     pub reserved: f32,
@@ -134,7 +139,19 @@ pub fn compute_layout(i: &LayoutInput) -> BarLayout {
     // the tray area.
     let tray_count = if i.tray_area { i.tray_count } else { 0 };
     let tray_slot = if i.tray_area { m.slot } else { 0.0 };
-    let right_w = m.slot * tray_count as f32 + 2.0 * tray_slot + i.clock_w;
+    let widget_w = |k: usize| {
+        if i.tray_area && i.widgets[k] > 0.0 {
+            i.widgets[k]
+        } else {
+            0.0
+        }
+    };
+    // each shown widget takes its width plus a GAP towards what follows it
+    let widgets_w: f32 = (0..2)
+        .filter(|&k| widget_w(k) > 0.0)
+        .map(|k| widget_w(k) + GAP)
+        .sum();
+    let right_w = widgets_w + m.slot * tray_count as f32 + 2.0 * tray_slot + i.clock_w;
     // right group with its inner padding on both sides, then the show-desktop strip
     let right_surface_w = PAD + right_w + PAD + SHOW_DESKTOP_W;
 
@@ -213,11 +230,21 @@ pub fn compute_layout(i: &LayoutInput) -> BarLayout {
     let apps: Vec<Rect> = (0..shown).map(|k| item(apps_x + k as f32 * s, s)).collect();
     let more = has_more.then(|| item(apps_x + shown as f32 * s, s));
 
-    let overflow_chevron = item(right_x, tray_slot);
+    let mut wx = right_x;
+    let widgets = [0, 1].map(|k| {
+        let w = widget_w(k);
+        (w > 0.0).then(|| {
+            let r = item(wx, w);
+            wx += w + GAP;
+            r
+        })
+    });
+    let tray_x = right_x + widgets_w;
+    let overflow_chevron = item(tray_x, tray_slot);
     let tray: Vec<Rect> = (0..tray_count)
-        .map(|k| item(right_x + tray_slot + k as f32 * m.slot, m.slot))
+        .map(|k| item(tray_x + tray_slot + k as f32 * m.slot, m.slot))
         .collect();
-    let quick_x = right_x + tray_slot + tray_count as f32 * m.slot;
+    let quick_x = tray_x + tray_slot + tray_count as f32 * m.slot;
     let quick = item(quick_x, tray_slot);
     let clock = item(quick_x + tray_slot, i.clock_w);
 
@@ -247,8 +274,33 @@ pub fn compute_layout(i: &LayoutInput) -> BarLayout {
         tray,
         quick,
         clock,
+        widgets,
         show_desktop,
         reserved,
+    }
+}
+
+/// The bar elements a panel can open from.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AnchorTarget {
+    Quick,
+    Clock,
+    /// 0 = Music, 1 = Claude limits.
+    Widget(usize),
+}
+
+/// The DIP rect a panel anchors to: the element itself, on every shape. A hidden widget (or an
+/// index past the last) falls back to the quick-settings button so a panel still has a spot.
+pub fn anchor_for(layout: &BarLayout, target: AnchorTarget) -> Rect {
+    match target {
+        AnchorTarget::Quick => layout.quick,
+        AnchorTarget::Clock => layout.clock,
+        AnchorTarget::Widget(k) => layout
+            .widgets
+            .get(k)
+            .copied()
+            .flatten()
+            .unwrap_or(layout.quick),
     }
 }
 
@@ -275,6 +327,7 @@ mod tests {
             clock_w: 64.0,
             reserve_floating: reserve,
             tray_area: true,
+            widgets: [0.0; 2],
         }
     }
     fn lay(shape: Shape, n: usize) -> BarLayout {
@@ -297,6 +350,7 @@ mod tests {
         v.extend(l.tray.iter().copied());
         v.push(l.quick);
         v.push(l.clock);
+        v.extend(l.widgets.iter().flatten().copied());
         v.push(l.show_desktop);
         v
     }
@@ -484,5 +538,75 @@ mod tests {
         let first = l.apps.first().unwrap();
         let last = l.apps.last().unwrap();
         assert!(((first.x + last.right()) / 2.0 - 960.0).abs() < 0.5);
+    }
+    #[test]
+    fn widgets_sit_left_of_the_tray_in_the_pill() {
+        let mut i = input(MON, Shape::Pill, Position::Bottom, 5, true);
+        i.widgets = [120.0, 90.0];
+        let l = compute_layout(&i);
+        let (m, c) = (l.widgets[0].unwrap(), l.widgets[1].unwrap());
+        assert!(m.right() <= c.x && c.right() <= l.overflow_chevron.x);
+        assert!(l.surfaces[0].x <= m.x && c.right() <= l.surfaces[0].right());
+        assert_eq!((m.w, c.w), (120.0, 90.0));
+    }
+    #[test]
+    fn widgets_fit_and_dont_overlap_in_every_shape() {
+        for shape in ALL_SHAPES {
+            for n in [0, 5, 200] {
+                let mut i = input(MON, shape, Position::Bottom, n, true);
+                i.widgets = [120.0, 90.0];
+                let l = compute_layout(&i);
+                for r in all_items(&l) {
+                    assert!(
+                        l.surfaces.iter().any(|s| contains(s, &r)),
+                        "{shape:?} {r:?}"
+                    );
+                }
+                assert_no_overlap(&all_items(&l));
+            }
+        }
+        // Islands: the widgets open the right island.
+        let mut i = input(MON, Shape::Islands, Position::Bottom, 5, true);
+        i.widgets = [120.0, 0.0];
+        let l = compute_layout(&i);
+        assert_eq!(l.widgets[0].unwrap().x, l.surfaces[2].x + PAD);
+        assert!(l.widgets[1].is_none());
+    }
+    #[test]
+    fn widgets_hidden_on_secondary_bars_and_when_zero() {
+        let mut i = input(MON, Shape::Pill, Position::Bottom, 5, true);
+        i.widgets = [120.0, 90.0];
+        i.tray_area = false;
+        assert_eq!(compute_layout(&i).widgets, [None, None]);
+        i.tray_area = true;
+        i.widgets = [0.0, 90.0];
+        let l = compute_layout(&i);
+        assert!(l.widgets[0].is_none() && l.widgets[1].is_some());
+        i.widgets = [0.0, 0.0];
+        assert_eq!(compute_layout(&i).widgets, [None, None]);
+    }
+    #[test]
+    fn pill_grows_by_the_widgets() {
+        let base = input(MON, Shape::Pill, Position::Bottom, 5, true);
+        let mut with = base;
+        with.widgets = [120.0, 90.0];
+        let w0 = compute_layout(&base).surfaces[0].w;
+        let w1 = compute_layout(&with).surfaces[0].w;
+        assert!((w1 - (w0 + 120.0 + 90.0 + 2.0 * GAP)).abs() < EPS);
+    }
+    #[test]
+    fn anchors_follow_the_element() {
+        let mut i = input(MON, Shape::Islands, Position::Top, 5, true);
+        i.widgets = [120.0, 90.0];
+        let l = compute_layout(&i);
+        assert_eq!(anchor_for(&l, AnchorTarget::Quick), l.quick);
+        assert_eq!(anchor_for(&l, AnchorTarget::Clock), l.clock);
+        assert_eq!(
+            anchor_for(&l, AnchorTarget::Widget(1)),
+            l.widgets[1].unwrap()
+        );
+        // hidden widget: falls back to the quick button
+        let l = lay(Shape::Pill, 5);
+        assert_eq!(anchor_for(&l, AnchorTarget::Widget(0)), l.quick);
     }
 }

@@ -8,6 +8,7 @@ use vitro_core::settings::{HoverEffect, IconSize, Material, Position, Shape};
 use vitro_core::style::{hover_style, material_style, Rgba, Theme};
 use vitro_render::bar_visual::{
     hover_timing, BarFocus, BarVisual, ChevronState, ItemState, TrayItemState, VisualEnv,
+    WidgetPill,
 };
 use vitro_render::compositor::init_compositor;
 use vitro_render::device::create_gpu_device;
@@ -29,6 +30,7 @@ fn layout(shape: Shape, apps: usize) -> BarLayout {
         clock_w: 72.0,
         reserve_floating: true,
         tray_area: true,
+        widgets: [0.0; 2],
     })
 }
 
@@ -323,6 +325,7 @@ fn tray_icons_and_chevron_draw_once() {
         clock_w: 72.0,
         reserve_floating: true,
         tray_area: true,
+        widgets: [0.0; 2],
     };
     let l = compute_layout(&input);
     let img = Arc::new(icon(16));
@@ -390,6 +393,7 @@ fn bar_without_tray_area_draws_start_and_clock_only() {
         clock_w: 72.0,
         reserve_floating: true,
         tray_area: false,
+        widgets: [0.0; 2],
     });
     // Even if the app handed tray items over, a bar without the tray area shows none.
     bar.set_tray(vec![TrayItemState::default(); 3], ChevronState::default());
@@ -451,6 +455,7 @@ fn focus_ring_follows_the_focused_item_without_redrawing() {
         clock_w: 72.0,
         reserve_floating: true,
         tray_area: true,
+        widgets: [0.0; 2],
     };
     let l = compute_layout(&input);
     let items = icons(3);
@@ -511,4 +516,63 @@ fn focus_ring_follows_the_focused_item_without_redrawing() {
     bar.set_focus(Some(BarFocus::Chevron));
     bar.update(&l, &items, "12:34", &style, &hover).unwrap();
     assert_eq!(bar.focus_ring(), None);
+}
+
+#[test]
+fn widget_pills_draw_only_what_the_app_supplies() {
+    let comp = init_compositor().unwrap();
+    let gpu = create_gpu_device(&comp).unwrap();
+    let mut bar = BarVisual::new(&comp, &gpu, 0).unwrap();
+    bar.set_env(VisualEnv {
+        animations: false,
+        ..Default::default()
+    });
+    let style = material_style(Material::Frosted, Theme::Dark, true);
+    let hover = hover_style(HoverEffect::Plate);
+    let mut l = compute_layout(&LayoutInput {
+        widgets: [120.0, 90.0],
+        ..input_for(Shape::Pill)
+    });
+    // Slots without content draw nothing: the bar looks as before.
+    bar.update(&l, &[], "12:34", &style, &hover).unwrap();
+    assert_eq!(bar.widget_cells(), 0);
+    let base = bar.surfaces_drawn();
+    let pill = |t: &str| {
+        Some(WidgetPill {
+            glyph: '\u{E8D6}',
+            text: t.to_string(),
+        })
+    };
+    bar.set_widgets([pill("Song - Artist"), None], None);
+    bar.update(&l, &[], "12:34", &style, &hover).unwrap();
+    assert_eq!(bar.widget_cells(), 1);
+    assert_eq!(bar.surfaces_drawn(), base + 1);
+    // Hover changes the plate, not the text surface.
+    bar.set_widgets([pill("Song - Artist"), None], Some(0));
+    bar.update(&l, &[], "12:34", &style, &hover).unwrap();
+    assert_eq!(bar.surfaces_drawn(), base + 1);
+    // A pill without a layout rect (widget hidden) draws nothing.
+    l.widgets = [None, None];
+    bar.update(&l, &[], "12:34", &style, &hover).unwrap();
+    assert_eq!(bar.widget_cells(), 0);
+}
+
+fn input_for(shape: Shape) -> LayoutInput {
+    LayoutInput {
+        monitor: Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 1536.0,
+            h: 864.0,
+        },
+        shape,
+        position: Position::Bottom,
+        icon_size: IconSize::Medium,
+        app_count: 0,
+        tray_count: 0,
+        clock_w: 72.0,
+        reserve_floating: true,
+        tray_area: true,
+        widgets: [0.0; 2],
+    }
 }

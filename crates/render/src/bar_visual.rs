@@ -77,6 +77,14 @@ pub struct ChevronState {
     pub open: bool,
 }
 
+/// What a widget pill of the bar shows: a glyph (Segoe Fluent Icons) and one line of text.
+/// The widget tasks supply it and the width in `LayoutInput::widgets`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WidgetPill {
+    pub glyph: char,
+    pub text: String,
+}
+
 /// Inputs that change rarely (monitor DPI, accent colour, the Animation effects setting,
 /// the screen edge the bar sits on).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -268,6 +276,10 @@ pub const TRAY_ICON_DIP: f32 = crate::tray_flyout::TRAY_ICON_DIP;
 /// Font sizes and geometry in DIPs.
 const GLYPH_DIP: f32 = 16.0;
 const CLOCK_FONT_DIP: f32 = 12.0;
+/// Widget pills: one font size for the glyph and the text, padding inside the plate.
+const WIDGET_FONT_DIP: f32 = 13.0;
+const WIDGET_PAD_DIP: f32 = 10.0;
+const WIDGET_GAP_DIP: f32 = 6.0;
 const DOT_DIP: f32 = 4.0;
 const ACTIVE_DOT_DIP: f32 = 12.0;
 const DOT_GAP_DIP: f32 = 3.0;
@@ -306,6 +318,18 @@ enum Content {
     },
     /// Icon centred in the cell, `dy` px above centre.
     Icon { image: IconRef, dy: i32 },
+    /// A widget pill: the glyph, then one line of text cut with an ellipsis; `pad` px inside
+    /// the cell edges, `gap` px between the two.
+    Pill {
+        glyph: char,
+        text: String,
+        size_px: i32,
+        color: Rgba,
+        pad: i32,
+        gap: i32,
+        w: i32,
+        h: i32,
+    },
     /// Rounded square of `size` px in place of an icon that has not loaded yet.
     Placeholder {
         size: i32,
@@ -485,7 +509,7 @@ impl Cell {
                 w: *size,
                 h: *size,
             },
-            Content::Text { w, h, .. } => PxRect {
+            Content::Text { w, h, .. } | Content::Pill { w, h, .. } => PxRect {
                 x: 0,
                 y: 0,
                 w: *w,
@@ -740,6 +764,44 @@ impl Cell {
                 self.sprite.SetOffset(Vector3::new(0.0, 0.0, 0.0))?;
                 self.sprite.SetIsVisible(true)?;
             }
+            Content::Pill {
+                glyph,
+                text,
+                size_px,
+                color: c,
+                pad,
+                gap,
+                w,
+                h,
+            } => {
+                self.placeholder.visual.SetIsVisible(false)?;
+                if redraw {
+                    let glyph = glyph.to_string();
+                    let glyph_w = *size_px as f32 * 1.2;
+                    let text_x = *pad as f32 + glyph_w + *gap as f32;
+                    let (fw, fh) = (*w as f32, *h as f32);
+                    let boxes = [
+                        (
+                            glyph.as_str(),
+                            FontKind::Glyph,
+                            (*pad as f32, 0.0, glyph_w, fh),
+                        ),
+                        (
+                            text.as_str(),
+                            FontKind::Text,
+                            (text_x, 0.0, (fw - text_x - *pad as f32).max(1.0), fh),
+                        ),
+                    ];
+                    let surface =
+                        painter.text_boxes(&boxes, *size_px as f32, *c, *w as u32, *h as u32)?;
+                    self.sprite
+                        .SetBrush(&comp.CreateSurfaceBrushWithSurface(&surface)?)?;
+                    drawn = 1;
+                }
+                self.sprite.SetSize(Vector2::new(*w as f32, *h as f32))?;
+                self.sprite.SetOffset(Vector3::new(0.0, 0.0, 0.0))?;
+                self.sprite.SetIsVisible(true)?;
+            }
             Content::Icon { image, dy } => {
                 self.placeholder.visual.SetIsVisible(false)?;
                 if redraw {
@@ -911,6 +973,10 @@ pub struct BarVisual {
     tray: Vec<Option<Cell>>,
     quick: Option<Cell>,
     clock: Option<Cell>,
+    /// Music and Claude pills.
+    widget_cells: [Option<Cell>; 2],
+    widget_pills: [Option<WidgetPill>; 2],
+    widget_hover: Option<usize>,
     tray_items: Vec<TrayItemState>,
     chevron_state: ChevronState,
     focus: Option<BarFocus>,
@@ -950,6 +1016,9 @@ impl BarVisual {
             tray: Vec::new(),
             quick: None,
             clock: None,
+            widget_cells: [None, None],
+            widget_pills: [None, None],
+            widget_hover: None,
             tray_items: Vec::new(),
             chevron_state: ChevronState::default(),
             focus: None,
@@ -1010,6 +1079,19 @@ impl BarVisual {
         self.chevron_state = chevron;
     }
 
+    /// The widget pills (index 0 = Music, 1 = Claude; `None` draws nothing) and the one under
+    /// the cursor; take effect on the next [`BarVisual::update`]. A pill also needs a rect in
+    /// `layout.widgets`.
+    pub fn set_widgets(&mut self, pills: [Option<WidgetPill>; 2], hovered: Option<usize>) {
+        self.widget_pills = pills;
+        self.widget_hover = hovered;
+    }
+
+    /// Number of widget pills currently in the tree (diagnostics and tests).
+    pub fn widget_cells(&self) -> usize {
+        self.widget_cells.iter().flatten().count()
+    }
+
     /// The item keyboard focus mode is on (`None`: no focus ring); takes effect on the next
     /// [`BarVisual::update`]. An item on another surface of the bar shows no ring here.
     pub fn set_focus(&mut self, focus: Option<BarFocus>) {
@@ -1044,6 +1126,7 @@ impl BarVisual {
             &mut self.clock,
         ]
         .into_iter()
+        .chain(self.widget_cells.iter_mut())
         .chain(self.apps.iter_mut())
         .chain(self.tray.iter_mut())
         .flatten()
@@ -1203,6 +1286,48 @@ impl BarVisual {
             }
         });
 
+        // A pill is drawn only when the app gave it text and the layout a rect.
+        let widget_specs: [Option<CellSpec>; 2] = [0, 1].map(|k| {
+            let (pill, r) = (self.widget_pills[k].as_ref()?, layout.widgets[k].as_ref()?);
+            owns(&surface, r).then(|| {
+                let rect = cell_rect(r);
+                let on = self.widget_hover == Some(k);
+                // The hover effect's plate when it has one; the other effects get the quiet
+                // plate of the tray icons.
+                let fx = HoverFx {
+                    motion: Motion::default(),
+                    anchor: Anchor::Centre,
+                    top: self.env.position == Position::Top,
+                    plate: hover.plate && on,
+                    sweep: false,
+                    timing: hover_timing(hover),
+                };
+                CellSpec {
+                    rect,
+                    content: Content::Pill {
+                        glyph: pill.glyph,
+                        text: pill.text.clone(),
+                        size_px: px(WIDGET_FONT_DIP),
+                        color: text,
+                        pad: px(WIDGET_PAD_DIP),
+                        gap: px(WIDGET_GAP_DIP),
+                        w: rect.w,
+                        h: rect.h,
+                    },
+                    plate: if on && !hover.plate {
+                        rgba_alpha(text, PLATE_HOVER_ALPHA)
+                    } else {
+                        Rgba(0, 0, 0, 0)
+                    },
+                    plate_inset,
+                    plate_radius,
+                    attention: false,
+                    dots: None,
+                    fx: Some(fx),
+                }
+            })
+        });
+
         let accent = rgba_alpha(self.env.accent, 255);
         let dot_metrics = (
             px(DOT_DIP),
@@ -1292,6 +1417,9 @@ impl BarVisual {
         }
         drawn += sync(&mut self.quick, quick, comp, painter, &parent, anim)?;
         drawn += sync(&mut self.clock, clock_spec, comp, painter, &parent, anim)?;
+        for (slot, spec) in self.widget_cells.iter_mut().zip(widget_specs) {
+            drawn += sync(slot, spec, comp, painter, &parent, anim)?;
+        }
         self.surfaces_drawn += u64::from(drawn);
 
         // Around the item's plate (the same inset and corner radius).

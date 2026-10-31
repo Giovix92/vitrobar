@@ -92,6 +92,10 @@ pub enum Key {
     SettingsEllipsis,
     Appearance,
     Behaviour,
+    Widgets,
+    MusicWidget,
+    ClaudeWidget,
+    ClaudeWidgetHint,
     Language,
     About,
     Theme,
@@ -191,6 +195,10 @@ pub const ALL_KEYS: &[Key] = &[
     Key::SettingsEllipsis,
     Key::Appearance,
     Key::Behaviour,
+    Key::Widgets,
+    Key::MusicWidget,
+    Key::ClaudeWidget,
+    Key::ClaudeWidgetHint,
     Key::Language,
     Key::About,
     Key::Theme,
@@ -365,6 +373,18 @@ pub fn tr(lang: Lang, key: Key) -> &'static str {
         (Lang::It, Key::Appearance) => "Aspetto",
         (Lang::En, Key::Behaviour) => "Behaviour",
         (Lang::It, Key::Behaviour) => "Comportamento",
+        (Lang::En, Key::Widgets) => "Widgets",
+        (Lang::It, Key::Widgets) => "Widget",
+        (Lang::En, Key::MusicWidget) => "Music",
+        (Lang::It, Key::MusicWidget) => "Musica",
+        (Lang::En, Key::ClaudeWidget) => "Claude limits",
+        (Lang::It, Key::ClaudeWidget) => "Limiti di Claude",
+        (Lang::En, Key::ClaudeWidgetHint) => {
+            "Shows your Claude 5-hour and weekly limits from Claude Code's status line. No account, no network."
+        }
+        (Lang::It, Key::ClaudeWidgetHint) => {
+            "Mostra i limiti di 5 ore e settimanali di Claude dalla riga di stato di Claude Code. Nessun account, nessuna rete."
+        }
         (Lang::En, Key::Language) => "Language",
         (Lang::It, Key::Language) => "Lingua",
         (Lang::En, Key::About) => "About",
@@ -429,7 +449,7 @@ mod tests {
             assert!(!tr(Lang::En, k).is_empty());
             assert!(!tr(Lang::It, k).is_empty());
         }
-        assert_eq!(ALL_KEYS.len(), 96);
+        assert_eq!(ALL_KEYS.len(), 100);
     }
     #[test]
     fn italian_differs_from_english() {

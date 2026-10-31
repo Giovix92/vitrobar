@@ -513,6 +513,8 @@ pub enum Hit {
     Tray(usize),
     Quick,
     Clock,
+    /// Index into `layout.widgets` (0 = Music, 1 = Claude limits).
+    Widget(usize),
     ShowDesktop,
 }
 
@@ -539,6 +541,13 @@ pub fn hit_test(l: &BarLayout, x: f32, y: f32) -> Option<Hit> {
     }
     if let Some(i) = l.tray.iter().position(|r| inside(r, x, y)) {
         return Some(Hit::Tray(i));
+    }
+    if let Some(i) = l
+        .widgets
+        .iter()
+        .position(|r| r.as_ref().is_some_and(|r| inside(r, x, y)))
+    {
+        return Some(Hit::Widget(i));
     }
     if inside(&l.quick, x, y) {
         return Some(Hit::Quick);
@@ -584,6 +593,7 @@ mod tests {
             clock_w: 70.0,
             reserve_floating: true,
             tray_area: true,
+            widgets: [0.0; 2],
         }
     }
 
@@ -622,6 +632,18 @@ mod tests {
         }
         let (x, y) = centre(&l.quick);
         assert_eq!(hit_test(&l, x, y), Some(Hit::Quick));
+    }
+
+    #[test]
+    fn widget_pills_hit_their_index() {
+        let l = compute_layout(&LayoutInput {
+            widgets: [100.0, 80.0],
+            ..input(2)
+        });
+        for i in 0..2 {
+            let (x, y) = centre(&l.widgets[i].unwrap());
+            assert_eq!(hit_test(&l, x, y), Some(Hit::Widget(i)));
+        }
     }
 
     #[test]

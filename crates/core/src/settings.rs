@@ -93,6 +93,12 @@ pub struct Settings {
     /// The Start pins were set up once (copied from the bar on the first open): an empty
     /// list then means the user unpinned everything, not "fill from the bar".
     pub start_pins_initialized: bool,
+    /// Bar widgets, off by default: the Music pill and the Claude-limits pill.
+    pub widget_music: bool,
+    pub widget_claude: bool,
+    /// The `statusLine` entry of Claude Code's settings that the Claude widget replaced, kept
+    /// so turning the widget off puts it back exactly (`None` = there was none).
+    pub claude_prev_statusline: Option<String>,
 }
 
 impl Default for Settings {
@@ -118,6 +124,9 @@ impl Default for Settings {
             win_key_opens_start: true,
             start_pins: Vec::new(),
             start_pins_initialized: false,
+            widget_music: false,
+            widget_claude: false,
+            claude_prev_statusline: None,
         }
     }
 }
@@ -217,6 +226,9 @@ fn from_table(t: &toml::Table) -> Settings {
         win_key_opens_start: get(t, "win-key-opens-start", d.win_key_opens_start),
         start_pins: get_list(t, "start-pins"),
         start_pins_initialized: get(t, "start-pins-initialized", d.start_pins_initialized),
+        widget_music: get(t, "widget-music", d.widget_music),
+        widget_claude: get(t, "widget-claude", d.widget_claude),
+        claude_prev_statusline: get(t, "claude-prev-statusline", d.claude_prev_statusline),
     }
 }
 
@@ -343,6 +355,9 @@ mod tests {
             win_key_opens_start: false,
             start_pins: vec![pin("Calc")],
             start_pins_initialized: true,
+            widget_music: true,
+            widget_claude: true,
+            claude_prev_statusline: Some(r#"{"type":"command"}"#.into()),
         };
         let d0 = Settings::default();
         assert_ne!(original.hover, d0.hover);
@@ -626,5 +641,41 @@ name = 3
         };
         save(&p, &o).unwrap();
         assert_eq!(load(&p), o);
+    }
+
+    #[test]
+    fn widget_fields_default_off_and_round_trip() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("settings.toml");
+        let s = Settings::default();
+        assert!(!s.widget_music && !s.widget_claude && s.claude_prev_statusline.is_none());
+        let o = Settings {
+            widget_music: true,
+            claude_prev_statusline: Some("node x.js".into()),
+            ..Settings::default()
+        };
+        save(&p, &o).unwrap();
+        let text = fs::read_to_string(&p).unwrap();
+        assert!(text.contains("widget-music = true"), "{text}");
+        assert!(text.contains("claude-prev-statusline"), "{text}");
+        assert_eq!(load(&p), o);
+    }
+
+    #[test]
+    fn a_bad_widget_value_resets_only_that_field() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("settings.toml");
+        fs::write(
+            &p,
+            "widget-music = \"yes\"
+widget-claude = true
+claude-prev-statusline = 5",
+        )
+        .unwrap();
+        let (s, st) = load_with_status(&p);
+        assert_eq!(st, LoadStatus::Loaded);
+        assert!(!s.widget_music);
+        assert!(s.widget_claude);
+        assert_eq!(s.claude_prev_statusline, None);
     }
 }

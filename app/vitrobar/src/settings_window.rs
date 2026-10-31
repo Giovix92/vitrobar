@@ -94,12 +94,16 @@ pub fn effect_of(id: ControlId, s: &Settings) -> Effect {
         | ControlId::Position
         | ControlId::Theme
         | ControlId::Accent
-        | ControlId::ReserveFloating => Effect::Relayout,
+        | ControlId::ReserveFloating
+        // The widget pills appear on or leave the bar.
+        | ControlId::WidgetMusic
+        | ControlId::WidgetClaude => Effect::Relayout,
         ControlId::WinKey => Effect::WinKey(s.win_key_opens_start),
         ControlId::StartWithWindows => Effect::Autostart(s.start_with_windows),
         ControlId::StockTaskbar => Effect::NextStart,
         ControlId::Language => Effect::Language,
         ControlId::StartStyle
+        | ControlId::ClaudeWidgetHint
         | ControlId::AboutVersion
         | ControlId::AboutLicense
         | ControlId::AboutSource => Effect::Saved,

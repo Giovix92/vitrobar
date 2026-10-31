@@ -89,6 +89,8 @@ fn columns(c: &Control) -> (Rect, Rect) {
             let n = colors.len() as f32;
             n * SWATCH_DIP + (n - 1.0).max(0.0) * SWATCH_GAP_DIP
         }
+        // A note row (its text is its label) has no control part: the note gets the row.
+        ControlKind::Text(k) if *k == c.label => 0.0,
         ControlKind::Link(_) | ControlKind::Text(_) => r.w - LABEL_MIN_DIP - GAP_DIP,
     }
     .min(r.w - GAP_DIP)
@@ -354,13 +356,14 @@ pub fn items(
             },
             None => label,
         };
+        let note = is_note(c);
         page.push(Item {
             rect: px(label_box),
             part: Part::Text {
                 text: tr(look.lang, c.label).to_string(),
                 font: FontKind::Text,
-                size_px: font(LABEL_DIP),
-                color: text,
+                size_px: font(if note { HINT_DIP } else { LABEL_DIP }),
+                color: if note { secondary } else { text },
                 centred: false,
             },
         });
@@ -395,6 +398,11 @@ pub fn items(
         }
     }
     (chrome, page)
+}
+
+/// A line of explanation under the row above it (a `Text` control whose text is its label).
+fn is_note(c: &Control) -> bool {
+    matches!(c.kind, ControlKind::Text(k) if k == c.label)
 }
 
 fn control_items(
@@ -572,6 +580,8 @@ fn control_items(
                 },
             });
         }
+        // A note is drawn by its label.
+        ControlKind::Text(_) if is_note(c) => {}
         ControlKind::Text(key) => {
             let value = match key {
                 Key::Version => look.version.to_string(),
@@ -752,6 +762,9 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(titles, ["Appearance", "Behaviour", "Language", "About"]);
+        assert_eq!(
+            titles,
+            ["Appearance", "Behaviour", "Widgets", "Language", "About"]
+        );
     }
 }
