@@ -21,6 +21,11 @@
 //! - Stuck-key safety: a key-up is swallowed exactly when its key-down was, unless that
 //!   down is older than [`SWALLOW_TTL_MS`] (its up was lost) or the session switched.
 //! - A mouse button anywhere ends focus mode ([`HookState::on_mouse_down`]).
+//! - Hung-UI fallback: when an output has waited more than [`UI_STALL_MS`] for the UI thread
+//!   to drain it, the hook behaves as disabled (Windows' own Start and shortcuts, no focus
+//!   mode) until the UI drains again ([`HookState::ui_drained`]). Pairs already in flight are
+//!   finished first: a swallowed down still gets its repeats and its up swallowed, and a
+//!   Windows-key combination we swallowed part of still has its up masked.
 
 /// Virtual-key codes the decisions use (Win32 values; `vitro-core` has no `windows` crate).
 pub const VK_TAB: u32 = 0x09;
@@ -90,6 +95,10 @@ pub struct Held {
     pub win: bool,
     pub modifier: bool,
 }
+
+/// An output the UI thread has not drained for this long (ms) means the UI is hung or busy:
+/// the hook falls back to stock behaviour.
+pub const UI_STALL_MS: u32 = 500;
 
 /// A swallowed key whose up has not come within this long (no auto-repeat refreshed it) is
 /// forgotten.
@@ -165,6 +174,8 @@ pub struct HookState {
     swallowed_at: [u32; 256],
     /// Shift / Ctrl / Alt held (any side).
     mods: VkSet,
+    /// Event time of the oldest output the UI thread has not drained yet.
+    pending_since: Option<u32>,
 }
 
 impl HookState {
@@ -178,7 +189,20 @@ impl HookState {
             swallowed: VkSet::default(),
             swallowed_at: [0; 256],
             mods: VkSet::default(),
+            pending_since: None,
         }
+    }
+
+    /// The UI thread took every queued output: the hung-UI fallback (if on) ends.
+    pub fn ui_drained(&mut self) {
+        self.pending_since = None;
+    }
+
+    /// An output has waited for the UI thread longer than [`UI_STALL_MS`] at `now`.
+    pub fn ui_stalled(&self, now: u32) -> bool {
+        // Signed: event times can come very slightly out of order.
+        self.pending_since
+            .is_some_and(|t| now.wrapping_sub(t) as i32 > UI_STALL_MS as i32)
     }
 
     pub fn enabled(&self) -> bool {
@@ -252,8 +276,31 @@ impl HookState {
         self.on_event_at(ev, 0)
     }
 
-    /// Decides on one event; `now` is its time stamp (ms, `KBDLLHOOKSTRUCT::time`).
+    /// Decides on one event; `now` is its time stamp (ms, `KBDLLHOOKSTRUCT::time`). The
+    /// caller queues the output (if any) for the UI thread and calls [`Self::ui_drained`]
+    /// whenever the UI takes the queue.
     pub fn on_event_at(&mut self, ev: KeyEv, now: u32) -> (HookDecision, Option<HookOutput>) {
+        if self.ui_stalled(now) {
+            return self.on_event_stalled(ev, now);
+        }
+        let r = self.decide(ev, now);
+        if r.1.is_some() && self.pending_since.is_none() {
+            self.pending_since = Some(now);
+        }
+        r
+    }
+
+    /// The UI is not draining: decide as if disabled (stock), but finish in-flight pairs.
+    fn on_event_stalled(&mut self, ev: KeyEv, now: u32) -> (HookDecision, Option<HookOutput>) {
+        // Focus mode would eat the navigation keys for a UI that cannot act on them.
+        let left_focus = std::mem::take(&mut self.focus_mode);
+        let enabled = std::mem::replace(&mut self.enabled, false);
+        let (d, _) = self.decide(ev, now);
+        self.enabled = enabled;
+        (d, left_focus.then_some(HookOutput::ExitFocus))
+    }
+
+    fn decide(&mut self, ev: KeyEv, now: u32) -> (HookDecision, Option<HookOutput>) {
         use HookDecision::*;
         match ev {
             KeyEv::Up(vk) => {
@@ -713,6 +760,85 @@ mod tests {
         h.on_event(Down(VK_SPACE));
         assert_eq!(h.on_mouse_down(), Some(ExitFocus));
         assert_eq!(h.on_event(Up(VK_SPACE)), (Swallow, None));
+    }
+
+    /// Feeds `ev` at time `t` (ms).
+    fn at(h: &mut HookState, ev: KeyEv, t: u32) -> (HookDecision, Option<HookOutput>) {
+        h.on_event_at(ev, t)
+    }
+
+    #[test]
+    fn a_hung_ui_makes_the_hook_stock_until_it_drains() {
+        let mut h = HookState::new(true);
+        // A lone tap: OpenStart is queued at t = 1000 and the UI never takes it.
+        at(&mut h, Down(VK_LWIN), 990);
+        assert_eq!(
+            at(&mut h, Up(VK_LWIN), 1000),
+            (PassAndMask, Some(OpenStart(1000)))
+        );
+        // Within 500 ms: still ours.
+        assert!(!h.ui_stalled(1500));
+        at(&mut h, Down(VK_LWIN), 1400);
+        assert_eq!(at(&mut h, Up(VK_LWIN), 1450).0, PassAndMask);
+        // Past 500 ms: a lone tap passes unmasked (Windows' Start opens), Win+3 is Windows'.
+        assert!(h.ui_stalled(1501));
+        at(&mut h, Down(VK_LWIN), 1600);
+        assert_eq!(at(&mut h, Up(VK_LWIN), 1610), (Pass, None));
+        at(&mut h, Down(VK_LWIN), 1700);
+        assert_eq!(at(&mut h, Down(0x33), 1710), (Pass, None));
+        assert_eq!(at(&mut h, Up(0x33), 1720), (Pass, None));
+        assert_eq!(at(&mut h, Up(VK_LWIN), 1730), (Pass, None));
+        // The UI drains: ours again.
+        h.ui_drained();
+        at(&mut h, Down(VK_LWIN), 1800);
+        assert_eq!(at(&mut h, Down(0x33), 1810), (Swallow, Some(LaunchNth(3))));
+        assert_eq!(at(&mut h, Up(0x33), 1820), (Swallow, None));
+        assert_eq!(at(&mut h, Up(VK_LWIN), 1830), (PassAndMask, None));
+    }
+
+    #[test]
+    fn a_stall_mid_pair_still_finishes_the_pair() {
+        let mut h = HookState::new(true);
+        // Win+2 swallowed at t = 0; the UI hangs before draining LaunchNth.
+        at(&mut h, Down(VK_LWIN), 0);
+        assert_eq!(at(&mut h, Down(0x32), 10), (Swallow, Some(LaunchNth(2))));
+        // 600 ms later (auto-repeat, within the swallow TTL) the hook is stock, yet the
+        // repeats and the up of the swallowed 2 are still eaten, and the Windows-key up is
+        // still masked (or Windows' Start would open on a "lone" tap).
+        assert!(h.ui_stalled(611));
+        assert_eq!(at(&mut h, Down(0x32), 611), (Swallow, None));
+        assert_eq!(at(&mut h, Up(0x32), 640), (Swallow, None));
+        assert_eq!(at(&mut h, Up(VK_LWIN), 650), (PassAndMask, None));
+        // The next press of 2 is a plain 2.
+        assert_eq!(at(&mut h, Down(0x32), 700), (Pass, None));
+        assert_eq!(at(&mut h, Up(0x32), 710), (Pass, None));
+        assert!(h.enabled(), "the fallback never changes the setting");
+    }
+
+    #[test]
+    fn a_stall_in_focus_mode_lets_the_navigation_keys_through() {
+        let mut h = HookState::new(true);
+        at(&mut h, Down(VK_LWIN), 0);
+        assert_eq!(at(&mut h, Down(0x54), 5), (Swallow, Some(FocusApps)));
+        at(&mut h, Up(0x54), 10);
+        at(&mut h, Up(VK_LWIN), 15);
+        assert!(h.focus_mode());
+        // The UI never drained FocusApps: 600 ms on, an arrow passes and focus mode ends.
+        assert_eq!(at(&mut h, Down(VK_LEFT), 606), (Pass, Some(ExitFocus)));
+        assert!(!h.focus_mode());
+        assert_eq!(at(&mut h, Up(VK_LEFT), 620), (Pass, None));
+    }
+
+    #[test]
+    fn outputs_drained_in_time_never_stall() {
+        let mut h = HookState::new(true);
+        for i in 0..10u32 {
+            let t = i * 1000;
+            at(&mut h, Down(VK_LWIN), t);
+            assert_eq!(at(&mut h, Up(VK_LWIN), t + 10).0, PassAndMask);
+            h.ui_drained();
+        }
+        assert!(!h.ui_stalled(100_000));
     }
 
     #[test]

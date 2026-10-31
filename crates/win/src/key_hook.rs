@@ -11,6 +11,10 @@
 //!    [`WM_VITRO_KEY`] to the notify window;
 //! 5. returns 1 to swallow, or `CallNextHookEx` for everything it passes.
 //!
+//! If the UI thread leaves an output undrained for more than
+//! [`vitro_core::key_hook::UI_STALL_MS`] (hung or busy), [`HookState`] decides as if disabled
+//! (stock Windows behaviour, in-flight pairs finished) until [`KeyHook::drain`] runs again.
+//!
 //! Nothing about the keys is stored, logged or sent anywhere; the only statistics kept are a
 //! call counter and the longest time spent in the procedure (no key codes).
 //!
@@ -152,18 +156,23 @@ fn post_sync() {
 
 fn queue_output(out: HookOutput) {
     if OUTPUTS.push(out) {
-        let notify = HWND(NOTIFY.load(Ordering::Acquire) as *mut _);
-        // SAFETY: posting never blocks on the receiver.
-        if unsafe { PostMessageW(Some(notify), WM_VITRO_KEY, WPARAM(0), LPARAM(0)) }.is_err() {
-            OUTPUTS.wake_failed();
-        }
+        wake_ui();
+    }
+}
+
+/// Posts the payload-free wake-up to the notify window.
+fn wake_ui() {
+    let notify = HWND(NOTIFY.load(Ordering::Acquire) as *mut _);
+    // SAFETY: posting never blocks on the receiver.
+    if unsafe { PostMessageW(Some(notify), WM_VITRO_KEY, WPARAM(0), LPARAM(0)) }.is_err() {
+        OUTPUTS.wake_failed();
     }
 }
 
 /// Decides on one physical event at `time` (ms); `true` = swallow.
 fn decide(ev: KeyEv, time: u32) -> bool {
     let held = matches!(ev, KeyEv::Down(_)).then(physical_held);
-    let (decision, output, focus_changed) = {
+    let (decision, wake, focus_changed) = {
         let mut guard = state();
         let Some(st) = guard.as_mut() else {
             return false;
@@ -173,7 +182,10 @@ fn decide(ev: KeyEv, time: u32) -> bool {
         }
         let before = st.focus_mode();
         let (d, o) = st.on_event_at(ev, time);
-        (d, o, before != st.focus_mode())
+        // Queued under the state lock, as [`KeyHook::drain`] drains under it: the state's
+        // "oldest undrained output" time (the hung-UI fallback) always matches the queue.
+        let wake = o.is_some_and(|o| OUTPUTS.push(o));
+        (d, wake, before != st.focus_mode())
     };
     if focus_changed {
         post_sync();
@@ -183,8 +195,8 @@ fn decide(ev: KeyEv, time: u32) -> bool {
         // right after, and the mask key must already be the latest input by then.
         inject_mask_key();
     }
-    if let Some(out) = output {
-        queue_output(out);
+    if wake {
+        wake_ui();
     }
     decision == HookDecision::Swallow
 }
@@ -305,9 +317,16 @@ impl KeyHook {
         }
     }
 
-    /// What the hook asked for since the last drain, in order.
+    /// What the hook asked for since the last drain, in order. Draining also tells the
+    /// hook the UI thread is responsive (it ends the hung-UI fallback, see
+    /// [`vitro_core::key_hook::UI_STALL_MS`]).
     pub fn drain(&self) -> Vec<HookOutput> {
-        OUTPUTS.drain()
+        let mut guard = state();
+        let out = OUTPUTS.drain();
+        if let Some(st) = guard.as_mut() {
+            st.ui_drained();
+        }
+        out
     }
 
     pub fn stats(&self) -> HookStats {
