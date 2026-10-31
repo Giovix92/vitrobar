@@ -4,6 +4,7 @@ pub mod account;
 pub mod appbar;
 pub mod audio;
 pub mod autostart;
+pub mod bluetooth;
 pub mod brightness;
 pub mod catalog;
 pub mod clipboard;

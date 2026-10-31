@@ -9,12 +9,16 @@ publish = false
 vitro-core = { path = "../core" }
 # The `#[interface]` / `#[implement]` macros expand to `windows_core::` paths.
 windows-core = "0.62.2"
+windows-collections = "0.3.2"
 windows = { version = "0.62.2", features = [
+    "Devices_Bluetooth",
+    "Devices_Enumeration",
     "Devices_Radios",
     "Foundation",
     "Foundation_Collections",
     "UI",
     "UI_ViewManagement",
+    "Win32_Devices_Bluetooth",
     "Win32_Devices_Display",
     "Win32_Devices_FunctionDiscovery",
     "Win32_Foundation",
