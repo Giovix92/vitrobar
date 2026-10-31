@@ -1267,8 +1267,13 @@ impl App {
                 raised = true;
             }
         }
+        let tray = mb.tray;
         mb.layout = layout;
         self.sync_appbar(k);
+        if tray {
+            // The pill grows and shrinks as apps come and go: the panel follows its button.
+            self.quick_reanchor();
+        }
         Ok(raised)
     }
 
@@ -1308,7 +1313,7 @@ impl App {
     /// reconnect to its virtual desktop manager.
     fn on_taskbar_created(&mut self, dirty: &mut Dirty) {
         self.close_start_now();
-        self.close_quick();
+        self.close_quick_now();
         self.stock.on_taskbar_created();
         // The old manager is a proxy into the Explorer that just ended: every query on it
         // would fail open (every window "on the current desktop") until the next restart.
@@ -3188,24 +3193,24 @@ impl App {
         self.close_start_as(true)
     }
 
-    /// A closing panel must not keep the keyboard: if it is the foreground window, hands the
-    /// foreground back to the window that had it before Start opened, so keys typed right
-    /// after Esc / the Win key / the Start button reach it (animated close or not). False
-    /// when it cannot (that window is gone, hidden, cloaked, Explorer's hidden taskbar, or
-    /// Windows refuses): the caller then drops the panel at once, so Windows picks the next
-    /// window.
-    fn hand_back_foreground(&self, sp: &StartPanel) -> bool {
+    /// A closing panel (Start, the quick panel) must not keep the keyboard: if `panel` is the
+    /// foreground window, hands the foreground back to `fg_at_open`, the window that had it
+    /// before the panel opened, so keys typed right after Esc / the Win key / the button
+    /// reach it (animated close or not). False when it cannot (that window is gone, hidden,
+    /// cloaked, Explorer's hidden taskbar, or Windows refuses): the caller then drops the
+    /// panel at once, so Windows picks the next window.
+    fn hand_back_foreground(&self, panel: HWND, fg_at_open: usize) -> bool {
         // SAFETY: plain queries and a foreground request for a window we only test.
         unsafe {
-            if GetForegroundWindow() != sp.hwnd() {
+            if GetForegroundWindow() != panel {
                 return true;
             }
-            let prev = HWND(sp.fg_at_open as *mut _);
-            sp.fg_at_open != 0
-                && !self.stock.watches(sp.fg_at_open as u64)
+            let prev = HWND(fg_at_open as *mut _);
+            fg_at_open != 0
+                && !self.stock.watches(fg_at_open as u64)
                 && can_take_foreground(prev)
                 && SetForegroundWindow(prev).as_bool()
-                && GetForegroundWindow() != sp.hwnd()
+                && GetForegroundWindow() != panel
         }
     }
 
@@ -3226,7 +3231,7 @@ impl App {
         let srcs = sp.icon_srcs.clone();
         // The next panel's query revisions continue after this one's.
         self.start_data.last_rev = self.start_data.last_rev.max(sp.state.query_rev);
-        let handed_back = !animate || self.hand_back_foreground(&sp);
+        let handed_back = !animate || self.hand_back_foreground(sp.hwnd(), sp.fg_at_open);
         if animate && self.sys.animations && handed_back {
             let (ms, motion) = if sp.state.grid {
                 (GRID_CLOSE_MS, Motion::Grow)
@@ -3684,11 +3689,26 @@ impl App {
         }
     }
 
-    /// True if it was open. Its services and timers go with it.
+    /// True if it was open. Its services and timers go with it. The foreground goes back to
+    /// the window that had it before the panel opened (same rules as Start).
     fn close_quick(&mut self) -> bool {
-        if self.quick.take().is_none() {
+        self.close_quick_as(true)
+    }
+
+    /// [`Self::close_quick`] for when the panel cannot be kept (Explorer restart, GPU loss,
+    /// monitor change): no foreground hand-back, Windows picks the next window.
+    fn close_quick_now(&mut self) -> bool {
+        self.close_quick_as(false)
+    }
+
+    fn close_quick_as(&mut self, hand_back: bool) -> bool {
+        let Some(q) = self.quick.take() else {
             return false;
+        };
+        if hand_back {
+            let _ = self.hand_back_foreground(q.hwnd(), q.fg_at_open);
         }
+        drop(q);
         if self.opts.debug_state {
             eprintln!("vitrobar-quick-closed");
         }
@@ -3800,6 +3820,27 @@ impl App {
             q.activated = true;
         } else if fg != q.fg_at_open {
             self.close_quick();
+        }
+    }
+
+    /// Moves the open quick panel to where the tray bar's quick button is now.
+    fn quick_reanchor(&mut self) {
+        if self.quick.is_none() {
+            return;
+        }
+        let anchor = self
+            .tray_monitor()
+            .and_then(|mb| quick_anchor(&mb.layout, mb.scale()));
+        let Some(anchor) = anchor else {
+            // The button went away.
+            self.close_quick();
+            return;
+        };
+        if let Some(q) = self.quick.as_mut() {
+            if let Err(e) = q.reanchor(&self.comp, anchor) {
+                eprintln!("vitrobar: the quick panel could not follow its button: {e}");
+                self.close_quick();
+            }
         }
     }
 
@@ -4287,7 +4328,7 @@ impl App {
     fn on_device_removed(&mut self, dirty: &mut Dirty) {
         // Its surfaces belonged to the lost device.
         self.close_start_now();
-        self.close_quick();
+        self.close_quick_now();
         self.close_settings();
         // GPU device removed (TDR, driver update): recreate, then redraw everything.
         self.gpu_lost = true;
@@ -4446,7 +4487,7 @@ impl App {
     fn flush(&mut self, mut d: Dirty) -> Result<()> {
         if d.monitors && self.reconcile_monitors(current_monitors(self.opts.debug_state)) {
             // Its anchor moved or went away.
-            self.close_quick();
+            self.close_quick_now();
             // New bars, new geometry: everything is laid out and drawn again, and every
             // window's monitor is read again (windows on a removed monitor were moved).
             d.visuals = true;

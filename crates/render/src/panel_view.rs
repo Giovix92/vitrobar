@@ -608,6 +608,22 @@ impl PanelView {
         r
     }
 
+    /// The anchor moved (the bar was laid out anew): the panel follows it, same size.
+    pub fn reanchor(&mut self, comp: &Comp, anchor_px: PxRect) -> Result<()> {
+        if anchor_px == self.anchor {
+            return Ok(());
+        }
+        self.flyout.reshape(
+            comp,
+            anchor_px,
+            self.position,
+            self.layout.size,
+            &self.style,
+        )?;
+        self.anchor = anchor_px;
+        Ok(())
+    }
+
     /// Theme, material or accent changed while the panel is open: redraws the glass and
     /// every row (the row cache is cleared, so Custom slots are recreated) with the new
     /// `style` and `accent`.

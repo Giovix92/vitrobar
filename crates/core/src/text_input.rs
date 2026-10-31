@@ -108,6 +108,13 @@ impl TextInput {
         self.caret = 0;
     }
 
+    /// [`Self::clear`] that first overwrites the characters in place (the Wi-Fi password box:
+    /// the text does not linger in the freed buffer).
+    pub fn wipe(&mut self) {
+        self.text.fill('\0');
+        self.clear();
+    }
+
     fn word_left_pos(&self) -> usize {
         let mut i = self.caret;
         while i > 0 && self.text[i - 1].is_whitespace() {
@@ -123,6 +130,14 @@ impl TextInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn wipe_empties_the_input() {
+        let mut t = TextInput::new();
+        t.insert("segreto");
+        t.wipe();
+        assert!(t.is_empty());
+        assert_eq!((t.caret(), t.len()), (0, 0));
+    }
     #[test]
     fn insert_and_caret() {
         let mut t = TextInput::new();

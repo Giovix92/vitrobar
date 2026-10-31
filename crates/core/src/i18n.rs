@@ -138,6 +138,7 @@ pub enum Key {
     Connecting,
     Connected,
     NotConnected,
+    WifiConnected,
     SecuredNetwork,
     OpenNetwork,
     NoNetworks,
@@ -274,6 +275,7 @@ pub const ALL_KEYS: &[Key] = &[
     Key::Connecting,
     Key::Connected,
     Key::NotConnected,
+    Key::WifiConnected,
     Key::SecuredNetwork,
     Key::OpenNetwork,
     Key::NoNetworks,
@@ -533,6 +535,8 @@ pub fn tr(lang: Lang, key: Key) -> &'static str {
         (Lang::It, Key::Connecting) => "Connessione…",
         (Lang::En, Key::Connected) => "Connected",
         (Lang::It, Key::Connected) => "Connesso",
+        (Lang::En, Key::WifiConnected) => "Connected",
+        (Lang::It, Key::WifiConnected) => "Connessa",
         (Lang::En, Key::NotConnected) => "Not connected",
         (Lang::It, Key::NotConnected) => "Non connesso",
         (Lang::En, Key::SecuredNetwork) => "Secured",
@@ -583,7 +587,7 @@ mod tests {
             assert!(!tr(Lang::En, k).is_empty());
             assert!(!tr(Lang::It, k).is_empty());
         }
-        assert_eq!(ALL_KEYS.len(), 133);
+        assert_eq!(ALL_KEYS.len(), 134);
     }
     #[test]
     fn italian_differs_from_english() {

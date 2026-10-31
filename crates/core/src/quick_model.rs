@@ -480,7 +480,7 @@ fn wifi_rows(i: &QuickInputs, lang: Lang) -> Vec<Row> {
             let detail = if connecting {
                 tr(lang, Key::Connecting).to_string()
             } else if connected {
-                format!("{} · {kind}", tr(lang, Key::Connected))
+                format!("{} · {kind}", tr(lang, Key::WifiConnected))
             } else {
                 kind.to_string()
             };
@@ -939,6 +939,36 @@ mod tests {
         assert_eq!(
             action(QuickPage::Wifi, Part::Item(ITEM_BASE + 2)),
             Some(Action::Network(2))
+        );
+    }
+
+    #[test]
+    fn italian_network_and_device_states_agree_in_gender() {
+        let mut i = QuickInputs {
+            wifi: Some(wifi()),
+            ..laptop()
+        };
+        i.bt = Some(BtInputs {
+            radio_on: Some(true),
+            devices: vec![BtDev {
+                name: "Cuffie".into(),
+                connected: true,
+                ..BtDev::default()
+            }],
+        });
+        let detail = |r: &[Row]| {
+            r.iter().find_map(|x| match x {
+                Row::Item { id, detail, .. } if *id == ITEM_BASE => detail.clone(),
+                _ => None,
+            })
+        };
+        assert_eq!(
+            detail(&rows(QuickPage::Wifi, &i, Lang::It)).as_deref(),
+            Some("Connessa · Protetta")
+        );
+        assert_eq!(
+            detail(&rows(QuickPage::Bluetooth, &i, Lang::It)).as_deref(),
+            Some("Connesso")
         );
     }
 

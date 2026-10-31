@@ -60,6 +60,8 @@ const PW_FONT_DIP: f32 = 14.0;
 const PW_MASK: char = '\u{2022}';
 /// `WM_MOUSELEAVE` (CommCtrl.h), as in app.rs.
 const WM_MOUSELEAVE: u32 = 0x02A3;
+/// `MK_LBUTTON` in a mouse message's `wParam`.
+const MK_LBUTTON: usize = 0x0001;
 
 /// What the app must do after an input.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,6 +124,12 @@ pub struct QuickPanel {
     /// First masked character shown in the password box (scrolled so the caret stays inside).
     pw_first: usize,
     drag: Option<Drag>,
+    /// A brightness value just set, shown until the worker reports it (see [`settle`]).
+    hold: Option<(Drag, u8)>,
+    /// The network connected when the pending attempt started, and whether the connection
+    /// has changed since (see [`attempt_over`]).
+    connect_from: Option<String>,
+    connect_moved: bool,
     hot: Option<Part>,
     pressed: Option<Part>,
     /// A press on the volume glyph (mute), which is not a panel part.
@@ -244,6 +252,40 @@ fn shown_value(drag: Option<Drag>, slider: u32, actual: f32) -> f32 {
         Some(d) if d.slider == slider => d.value,
         _ => actual,
     }
+}
+
+/// Brightness wake-ups a just-set value is held against before the service value shows again.
+const HOLD_ROUNDS: u8 = 2;
+/// Levels this close count as the one that was set (DDC rounds to whole steps).
+const HOLD_EPSILON: f32 = 0.01;
+
+/// The held brightness value after a wake-up that read `actual`: released once the service
+/// reports it, or after [`HOLD_ROUNDS`] wake-ups that don't (hardware keys win then).
+fn settle(hold: Option<(Drag, u8)>, actual: Option<f32>) -> Option<(Drag, u8)> {
+    let (d, rounds) = hold?;
+    match actual {
+        Some(a) if (a - d.value).abs() > HOLD_EPSILON && rounds > 1 => Some((d, rounds - 1)),
+        _ => None,
+    }
+}
+
+/// Whether the connect attempt to `target` is over: connected to it, the radio went off, or
+/// the connection left the network it had at the start (`from`) and landed on another one
+/// (`moved` remembers the leaving across calls). A failure arrives as its own change.
+fn attempt_over(
+    target: &str,
+    from: Option<&str>,
+    moved: &mut bool,
+    now: Option<&str>,
+    radio_off: bool,
+) -> bool {
+    if radio_off || now == Some(target) {
+        return true;
+    }
+    if now != from {
+        *moved = true;
+    }
+    *moved && now.is_some()
 }
 
 /// The service snapshots the rows are built from.
@@ -376,6 +418,9 @@ impl QuickPanel {
             password: TextInput::new(),
             pw_first: 0,
             drag: None,
+            hold: None,
+            connect_from: None,
+            connect_moved: false,
             hot: None,
             pressed: None,
             mute_pressed: false,
@@ -405,8 +450,18 @@ impl QuickPanel {
 
     fn read_wifi(&mut self) {
         self.wifi = self.services.wifi.as_ref().map(Wifi::snapshot);
-        let connected = self.wifi.as_ref().and_then(|w| w.connected.clone());
-        if self.ui.connecting.is_some() && self.ui.connecting == connected {
+        let Some(target) = self.ui.connecting.clone() else {
+            return;
+        };
+        let now = self.wifi.as_ref().and_then(|w| w.connected.as_deref());
+        let radio_off = self.wifi.as_ref().is_none_or(|w| w.radio_on == Some(false));
+        if attempt_over(
+            &target,
+            self.connect_from.as_deref(),
+            &mut self.connect_moved,
+            now,
+            radio_off,
+        ) {
             self.ui.connecting = None;
         }
     }
@@ -427,6 +482,14 @@ impl QuickPanel {
             .as_ref()
             .map(Brightness::displays)
             .unwrap_or_default();
+        if let Some((d, _)) = self.hold {
+            let actual = d
+                .slider
+                .checked_sub(quick_model::BRIGHTNESS_BASE)
+                .and_then(|k| self.displays.get(k as usize))
+                .map(|x| x.level);
+            self.hold = settle(self.hold, actual);
+        }
     }
 
     fn inputs(&self) -> QuickInputs {
@@ -440,7 +503,7 @@ impl QuickPanel {
                 power: &self.power,
             },
             &self.ui,
-            self.drag,
+            self.drag.or(self.hold.map(|(d, _)| d)),
             self.lang,
         )
     }
@@ -595,6 +658,16 @@ impl QuickPanel {
                     self.tracking = true;
                 }
                 if let Some(d) = self.drag {
+                    if msg.wParam.0 & MK_LBUTTON == 0 {
+                        // The button went up where we could not hear it (capture lost):
+                        // the drag ends at the last value.
+                        // SAFETY: releases our own capture, if we still have it.
+                        unsafe {
+                            let _ = ReleaseCapture();
+                        }
+                        self.pressed = None;
+                        return self.set_slider(d.slider, d.value, false, g);
+                    }
                     return match self.view.slider_value(d.slider, pt.0) {
                         Some(v) if v != d.value => self.set_slider(d.slider, v, true, g),
                         _ => Outcome::None,
@@ -686,9 +759,9 @@ impl QuickPanel {
                 if pw {
                     match (left, ctrl) {
                         (true, false) => self.password.left(),
-                        (true, true) => self.password.word_left(),
+                        (true, true) => self.password.home(),
                         (false, false) => self.password.right(),
-                        (false, true) => self.password.word_right(),
+                        (false, true) => self.password.end(),
                     }
                     self.render_or_close(g)
                 } else if let Some(Part::Slider(id)) = self.focus {
@@ -739,7 +812,8 @@ impl QuickPanel {
             wipe(text);
             return Outcome::None;
         }
-        self.password.insert(&text);
+        // A password copied with its line break still joins.
+        self.password.insert(text.trim_end_matches(['\r', '\n']));
         wipe(text);
         self.render_or_close(g)
     }
@@ -890,15 +964,19 @@ impl QuickPanel {
                 d.level = v;
             }
         }
-        self.drag = dragging.then_some(Drag {
+        let d = Drag {
             slider: id,
             value: v,
-        });
+        };
+        self.drag = dragging.then_some(d);
+        // A brightness level set for good is shown until the worker reports it (a WMI
+        // event read mid-write would otherwise make the thumb jump back for a moment).
+        self.hold = (!dragging && id != SLIDER_VOLUME).then_some((d, HOLD_ROUNDS));
         self.render_or_close(g)
     }
 
     fn close_password(&mut self) {
-        self.password.clear();
+        self.password.wipe();
         self.pw_first = 0;
         self.ui.password_for = None;
     }
@@ -967,12 +1045,14 @@ impl QuickPanel {
             wipe(p);
         }
         // Never kept past the connect call, whatever the outcome.
-        self.password.clear();
+        self.password.wipe();
         self.pw_first = 0;
         match r {
             Ok(()) => {
                 self.ui.password_for = None;
                 self.ui.connecting = Some(ssid);
+                self.connect_from = self.wifi.as_ref().and_then(|w| w.connected.clone());
+                self.connect_moved = false;
             }
             Err(WifiError::HandOff) => {
                 self.close_password();
@@ -1173,6 +1253,11 @@ impl QuickPanel {
         }
     }
 
+    /// The bar was laid out anew (the pill grew or shrank): the panel follows its button.
+    pub fn reanchor(&mut self, comp: &Comp, anchor_px: PxRect) -> Result<()> {
+        self.view.reanchor(comp, anchor_px)
+    }
+
     /// Theme, material or accent changed while open.
     pub fn restyle(&mut self, g: &Gfx, style: &MaterialStyle, accent: Rgba) -> Result<()> {
         self.text = style.text;
@@ -1194,7 +1279,7 @@ impl Drop for QuickPanel {
                 let _ = ReleaseCapture();
             }
         }
-        self.password.clear();
+        self.password.wipe();
     }
 }
 
@@ -1311,6 +1396,46 @@ mod tests {
         // Other sliders and no drag show the service value.
         assert_eq!(shown_value(d, quick_model::BRIGHTNESS_BASE, 0.6), 0.6);
         assert_eq!(shown_value(None, SLIDER_VOLUME, 0.6), 0.6);
+    }
+
+    #[test]
+    fn a_set_brightness_is_held_until_reported() {
+        let d = Drag {
+            slider: quick_model::BRIGHTNESS_BASE,
+            value: 0.8,
+        };
+        let h = Some((d, HOLD_ROUNDS));
+        // A stale level mid-write: still held, one round fewer.
+        assert_eq!(settle(h, Some(0.3)), Some((d, HOLD_ROUNDS - 1)));
+        // The worker reports the value: released.
+        assert_eq!(settle(h, Some(0.805)), None);
+        // Out of rounds (hardware keys moved it): the service wins.
+        assert_eq!(settle(Some((d, 1)), Some(0.3)), None);
+        // The display went away.
+        assert_eq!(settle(h, None), None);
+        assert_eq!(settle(None, Some(0.3)), None);
+    }
+
+    #[test]
+    fn a_connect_attempt_ends_on_the_target_elsewhere_or_radio_off() {
+        let mut moved = false;
+        // Still on the old network: pending.
+        assert!(!attempt_over("B", Some("A"), &mut moved, Some("A"), false));
+        // Dropped the old one on the way: pending.
+        assert!(!attempt_over("B", Some("A"), &mut moved, None, false));
+        // Landed on another network (Windows fell back): over.
+        assert!(attempt_over("B", Some("A"), &mut moved, Some("C"), false));
+        // Back on the old one after leaving it: over too.
+        let mut moved = false;
+        assert!(!attempt_over("B", Some("A"), &mut moved, None, false));
+        assert!(attempt_over("B", Some("A"), &mut moved, Some("A"), false));
+        // Connected to the target, or the radio went off.
+        let mut moved = false;
+        assert!(attempt_over("B", None, &mut moved, Some("B"), false));
+        assert!(attempt_over("B", None, &mut moved, None, true));
+        // From nothing straight to another network.
+        let mut moved = false;
+        assert!(attempt_over("B", None, &mut moved, Some("C"), false));
     }
 
     #[test]
