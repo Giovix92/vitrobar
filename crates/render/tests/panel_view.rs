@@ -3,7 +3,7 @@
 
 use vitro_core::panel_kit::{Button, Part, Row, Tile};
 use vitro_core::settings::{Material, Position};
-use vitro_core::style::{material_style, Theme};
+use vitro_core::style::{material_style, Rgba, Theme};
 use vitro_render::compositor::init_compositor;
 use vitro_render::device::create_gpu_device;
 use vitro_render::panel_view::PanelView;
@@ -69,6 +69,7 @@ fn panel_draws_every_row_kind_and_hit_tests() {
         96,
         anchor,
         Position::Bottom,
+        Rgba(0, 0x78, 0xD4, 255),
         &rows(0.5, 60.0),
     )
     .unwrap();
@@ -114,6 +115,17 @@ fn panel_draws_every_row_kind_and_hit_tests() {
     assert_eq!(b2, b);
     assert_eq!(t2, t - 60);
 
+    let light = material_style(Material::Frosted, Theme::Light, true);
+    view.restyle(
+        &comp,
+        &painter,
+        &light,
+        Rgba(200, 30, 90, 255),
+        &rows(0.9, 120.0),
+    )
+    .unwrap();
+    assert!(view.custom_slot(30).is_some());
+
     // No scrolling when everything fits.
     view.scroll_by(50.0).unwrap();
     assert_eq!(view.scroll(), 0.0);
@@ -147,6 +159,7 @@ fn tall_content_scrolls_and_hit_follows() {
         96,
         (500, 900, 540, 948),
         Position::Bottom,
+        Rgba(0, 0x78, 0xD4, 255),
         &items,
     )
     .unwrap();

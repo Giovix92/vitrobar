@@ -26,8 +26,6 @@ use crate::material::color;
 use crate::surfaces::{FontKind, Painter};
 use crate::tray_flyout::RoundRect;
 
-/// Accent of the "on" tiles, slider fills and the focus ring until the owner knows better.
-pub const ACCENT: Rgba = Rgba(0x00, 0x78, 0xD4, 255);
 const WHITE: Rgba = Rgba(255, 255, 255, 255);
 
 const TILE_RADIUS_DIP: f32 = 8.0;
@@ -49,6 +47,8 @@ const DIM: f32 = 0.7;
 /// Segoe Fluent Icons "ChevronRight" and "CheckMark".
 const CHEVRON: &str = "\u{E76C}";
 const CHECK: &str = "\u{E73E}";
+/// A busy item shows a static ellipsis on purpose: no animation and no timer, so an open
+/// panel costs no CPU.
 const BUSY: &str = "\u{2026}";
 
 fn alpha(c: Rgba, a: u8) -> Rgba {
@@ -132,13 +132,16 @@ fn plate(ctx: &Ctx, into: &ContainerVisual, r: PxRect, radius_px: f32, c: Rgba) 
     into.Children()?.InsertAtTop(&rr.visual)
 }
 
-/// `r` (content DIPs) in px relative to a row starting at `band_y`.
+/// `r` (content DIPs) in px relative to a row starting at `band_y`: every edge is rounded
+/// as an absolute px value first, so children line up with the row and the overlays at
+/// fractional DPI.
 fn local(r: &Rect, band_y: f32, s: f32) -> PxRect {
+    let top = round(band_y * s);
     (
         round(r.x * s),
-        round((r.y - band_y) * s),
+        round(r.y * s) - top,
         round(r.right() * s),
-        round((r.bottom() - band_y) * s),
+        round(r.bottom() * s) - top,
     )
 }
 
@@ -521,7 +524,10 @@ pub struct PanelView {
 
 impl PanelView {
     /// Opens `rows` as a panel anchored like the window preview: above `anchor_px` (below it
-    /// for a top bar), centred on it and kept inside the work area.
+    /// for a top bar), centred on it and kept inside the work area. `accent` (the colour that
+    /// feeds the bar: the Windows accent unless the user picked one) fills "on" tiles and
+    /// sliders and strokes the focus ring.
+    #[allow(clippy::too_many_arguments)]
     pub fn show(
         comp: &Comp,
         painter: &Painter,
@@ -529,6 +535,7 @@ impl PanelView {
         dpi: u32,
         anchor_px: PxRect,
         position: Position,
+        accent: Rgba,
         rows: &[Row],
     ) -> Result<Self> {
         let l = layout(rows);
@@ -567,7 +574,7 @@ impl PanelView {
             anchor: anchor_px,
             position,
             style: *style,
-            accent: ACCENT,
+            accent,
             scale: s,
             scroll: 0.0,
             hot: None,
@@ -584,11 +591,42 @@ impl PanelView {
     /// slot); a new size reshapes the window, keeping it next to the anchor.
     pub fn update(&mut self, comp: &Comp, painter: &Painter, rows: &[Row]) -> Result<()> {
         let l = layout(rows);
-        if l.size != self.layout.size {
+        let before = self.layout.size;
+        let resized = l.size != before;
+        if resized {
             self.flyout
                 .reshape(comp, self.anchor, self.position, l.size, &self.style)?;
         }
-        self.apply(painter, l, rows)
+        let r = self.apply(painter, l, rows);
+        if r.is_err() && resized {
+            // A failed apply leaves the rows and layout untouched: put the window back to
+            // their size so both stay consistent.
+            let _ = self
+                .flyout
+                .reshape(comp, self.anchor, self.position, before, &self.style);
+        }
+        r
+    }
+
+    /// Theme, material or accent changed while the panel is open: redraws the glass and
+    /// every row (the row cache is cleared, so Custom slots are recreated) with the new
+    /// `style` and `accent`.
+    pub fn restyle(
+        &mut self,
+        comp: &Comp,
+        painter: &Painter,
+        style: &MaterialStyle,
+        accent: Rgba,
+        rows: &[Row],
+    ) -> Result<()> {
+        self.flyout.restyle(comp, style)?;
+        self.style = *style;
+        self.accent = accent;
+        let layer = self.rows_layer.Children()?;
+        for gone in std::mem::take(&mut self.rows) {
+            let _ = layer.Remove(&gone.container);
+        }
+        self.update(comp, painter, rows)
     }
 
     fn apply(&mut self, painter: &Painter, l: PanelLayout, rows: &[Row]) -> Result<()> {
@@ -600,38 +638,61 @@ impl PanelView {
             text: self.style.text,
             accent: self.accent,
         };
-        let mut old: Vec<Option<RowVis>> = std::mem::take(&mut self.rows)
-            .into_iter()
-            .map(Some)
-            .collect();
-        let mut fresh: Vec<RowVis> = Vec::with_capacity(rows.len());
+        // Nothing of `self` changes until every new row is built: a failure leaves the
+        // previous rows and layout in place (the new visuals are removed again).
+        let mut used = vec![false; self.rows.len()];
+        let mut fresh: Vec<(RowVis, bool)> = Vec::with_capacity(rows.len());
         let layer = self.rows_layer.Children()?;
-        for (i, row) in rows.iter().enumerate() {
-            let same = old
-                .iter()
-                .position(|o| o.as_ref().is_some_and(|o| o.row == *row));
-            let vis = match same.and_then(|k| old[k].take()) {
-                Some(mut v) => {
-                    let band_y = l.rows[i].y;
-                    if v.y != band_y {
-                        v.container
-                            .SetOffset(Vector3::new(0.0, round(band_y * s) as f32, 0.0))?;
-                        v.y = band_y;
+        let built = (|| -> Result<()> {
+            for (i, row) in rows.iter().enumerate() {
+                let same = self
+                    .rows
+                    .iter()
+                    .enumerate()
+                    .position(|(k, o)| !used[k] && o.row == *row);
+                match same {
+                    Some(k) => {
+                        used[k] = true;
+                        let o = &self.rows[k];
+                        fresh.push((
+                            RowVis {
+                                row: o.row.clone(),
+                                y: l.rows[i].y,
+                                container: o.container.clone(),
+                                slot: o.slot.clone(),
+                            },
+                            false,
+                        ));
                     }
-                    v
+                    None => {
+                        let v = build_row(&ctx, &l, i, row)?;
+                        layer.InsertAtTop(&v.container)?;
+                        fresh.push((v, true));
+                    }
                 }
-                None => {
-                    let v = build_row(&ctx, &l, i, row)?;
-                    layer.InsertAtTop(&v.container)?;
-                    v
+            }
+            Ok(())
+        })();
+        if let Err(e) = built {
+            for (v, new) in &fresh {
+                if *new {
+                    let _ = layer.Remove(&v.container);
                 }
-            };
-            fresh.push(vis);
+            }
+            return Err(e);
         }
-        for gone in old.into_iter().flatten() {
-            let _ = layer.Remove(&gone.container);
+        for (v, new) in &fresh {
+            if !new {
+                v.container
+                    .SetOffset(Vector3::new(0.0, round(v.y * s) as f32, 0.0))?;
+            }
         }
-        self.rows = fresh;
+        for (k, o) in self.rows.iter().enumerate() {
+            if !used[k] {
+                let _ = layer.Remove(&o.container);
+            }
+        }
+        self.rows = fresh.into_iter().map(|(v, _)| v).collect();
         self.layout = l;
 
         let (w, h) = (

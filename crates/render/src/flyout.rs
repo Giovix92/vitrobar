@@ -424,6 +424,19 @@ impl Flyout {
         unsafe { SetForegroundWindow(self.hwnd) }.as_bool()
     }
 
+    /// Redraws the glass with a new `style` (theme or material change while open).
+    pub fn restyle(&mut self, comp: &Comp, style: &MaterialStyle) -> Result<()> {
+        let (l, t, r, b) = self.rect_px;
+        let size_v = Vector2::new((r - l) as f32, (b - t) as f32);
+        let glass: Visual =
+            backdrop_visual(comp, style, size_v, RADIUS_DIP * self.scale)?.cast()?;
+        let children = self.root.Children()?;
+        children.Remove(&self.glass)?;
+        children.InsertAtBottom(&glass)?;
+        self.glass = glass;
+        Ok(())
+    }
+
     /// Gives the flyout a new size (and place next to `anchor_px`), redrawing the glass.
     pub fn reshape(
         &mut self,
