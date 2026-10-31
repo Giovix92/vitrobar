@@ -9,6 +9,7 @@ pub mod image;
 pub mod key_hook;
 pub mod layout;
 pub mod menu_model;
+pub mod panel_kit;
 pub mod restart;
 pub mod search;
 pub mod settings;

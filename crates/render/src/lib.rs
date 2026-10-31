@@ -7,6 +7,7 @@ pub mod flyout;
 pub mod material;
 pub mod menu_view;
 pub mod panel;
+pub mod panel_view;
 pub mod settings_view;
 pub mod start_view;
 pub mod surfaces;
