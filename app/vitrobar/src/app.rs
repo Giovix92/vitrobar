@@ -35,8 +35,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use vitro_core::clock::ms_until_next_minute;
-use vitro_core::i18n::{lang_from_tag, tr, Key, Lang};
 use vitro_core::flyout_toggle::{FlyoutToggle, StockFlyout, ToggleAction};
+use vitro_core::i18n::{lang_from_tag, tr, Key, Lang};
 use vitro_core::image::BgraImage;
 use vitro_core::key_hook::HookOutput;
 use vitro_core::layout::{compute_layout, diff_monitors, metrics, BarLayout, LayoutInput, Rect};
@@ -92,11 +92,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetKeyState, VK_CONTROL, VK_ESCAPE, VK_F4, VK_MENU, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetCursorPos, GetForegroundWindow, GetMessagePos, GetWindowThreadProcessId,
-    IsWindow, KillTimer, MsgWaitForMultipleObjectsEx, PeekMessageW, PostMessageW, PostQuitMessage,
-    PostThreadMessageW, SetForegroundWindow, SetTimer, TranslateMessage, MSG, MWMO_INPUTAVAILABLE,
-    PM_REMOVE, QS_ALLINPUT, WM_CHAR, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_NULL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
+    DispatchMessageW, GetCursorPos, GetForegroundWindow, GetMessagePos, GetWindowLongPtrW,
+    GetWindowThreadProcessId, IsWindow, KillTimer, MsgWaitForMultipleObjectsEx, PeekMessageW,
+    PostMessageW, PostQuitMessage, PostThreadMessageW, SetForegroundWindow, SetTimer,
+    TranslateMessage, GWL_EXSTYLE, MSG, MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT, WM_CHAR,
+    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NULL, WM_QUIT,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WS_EX_TOPMOST,
 };
 
 use crate::bar_window::{
@@ -1682,8 +1683,7 @@ impl App {
                 self.foreground = fg;
                 self.foreground_ours = is_own_window(fg);
                 if let Some(h) = fg {
-                    let now = self.now_ms();
-                    self.flyout_toggle.foreground_changed(h, now);
+                    self.flyout_foreground(h);
                 }
                 dirty.fullscreen = true;
                 self.start_foreground_changed(fg);
@@ -1695,8 +1695,7 @@ impl App {
             }
             WindowEvent::Foreground(h) => {
                 // Only the flyout toggle cares: the shell hook misses the stock flyouts.
-                let now = self.now_ms();
-                self.flyout_toggle.foreground_changed(h, now);
+                self.flyout_foreground(h);
             }
             WindowEvent::Flash(h) => {
                 // Carry 7: read_window_info never reports flashing; the event does.
@@ -3449,12 +3448,22 @@ impl App {
         }
     }
 
-    /// The foreground window changed. When the panel never got the foreground (activation
-    /// refused), it cannot hear its deactivation: it closes as soon as the foreground moves
-    /// away from the window that had it at open (fallback for carry 12). Getting the
-    /// foreground itself (a click on it) makes it a normal activated panel.
     fn now_ms(&self) -> u64 {
         self.clock_base.elapsed().as_millis() as u64
+    }
+
+    /// Tells the flyout toggle the foreground is now `h`. Only a topmost window of another
+    /// process can be a stock flyout; any other change just ends an open flyout's state.
+    fn flyout_foreground(&mut self, h: Hwnd) {
+        let now = self.now_ms();
+        // SAFETY: plain query; a stale handle gives 0.
+        let topmost =
+            unsafe { GetWindowLongPtrW(hwnd_of(h), GWL_EXSTYLE) } as u32 & WS_EX_TOPMOST.0 != 0;
+        if topmost && !is_own_window(Some(h)) {
+            self.flyout_toggle.foreground_changed(h, now);
+        } else {
+            self.flyout_toggle.unclaimable_foreground(h);
+        }
     }
 
     /// Quick Settings / clock button: a second click on the open flyout closes it (Esc, only
