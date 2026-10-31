@@ -12,11 +12,12 @@
 //! The free [`displays`] / [`set_level`] block and need COM initialised on the calling thread
 //! (the worker does that itself); the UI thread should use the [`Brightness`] service.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
-use windows::core::{implement, w, Result, BOOL, BSTR, HRESULT, PCWSTR};
+use windows::core::{implement, Interface, w, Result, BOOL, BSTR, HRESULT, PCWSTR};
 use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::Devices::Display::{
     DestroyPhysicalMonitors, GetMonitorBrightness, GetNumberOfPhysicalMonitorsFromHMONITOR,
@@ -25,13 +26,13 @@ use windows::Win32::Devices::Display::{
 use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, HDC, HMONITOR};
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoSetProxyBlanket, CoUninitialize, CLSCTX_INPROC_SERVER,
+    CoCreateInstance, CoInitializeEx, CoSetProxyBlanket, CoUninitialize, CLSCTX_INPROC_SERVER, CLSCTX_LOCAL_SERVER,
     COINIT_MULTITHREADED, EOAC_NONE, RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE,
 };
 use windows::Win32::System::Rpc::{RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE};
 use windows::Win32::System::Wmi::{
-    IWbemClassObject, IWbemLocator, IWbemObjectSink, IWbemObjectSink_Impl, IWbemServices,
-    WbemLocator, WBEM_FLAG_FORWARD_ONLY, WBEM_FLAG_RETURN_IMMEDIATELY, WBEM_INFINITE,
+    IUnsecuredApartment, IWbemClassObject, IWbemLocator, IWbemObjectSink, IWbemObjectSink_Impl, IWbemServices,
+    UnsecuredApartment, WbemLocator, WBEM_FLAG_FORWARD_ONLY, WBEM_FLAG_RETURN_IMMEDIATELY, WBEM_INFINITE,
 };
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
@@ -42,7 +43,7 @@ pub const INTERNAL_ID: u64 = 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrightnessKind {
-    /// Built-in panel, through WMI.
+    /// Built-in panel, through WMI (its `Display::name` is empty).
     Internal,
     /// External monitor, through DDC/CI.
     Ddc,
@@ -134,6 +135,9 @@ pub enum Change {
 struct Shared {
     queue: WakeQueue<Change>,
     displays: Mutex<Vec<Display>>,
+    /// Levels set by the user whose hardware write has not completed yet; a refresh must
+    /// not overwrite them with the stale value it read.
+    pending: Mutex<HashMap<u64, f32>>,
     notify: isize,
     msg: u32,
     closed: AtomicBool,
@@ -142,6 +146,10 @@ struct Shared {
 impl Shared {
     fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Display>> {
         self.displays.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn pending(&self) -> std::sync::MutexGuard<'_, HashMap<u64, f32>> {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn wake(&self, change: Change) {
@@ -176,6 +184,7 @@ impl Brightness {
         let shared = Arc::new(Shared {
             queue: WakeQueue::new(),
             displays: Mutex::new(Vec::new()),
+            pending: Mutex::new(HashMap::new()),
             notify: notify.0 as isize,
             msg: wake_msg,
             closed: AtomicBool::new(false),
@@ -210,6 +219,7 @@ impl Brightness {
     /// slider does not jump back while the (slow) hardware write is pending.
     pub fn set_level(&self, monitor: u64, level: f32) {
         let level = clamp_level(level);
+        self.shared.pending().insert(monitor, level);
         if let Some(d) = self.shared.lock().iter_mut().find(|d| d.monitor == monitor) {
             d.level = level;
         }
@@ -250,17 +260,24 @@ fn worker(shared: Arc<Shared>, rx: Receiver<Job>) {
     // Keep the WMI connection and the sink alive for the event subscription.
     let subscription = Wmi::connect().and_then(|w| {
         let sink: IWbemObjectSink = BrightnessEvents(shared.clone()).into();
-        // SAFETY: the sink outlives the subscription (cancelled below before it is dropped).
+        // Deliver through an unsecured-apartment stub: a plain sink often gets no callbacks
+        // (or E_ACCESSDENIED) at the default process COM security, and we must not call
+        // CoInitializeSecurity (process-wide).
+        // SAFETY: plain activation; the stub forwards to `sink`, which it keeps alive.
+        let apt: IUnsecuredApartment =
+            unsafe { CoCreateInstance(&UnsecuredApartment, None, CLSCTX_LOCAL_SERVER) }?;
+        let stub: IWbemObjectSink = unsafe { apt.CreateObjectStub(&sink) }?.cast()?;
+        // SAFETY: the stub outlives the subscription (cancelled below before it is dropped).
         unsafe {
             w.svc.ExecNotificationQueryAsync(
                 &BSTR::from("WQL"),
                 &BSTR::from("SELECT * FROM WmiMonitorBrightnessEvent"),
                 Default::default(),
                 None,
-                &sink,
+                &stub,
             )
         }?;
-        Ok((w, sink))
+        Ok((w, stub))
     });
 
     while let Ok(first) = rx.recv() {
@@ -271,10 +288,27 @@ fn worker(shared: Arc<Shared>, rx: Receiver<Job>) {
         for job in coalesce(batch) {
             match job {
                 Job::Refresh => {
-                    *shared.lock() = displays();
+                    let mut fresh = displays();
+                    {
+                        // Keep levels the user set after this read was queued.
+                        let pending = shared.pending();
+                        for d in &mut fresh {
+                            if let Some(&l) = pending.get(&d.monitor) {
+                                d.level = l;
+                            }
+                        }
+                    }
+                    *shared.lock() = fresh;
                     shared.wake(Change::Displays);
                 }
-                Job::Set(monitor, level) => set_level(monitor, level),
+                Job::Set(monitor, level) => {
+                    set_level(monitor, level);
+                    // Done, unless a newer level was set meanwhile (its job is still queued).
+                    let mut p = shared.pending();
+                    if p.get(&monitor) == Some(&level) {
+                        p.remove(&monitor);
+                    }
+                }
             }
         }
     }
@@ -536,7 +570,8 @@ pub fn displays() -> Vec<Display> {
     if let Some(level) = Wmi::connect().ok().and_then(|w| w.internal_level()) {
         out.push(Display {
             monitor: INTERNAL_ID,
-            name: "Built-in display".into(),
+            // The UI labels the built-in panel by kind (`Key::BuiltInDisplay`).
+            name: String::new(),
             level,
             kind: BrightnessKind::Internal,
         });

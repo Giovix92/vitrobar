@@ -4,6 +4,8 @@
 //! as `WM_POWERBROADCAST` / `PBT_POWERSETTINGCHANGE` on the window passed to [`register`]
 //! (the app forwards the message, the panel then calls [`snapshot`] again). Nothing polls.
 
+use std::sync::OnceLock;
+
 use windows::core::{s, w, Result, GUID};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::Foundation::{HANDLE, HWND};
@@ -107,13 +109,19 @@ pub fn snapshot() -> PowerSnapshot {
 }
 
 type GetOverlayFn = unsafe extern "system" fn(*mut GUID) -> u32;
-type SetOverlayFn = unsafe extern "system" fn(*const GUID) -> u32;
+/// `DWORD PowerSetActiveOverlayScheme(GUID)`: the GUID is passed by value (matters on ARM64).
+type SetOverlayFn = unsafe extern "system" fn(GUID) -> u32;
 
 /// The overlay-scheme exports of `powrprof.dll` (Windows 10 1709+), looked up at run time so
 /// a system without them just reports no power mode.
 fn overlay_api() -> Option<(GetOverlayFn, SetOverlayFn)> {
+    static API: OnceLock<Option<(GetOverlayFn, SetOverlayFn)>> = OnceLock::new();
+    *API.get_or_init(load_overlay_api)
+}
+
+fn load_overlay_api() -> Option<(GetOverlayFn, SetOverlayFn)> {
     // SAFETY: loading a system DLL by name and resolving two documented exports whose
-    // signatures are `DWORD f(GUID*)` / `DWORD f(const GUID*)`.
+    // signatures are `DWORD f(GUID*)` / `DWORD f(GUID)`.
     unsafe {
         let lib = LoadLibraryW(w!("powrprof.dll")).ok()?;
         let get = GetProcAddress(lib, s!("PowerGetEffectiveOverlayScheme"))?;
@@ -142,7 +150,7 @@ pub fn set_mode(mode: PowerMode) -> bool {
     };
     let g = overlay_guid(mode);
     // SAFETY: the GUID is a documented overlay scheme.
-    (unsafe { set(&g) }) == 0
+    (unsafe { set(g) }) == 0
 }
 
 /// The registration of the three power settings on a window; unregisters on drop.
