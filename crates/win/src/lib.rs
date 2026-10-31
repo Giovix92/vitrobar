@@ -2,6 +2,7 @@
 
 pub mod account;
 pub mod appbar;
+pub mod audio;
 pub mod autostart;
 pub mod catalog;
 pub mod clipboard;
