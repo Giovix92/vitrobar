@@ -3999,13 +3999,13 @@ enum Next {
 
 /// `wakes` counts the wake-later rounds in a row; a persistent refill (a producer that keeps
 /// the inbox non-empty) ends in a blocking [`Next::Wait`] after [`MAX_WAKE_ROUNDS`] of them,
-/// which resets the counter. Any `Wait` or `Again` resets it too.
+/// which resets the counter. Only a `Wait` resets it: `run` zeroes `spins` after each
+/// `WakeLater`, so `Again` rounds sit between the wake-later rounds of a persistent refill.
 fn after_flush(pending: bool, spins: u32, wakes: &mut u32) -> Next {
     if !pending {
         *wakes = 0;
         Next::Wait
     } else if spins < MAX_IMMEDIATE_PASSES {
-        *wakes = 0;
         Next::Again
     } else if *wakes >= MAX_WAKE_ROUNDS {
         *wakes = 0;
@@ -4197,28 +4197,55 @@ mod tests {
         assert_eq!(passes, MAX_IMMEDIATE_PASSES);
     }
 
+    /// One loop turn exactly as `run` applies it to `after_flush`'s answer.
+    fn turn(pending: bool, spins: &mut u32, wakes: &mut u32) -> Next {
+        let n = after_flush(pending, *spins, wakes);
+        match n {
+            Next::Wait | Next::WakeLater => *spins = 0,
+            Next::Again => *spins += 1,
+        }
+        n
+    }
+
     #[test]
     fn persistent_refill_falls_back_to_blocking_wait() {
-        let mut wakes = 0;
-        // The inbox never empties and the passes are always used up: wake-later rounds,
-        // then a blocking wait, then the cycle starts over.
-        for _ in 0..2 {
-            for _ in 0..MAX_WAKE_ROUNDS {
-                assert_eq!(
-                    after_flush(true, MAX_IMMEDIATE_PASSES, &mut wakes),
-                    Next::WakeLater
-                );
+        let (mut spins, mut wakes) = (0, 0);
+        let mut wake_later = 0;
+        // A producer that keeps the inbox non-empty: eventually a blocking wait.
+        let mut waited = false;
+        for _ in 0..1000 {
+            match turn(true, &mut spins, &mut wakes) {
+                Next::WakeLater => wake_later += 1,
+                Next::Wait => {
+                    waited = true;
+                    break;
+                }
+                Next::Again => {}
             }
-            assert_eq!(
-                after_flush(true, MAX_IMMEDIATE_PASSES, &mut wakes),
-                Next::Wait
-            );
-            assert_eq!(wakes, 0);
         }
-        // An empty inbox in between resets the count.
-        after_flush(true, MAX_IMMEDIATE_PASSES, &mut wakes);
-        assert_eq!(after_flush(false, 0, &mut wakes), Next::Wait);
+        assert!(waited, "never fell back to a blocking wait");
+        assert_eq!(wake_later, MAX_WAKE_ROUNDS);
         assert_eq!(wakes, 0);
+        // And the cycle starts over.
+        let mut again = 0;
+        while turn(true, &mut spins, &mut wakes) == Next::Again {
+            again += 1;
+        }
+        assert_eq!(again, MAX_IMMEDIATE_PASSES);
+    }
+
+    #[test]
+    fn an_inbox_that_empties_resets_to_normal_behaviour() {
+        let (mut spins, mut wakes) = (0, 0);
+        loop {
+            if turn(true, &mut spins, &mut wakes) == Next::WakeLater {
+                break;
+            }
+        }
+        assert_eq!(wakes, 1);
+        assert_eq!(turn(false, &mut spins, &mut wakes), Next::Wait);
+        assert_eq!((spins, wakes), (0, 0));
+        assert_eq!(turn(true, &mut spins, &mut wakes), Next::Again);
     }
 
     #[test]

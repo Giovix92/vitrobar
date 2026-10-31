@@ -420,7 +420,7 @@ folder name, Character Map and Paint by the process the check started.
    `failures` names every budget missed, and every test window left open. Run it 3 times;
    all 3 must pass.
    The Start panel, measured on its own (stage 2, Task 10):
-   `pwsh scripts/perf-check.ps1 -Exe targeteleaseitrobar.exe -StartPanel` -> one line
+   `pwsh scripts/perf-check.ps1 -Exe target\release\vitrobar.exe -StartPanel` -> one line
    of JSON with `"pass": true`. It starts Vitrobar with `--debug-state`, posts the debug
    message `Vitrobar.Debug.OpenStart` (a registered window message to the `VitrobarNotify`
    window, ignored without `--debug-state`; it toggles Start on the primary monitor) and

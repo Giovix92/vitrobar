@@ -264,6 +264,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_TIMECHANGE => with_inbox(|i| i.clock = true),
         m if m == open_start_msg() => {
             // Payload-free; ignored by the app unless it runs with --debug-state.
+            // A --debug-state build accepts it from any same-integrity process (by design).
             with_inbox(|i| i.debug_open_start = true);
             return LRESULT(0);
         }
