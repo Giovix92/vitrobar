@@ -74,6 +74,8 @@ pub const TIMER_MARGIN_COLLAPSE: usize = 0x5705;
 pub const TIMER_REASSERT: usize = 0x5706;
 /// One-shot: the cursor rested on a tray icon long enough for its tooltip (500 ms).
 pub const TIMER_TRAY_TIP: usize = 0x5707;
+/// One-shot after the takeover: read the Start app catalog ahead of the first open.
+pub const TIMER_START_PREFETCH: usize = 0x5708;
 
 /// Everything the notify window received since the last [`take_inbox`].
 #[derive(Debug, Default, PartialEq)]

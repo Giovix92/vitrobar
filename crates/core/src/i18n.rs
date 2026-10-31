@@ -78,6 +78,7 @@ pub enum Key {
     Calculator,
     CopyResult,
     NoResults,
+    LoadingApps,
     Lock,
     Sleep,
     Restart,
@@ -176,6 +177,7 @@ pub const ALL_KEYS: &[Key] = &[
     Key::Calculator,
     Key::CopyResult,
     Key::NoResults,
+    Key::LoadingApps,
     Key::Lock,
     Key::Sleep,
     Key::Restart,
@@ -335,6 +337,8 @@ pub fn tr(lang: Lang, key: Key) -> &'static str {
         (Lang::It, Key::CopyResult) => "Premi Invio per copiare",
         (Lang::En, Key::NoResults) => "No results",
         (Lang::It, Key::NoResults) => "Nessun risultato",
+        (Lang::En, Key::LoadingApps) => "Loading apps\u{2026}",
+        (Lang::It, Key::LoadingApps) => "Caricamento app\u{2026}",
         (Lang::En, Key::Lock) => "Lock",
         (Lang::It, Key::Lock) => "Blocca",
         (Lang::En, Key::Sleep) => "Sleep",
@@ -425,7 +429,7 @@ mod tests {
             assert!(!tr(Lang::En, k).is_empty());
             assert!(!tr(Lang::It, k).is_empty());
         }
-        assert_eq!(ALL_KEYS.len(), 95);
+        assert_eq!(ALL_KEYS.len(), 96);
     }
     #[test]
     fn italian_differs_from_english() {

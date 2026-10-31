@@ -107,7 +107,8 @@ use crate::launcher::{Job, Launcher};
 use crate::menus::{app_menu, bar_menu, power_menu, start_item_menu, MenuChoice};
 use crate::notify::{
     inbox_pending, take_inbox, Inbox, NotifyWindow, TIMER_CLOCK, TIMER_GPU_RETRY, TIMER_HOVER_HIDE,
-    TIMER_HOVER_SHOW, TIMER_MARGIN_COLLAPSE, TIMER_REASSERT, TIMER_TRAY_TIP, WM_APP_TAKE_OVER,
+    TIMER_HOVER_SHOW, TIMER_MARGIN_COLLAPSE, TIMER_REASSERT, TIMER_START_PREFETCH, TIMER_TRAY_TIP,
+    WM_APP_TAKE_OVER,
 };
 use crate::settings_window::{apply_choice, Effect, SettingsAction, SettingsInput, SettingsWindow};
 use crate::shell::{self, StockGuard};
@@ -144,6 +145,8 @@ const SPRING_PEAK: f32 = 1.12;
 /// After `TaskbarCreated`, hide the stock taskbar once more this long later (Explorer can
 /// show it after its broadcast).
 const REASSERT_MS: u32 = 1000;
+/// Delay from the takeover to the background read of the Start app catalog.
+const START_PREFETCH_MS: u32 = 3000;
 /// Resting on a tray icon shows its tooltip after this long.
 const TRAY_TIP_MS: u32 = 500;
 
@@ -759,6 +762,17 @@ impl App {
         // The Windows key is ours from here on (disabled: installed, but every key passes).
         self.keys
             .start(self.notify.hwnd, self.settings.win_key_opens_start);
+        // "Win, type, Enter" right after sign-in needs the catalog (a cold read takes many
+        // seconds): read it once in the background, after the startup work has settled.
+        // SAFETY: one-shot timer on our own window (killed when it fires).
+        unsafe {
+            SetTimer(
+                Some(self.notify.hwnd),
+                TIMER_START_PREFETCH,
+                START_PREFETCH_MS,
+                None,
+            )
+        };
         // Registers the appbars and draws the tray area.
         dirty.visuals = true;
     }
@@ -1679,6 +1693,10 @@ impl App {
             TIMER_TRAY_TIP => {
                 self.kill_timer(TIMER_TRAY_TIP);
                 self.show_tooltip();
+            }
+            TIMER_START_PREFETCH => {
+                self.kill_timer(TIMER_START_PREFETCH);
+                self.start_data.prefetch(self.notify.hwnd);
             }
             TIMER_MARGIN_COLLAPSE => {
                 self.kill_timer(TIMER_MARGIN_COLLAPSE);
@@ -3331,6 +3349,7 @@ impl App {
             Some(ResultKind::App(_)) => "\"app\"",
             Some(ResultKind::Setting(_)) => "\"setting\"",
             Some(ResultKind::File(_)) => "\"file\"",
+            Some(ResultKind::Loading) => "\"loading\"",
             None => "null",
         };
         format!(
@@ -3798,9 +3817,11 @@ impl App {
         }
         if inbox.start_data {
             // Always drained (a pending wake-up blocks the next one), shown only while open.
+            let was_loading = self.start_data.apps_loading();
             let (apps_changed, any) = self.start_data.drain();
             if any {
-                self.start_refresh(apps_changed);
+                // The end of the catalog read also takes the "Loading apps…" row away.
+                self.start_refresh(apps_changed || was_loading != self.start_data.apps_loading());
             }
         }
         if inbox.files {

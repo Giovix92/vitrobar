@@ -105,6 +105,9 @@ pub enum ResultKind {
     Setting(usize),
     /// Index into the `files` slice.
     File(usize),
+    /// "Loading apps…": a placeholder the Start panel puts first while the app catalog is
+    /// still being read. [`search`] never returns it; running it does nothing.
+    Loading,
 }
 
 pub struct SearchResults {

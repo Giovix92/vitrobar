@@ -31,8 +31,12 @@ use vitro_win::event_queue::WakeQueue;
 use vitro_win::file_search::FileSearch;
 use vitro_win::power::PowerAction;
 use windows::core::Result;
+use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+use windows::Win32::System::Threading::{
+    GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_NORMAL,
+};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 use crate::icon_loader::{IconLoader, IconSrc, Lookup, MAX_ICON_PX};
@@ -385,6 +389,39 @@ pub fn grid_results(text: &str, apps: &[Pin], files: &[FileHit], lang: Lang) -> 
     rows
 }
 
+/// How the results are laid out: the list fits `n` rows on its first screen, the grid
+/// shows everything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fit {
+    List(usize),
+    Grid,
+}
+
+/// The results the panel lists for `text`: [`grid_results`] or the fitted list, with the
+/// "Loading apps…" row first while the catalog is still being read (in the list only once
+/// something was typed: Home shows no results).
+pub fn panel_results(
+    text: &str,
+    data: &StartData,
+    files: &[FileHit],
+    lang: Lang,
+    fit: Fit,
+) -> Vec<ResultKind> {
+    let loading = data.apps_loading();
+    let mut results = match fit {
+        Fit::Grid => grid_results(text, &data.apps, files, lang),
+        Fit::List(rows) => {
+            let items = search(text, &data.apps, files, lang).items;
+            // The "Loading apps…" row takes one of the rows the files are fitted into.
+            fit_results(items, rows.saturating_sub(usize::from(loading)).max(1))
+        }
+    };
+    if loading && (fit == Fit::Grid || !text.trim().is_empty()) {
+        results.insert(0, ResultKind::Loading);
+    }
+    results
+}
+
 /// What [`StartState::handle`] needs to know besides the input: geometry and content.
 pub struct StartCtx<'a> {
     pub geom: &'a Geom,
@@ -660,7 +697,7 @@ impl StartState {
                 }
                 self.edited()
             }
-            VK_RETURN if searching || self.kbd => self.run(self.selected, ctx),
+            VK_RETURN if searching || self.kbd => self.enter(ctx),
             VK_LEFT | VK_RIGHT | VK_UP | VK_DOWN | VK_PRIOR | VK_NEXT | VK_HOME | VK_END
                 if n > 0 =>
             {
@@ -749,7 +786,7 @@ impl StartState {
                     StartAction::Redraw
                 }
             }
-            VK_RETURN if searching => self.run(self.selected, ctx),
+            VK_RETURN if searching => self.enter(ctx),
             VK_UP | VK_DOWN | VK_PRIOR | VK_NEXT | VK_HOME | VK_END if all_apps => {
                 let row = ctx.geom.row_h as f32;
                 let page = (ctx.geom.list_h() as f32 - row).max(row);
@@ -777,9 +814,21 @@ impl StartState {
         }
     }
 
+    /// Enter: runs the selected result, except while the app catalog is still loading and
+    /// no app is listed (the app being typed for would otherwise lose to a setting or a
+    /// file).
+    fn enter(&self, ctx: &StartCtx) -> StartAction {
+        let loading = ctx.results.contains(&ResultKind::Loading);
+        if loading && !ctx.results.iter().any(|k| matches!(k, ResultKind::App(_))) {
+            return StartAction::None;
+        }
+        self.run(self.selected, ctx)
+    }
+
     /// Runs search result `i`.
     fn run(&self, i: usize, ctx: &StartCtx) -> StartAction {
         match ctx.results.get(i) {
+            Some(ResultKind::Loading) => StartAction::None,
             Some(ResultKind::Math(v)) => StartAction::CopyMath(format_result(*v, ctx.lang)),
             Some(ResultKind::App(a)) => ctx
                 .apps
@@ -906,6 +955,8 @@ pub fn pin_icon(p: &Pin) -> Option<IconSrc> {
 
 enum Request {
     Apps,
+    /// The same read, ahead of the first open, at below-normal priority.
+    PrefetchApps,
     Recent,
     Account,
 }
@@ -923,6 +974,9 @@ enum Answer {
 struct DataWorker {
     tx: Sender<Request>,
     answers: Arc<WakeQueue<Answer>>,
+    /// Kept (not joined) to raise the thread back to normal priority when a panel opens
+    /// during the prefetch.
+    thread: std::thread::JoinHandle<()>,
 }
 
 impl DataWorker {
@@ -931,7 +985,7 @@ impl DataWorker {
         let answers = Arc::new(WakeQueue::new());
         let queue = Arc::clone(&answers);
         let notify = notify.0 as isize;
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("vitrobar-start".into())
             .spawn(move || {
                 // SAFETY: initialises COM for this worker thread only; balanced below.
@@ -939,6 +993,22 @@ impl DataWorker {
                 while let Ok(req) = rx.recv() {
                     let answer = match req {
                         Request::Apps => Answer::Apps(list_all_apps()),
+                        Request::PrefetchApps => {
+                            // SAFETY: plain calls on this worker thread's own pseudo-handle.
+                            unsafe {
+                                let _ = SetThreadPriority(
+                                    GetCurrentThread(),
+                                    THREAD_PRIORITY_BELOW_NORMAL,
+                                );
+                            }
+                            let apps = list_all_apps();
+                            // SAFETY: as above.
+                            unsafe {
+                                let _ =
+                                    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+                            }
+                            Answer::Apps(apps)
+                        }
                         Request::Recent => {
                             Answer::Recent(recent_docs_enabled().then(|| recent_files(RECENT_MAX)))
                         }
@@ -964,7 +1034,22 @@ impl DataWorker {
                     unsafe { CoUninitialize() };
                 }
             })?;
-        Ok(Self { tx, answers })
+        Ok(Self {
+            tx,
+            answers,
+            thread,
+        })
+    }
+
+    /// A panel is opening: whatever the worker reads now is awaited, so it runs at normal
+    /// priority (a prefetch in progress is raised).
+    fn boost(&self) {
+        use std::os::windows::io::AsRawHandle;
+        // SAFETY: the handle belongs to the JoinHandle we hold, so it is valid; a thread
+        // that already ended just makes the call fail.
+        unsafe {
+            let _ = SetThreadPriority(HANDLE(self.thread.as_raw_handle()), THREAD_PRIORITY_NORMAL);
+        }
     }
 }
 
@@ -1010,9 +1095,7 @@ impl StartData {
         }
     }
 
-    /// On open: start the workers (first time), refresh the catalog when it is older than
-    /// [`CATALOG_MAX_AGE`] (or was never read), and the recent files every time.
-    pub fn refresh(&mut self, notify: HWND) {
+    fn ensure_worker(&mut self, notify: HWND) {
         if self.worker.is_none() {
             match DataWorker::start(notify) {
                 Ok(w) => {
@@ -1022,12 +1105,38 @@ impl StartData {
                 Err(e) => eprintln!("vitrobar: the Start data worker could not start: {e}"),
             }
         }
+    }
+
+    /// Once, shortly after startup: read the catalog ahead of the first open (a cold read
+    /// takes many seconds), at below-normal priority. Does nothing once a read was asked for.
+    pub fn prefetch(&mut self, notify: HWND) {
+        if self.apps_at.is_some() || self.apps_pending {
+            return;
+        }
+        self.ensure_worker(notify);
+        if let Some(w) = &self.worker {
+            if w.tx.send(Request::PrefetchApps).is_ok() {
+                self.apps_pending = true;
+            }
+        }
+    }
+
+    /// The catalog is being read and there is nothing to show yet.
+    pub fn apps_loading(&self) -> bool {
+        self.apps_pending && self.apps.is_empty()
+    }
+
+    /// On open: start the workers (first time), refresh the catalog when it is older than
+    /// [`CATALOG_MAX_AGE`] (or was never read), and the recent files every time.
+    pub fn refresh(&mut self, notify: HWND) {
+        self.ensure_worker(notify);
         if self.files.is_none() {
             self.files = FileSearch::start(notify, WM_APP_FILE_SEARCH)
                 .inspect_err(|e| eprintln!("vitrobar: file search could not start: {e}"))
                 .ok();
         }
         let Some(w) = &self.worker else { return };
+        w.boost();
         let stale = self.apps_at.is_none_or(|t| t.elapsed() >= CATALOG_MAX_AGE);
         if stale && !self.apps_pending && w.tx.send(Request::Apps).is_ok() {
             self.apps_pending = true;
@@ -1220,6 +1329,7 @@ impl StartPanel {
     fn key_of(&self, i: usize, data: &StartData) -> Option<String> {
         Some(match self.results.get(i)? {
             ResultKind::Math(_) => "m".into(),
+            ResultKind::Loading => "l".into(),
             ResultKind::App(a) => {
                 let p = data.apps.get(*a)?;
                 format!("a:{}:{}", p.aumid.as_deref().unwrap_or(""), p.name)
@@ -1247,12 +1357,12 @@ impl StartPanel {
         }
         self.searched = rev;
         let text = self.state.input.text();
-        self.results = if self.state.grid {
-            grid_results(&text, &data.apps, &self.files, lang)
+        let fit = if self.state.grid {
+            Fit::Grid
         } else {
-            let items = search(&text, &data.apps, &self.files, lang).items;
-            fit_results(items, self.geom.result_rows())
+            Fit::List(self.geom.result_rows())
         };
+        self.results = panel_results(&text, data, &self.files, lang, fit);
         if !changed {
             // Same query ranked again (files or the catalog arrived): the selection stays
             // on the same item.
@@ -1691,6 +1801,11 @@ impl StartPanel {
         let glyph_box = (r.0, r.1, r.0 + icon_w, r.3);
         let lang = look.lang;
         let (title, sub, icon) = match kind {
+            ResultKind::Loading => (
+                tr(lang, Key::LoadingApps).to_string(),
+                tr(lang, Key::Apps).to_string(),
+                Err('\u{E895}'),
+            ),
             ResultKind::Math(v) => (
                 format!("= {}", format_result(*v, lang)),
                 format!(
@@ -1962,6 +2077,54 @@ mod tests {
                 lang: Lang::En,
             }
         }
+    }
+
+    #[test]
+    fn loading_apps_row_comes_first_and_enter_waits_for_the_catalog() {
+        let mut data = StartData::new();
+        assert!(!data.apps_loading());
+        // The catalog read is under way and nothing was read yet.
+        data.apps_pending = true;
+        assert!(data.apps_loading());
+        let r = panel_results("display", &data, &[], Lang::En, Fit::List(8));
+        assert_eq!(r.first(), Some(&ResultKind::Loading));
+        assert!(r.iter().any(|k| matches!(k, ResultKind::Setting(_))));
+        // Home (nothing typed) lists nothing; the grid shows the row above its cells.
+        assert!(panel_results("", &data, &[], Lang::En, Fit::List(8)).is_empty());
+        assert_eq!(
+            panel_results("", &data, &[], Lang::En, Fit::Grid),
+            vec![ResultKind::Loading]
+        );
+        // Enter does nothing while only settings/files are listed, on any selection.
+        let mut f = Fixture::new();
+        f.results = r;
+        let mut s = StartState::new();
+        s.handle(StartInput::Char('d'), &f.ctx());
+        assert_eq!(key(&mut s, &f, VK_RETURN), StartAction::None);
+        s.selected = 1;
+        assert_eq!(key(&mut s, &f, VK_RETURN), StartAction::None);
+        // A click on a setting still opens it; the row itself runs nothing.
+        assert!(matches!(s.run(1, &f.ctx()), StartAction::Open(_)));
+        assert_eq!(s.run(0, &f.ctx()), StartAction::None);
+        // Loaded: no row, Enter runs the top result again.
+        data.apps_pending = false;
+        data.apps = vec![pin("Display Fusion")];
+        let r = panel_results("display", &data, &[], Lang::En, Fit::List(8));
+        assert!(!r.contains(&ResultKind::Loading));
+        f.results = r;
+        f.apps = data.apps.clone();
+        s.selected = 0;
+        assert!(matches!(key(&mut s, &f, VK_RETURN), StartAction::Launch(_)));
+    }
+
+    #[test]
+    fn a_catalog_refresh_that_keeps_old_apps_is_not_loading() {
+        let mut data = StartData::new();
+        data.apps = vec![pin("Paint")];
+        data.apps_pending = true;
+        assert!(!data.apps_loading());
+        let r = panel_results("pai", &data, &[], Lang::En, Fit::List(8));
+        assert_eq!(r.first(), Some(&ResultKind::App(0)));
     }
 
     fn centre(r: PxRect) -> (i32, i32) {
