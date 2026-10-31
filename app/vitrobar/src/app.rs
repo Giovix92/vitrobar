@@ -2355,6 +2355,9 @@ impl App {
             WM_MOUSELEAVE => {
                 self.over_flyout = false;
                 self.reset_flyout_press();
+                if let Some(s) = self.strip.as_mut() {
+                    let _ = s.thumbs.set_close_hot(None);
+                }
             }
             WM_LBUTTONDOWN => {
                 self.flyout_close_pressed = close;
