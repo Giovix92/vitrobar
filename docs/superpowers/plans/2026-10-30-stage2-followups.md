@@ -34,3 +34,11 @@ Carried out of the stage-2 execution ledger. Input for stage 3+.
 
 ## Incidents
 - Task 9: implementer DONE_WITH_CONCERNS (02dc278). Changes apply 7–10 ms; mem open ≤16 MB. StockTaskbar switch applies at next start. Placeholder .ico added. INCIDENT: a screenshot caught another app's window on the user's screen — deleted immediately (disclose to user).
+
+## Stage 2.5 (polish after the first real run, plan 2026-10-31-stage2-5-polish.md)
+- Rulings: R1 Start ignores a deactivation only when the new foreground is a glass menu; R2 the menu loop consumes only its own deactivation entry; R3/R4 the fading Start panel is not click-through — a click on it drops it at once (that click is lost); R5 the menu loop ends on any foreground change (EVENT_SYSTEM_FOREGROUND WinEvent hook) and when the key hook has output pending; R6 only a WS_EX_TOPMOST window of another process can be claimed as the stock Quick Settings / notification flyout.
+- New synthetic input: Esc (SendInput) to close the stock Quick Settings / notification flyout on a second click, only after re-checking it is the recorded foreground window.
+- Accessibility: the glass menus lose the native menu's screen-reader support — revisit with UI Automation.
+- Watch item: "two apps appeared after opening the stock Start" (user report 2026-10-31, not reproducible). The only Vitrobar path that opens the stock Start is open_stock_start() (Ctrl+Esc via SendInput) when the Start panel fails. If it recurs: which apps, and how Start was opened.
+- Parked minors: a key pressed during a menu opened while a stale key flag was pending won't dismiss it (hook stall fallback covers); preview ✕ hot state starts at rest after a rebuild; a ✕ sprite is built for a window whose thumbnail failed (harmless); the app's save prompt may appear behind other windows (as with the stock taskbar); mid-open Start close relies on compositor getters after StopAnimation (visual check on the checklist).
+- Unverified live (user's instance was running): Start fade/foreground hand-back, glass menu focus and dismissal, flyout toggle (is the stock flyout WS_EX_TOPMOST?), preview ✕ and middle-click. Perf re-run pending for the same reason.

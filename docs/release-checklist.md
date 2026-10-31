@@ -63,6 +63,14 @@ the settings menu of Task 13 can switch it live: edit the file and restart the b
 4. After the strip closes and 2 s pass: Task Manager shows 0 % CPU for `vitrobar.exe` and no
    GPU use.
 
+Stage 2.5 (close from the preview):
+- Hover an app with two windows: each title has a ✕ at its right; the ✕ turns red under the
+  pointer and back when the pointer leaves the preview.
+- Click a ✕: that window closes, the preview stays and shows the other one. Middle-click a
+  thumbnail: same.
+- Close a document with unsaved changes this way: the app asks before closing (Vitrobar never
+  forces it).
+
 ## Stock taskbar
 
 Introduced by stage 1, Task 11. Vitrobar switches the stock taskbar to auto-hide (Explorer
@@ -199,6 +207,13 @@ file (`settings` and `settings_window` in the `vitrobar-state` lines; `vitrobar-
 name each change, `vitrobar-menu` lines each menu choice). "Start with Windows" and the stock
 taskbar mode are verified by unit tests only (a live toggle writes the real Run key).
 
+Stage 2.5 (glass menus):
+- Right-click the bar, an app, a Start pin and the Start power button: each opens a glass menu
+  in the bar's style (check mark on "Start with Windows" when on). Look at it in light and dark.
+- Arrow keys move the highlight (skipping separators), Enter chooses, Esc closes. Clicking
+  outside, Alt, Alt+Tab and the Windows key close the menu without choosing.
+- With Start open, right-click a pin: Start stays open behind the menu and after it closes.
+
 ## Monitors and desktops
 
 Introduced by stage 1, Task 14. Every monitor has its own bar with its own windows; pins are
@@ -300,6 +315,14 @@ with `--debug-state` and `VITROBAR_POWER_DRY_RUN=1`: every power action is then 
     them (up from the first grid row reaches those rows); Esc clears the text, a second Esc
     closes; so do deactivation, launching an app and a second click on Start. Memory with the
     grid scrolled through under 60 MB, 3 s after closing under 40 MB.
+
+Stage 2.5 (animation):
+- Open Start: it rises from the bar and fades in; close it (Start button, Esc, click outside):
+  it fades out. Grid mode: it grows in and fades out. With Windows "Animation effects" off:
+  no animation.
+- Close Start with Esc and type at once: the keys reach the app you were in.
+- Open and close Start very fast (double-tap Win, or close it while still opening): no jump,
+  never two panels, never an invisible panel holding the keyboard.
 
 ## Keyboard
 
