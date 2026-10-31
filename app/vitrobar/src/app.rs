@@ -56,7 +56,7 @@ use vitro_render::compositor::{init_compositor, Comp};
 use vitro_render::device::{create_gpu_device, GpuDevice};
 use vitro_render::flyout::{live_thumbnails, take_deactivated, Flyout, ThumbnailStrip};
 use vitro_render::panel::{
-    take_panel_close_requests, take_panel_deactivated, take_panel_dpi_changes,
+    take_panel_close_requests, take_panel_deactivated, take_panel_dpi_changes, Motion,
 };
 use vitro_render::settings_view::{SettingsLook, WINDOW_H_DIP, WINDOW_W_DIP};
 use vitro_render::surfaces::{FontKind, Painter};
@@ -107,8 +107,8 @@ use crate::launcher::{Job, Launcher};
 use crate::menus::{app_menu, bar_menu, power_menu, start_item_menu, MenuChoice};
 use crate::notify::{
     inbox_pending, take_inbox, Inbox, NotifyWindow, TIMER_CLOCK, TIMER_GPU_RETRY, TIMER_HOVER_HIDE,
-    TIMER_HOVER_SHOW, TIMER_MARGIN_COLLAPSE, TIMER_REASSERT, TIMER_START_PREFETCH, TIMER_TRAY_TIP,
-    WM_APP_TAKE_OVER,
+    TIMER_HOVER_SHOW, TIMER_MARGIN_COLLAPSE, TIMER_REASSERT, TIMER_START_CLOSED,
+    TIMER_START_PREFETCH, TIMER_TRAY_TIP, WM_APP_TAKE_OVER,
 };
 use crate::settings_window::{apply_choice, Effect, SettingsAction, SettingsInput, SettingsWindow};
 use crate::shell::{self, StockGuard};
@@ -157,8 +157,13 @@ const TRAY_TIP_MS: u32 = 500;
 /// alone never changes a normal run. Unset in normal use.
 const FAKE_MONITOR_ENV: &str = "VITROBAR_FAKE_MONITOR";
 
-/// The full-screen Start grid's fade-in.
+/// The Start panel's rise and fade-out, and the full-screen grid's grow and shrink.
+const START_OPEN_MS: u32 = 160;
+const START_CLOSE_MS: u32 = 110;
 const GRID_OPEN_MS: u32 = 180;
+const GRID_CLOSE_MS: u32 = 130;
+/// How long past its close animation a fading panel lives before the timer destroys it.
+const START_CLOSED_SLACK_MS: u32 = 30;
 
 /// Debug hook for live tests of the Start panel's power menu: `1` makes every power action a
 /// dry run (recorded, never carried out). Honoured only together with `--debug-state`.
@@ -547,6 +552,9 @@ struct App {
     strip: Option<Strip>,
     /// The open Start panel (its visuals and window go before the compositor and GPU).
     start: Option<StartPanel>,
+    /// The Start panel that is fading out (no longer `start`: it takes no input). Dropped by
+    /// `TIMER_START_CLOSED`, by the next `open_start` or by any close that must be immediate.
+    start_closing: Option<StartPanel>,
     /// What the Start panel shows, cached across opens, and its worker threads.
     start_data: StartData,
     /// The open settings window (its visuals and window go before the compositor and GPU).
@@ -665,6 +673,7 @@ impl App {
             overflow: None,
             strip: None,
             start: None,
+            start_closing: None,
             start_data: StartData::new(),
             settings_win: None,
             monitors,
@@ -1206,7 +1215,7 @@ impl App {
     /// Explorer restarted: hide its new taskbar, register the appbars with the new shell and
     /// reconnect to its virtual desktop manager.
     fn on_taskbar_created(&mut self, dirty: &mut Dirty) {
-        self.close_start();
+        self.close_start_now();
         self.stock.on_taskbar_created();
         // The old manager is a proxy into the Explorer that just ended: every query on it
         // would fail open (every window "on the current desktop") until the next restart.
@@ -1253,7 +1262,7 @@ impl App {
                 self.set_tip_target(None);
             }
             if self.start.as_ref().is_some_and(|s| s.monitor == id) {
-                self.close_start();
+                self.close_start_now();
             }
             if self.cur == id {
                 self.cancel_show();
@@ -1694,6 +1703,10 @@ impl App {
             TIMER_TRAY_TIP => {
                 self.kill_timer(TIMER_TRAY_TIP);
                 self.show_tooltip();
+            }
+            TIMER_START_CLOSED => {
+                self.kill_timer(TIMER_START_CLOSED);
+                self.drop_start_closing();
             }
             TIMER_START_PREFETCH => {
                 self.kill_timer(TIMER_START_PREFETCH);
@@ -2877,6 +2890,8 @@ impl App {
 
     fn open_start(&mut self, k: usize, dirty: &mut Dirty) {
         let began = Instant::now();
+        // A panel still fading out goes at once: never two panels, never an invisible one.
+        self.drop_start_closing();
         if let Some(f) = self.keys.focus() {
             dirty.bars.insert(f.monitor);
         }
@@ -2951,12 +2966,22 @@ impl App {
                 if full_screen {
                     // Every app is listed from the first frame.
                     sp.research(&self.start_data, lang, true);
-                    if self.sys.animations {
-                        if let Err(e) = sp.animate_open(GRID_OPEN_MS) {
-                            eprintln!("vitrobar: the Start grid could not fade in: {e}");
-                            // Never activate an invisible panel: it would hold the keyboard.
-                            sp.show_static();
-                        }
+                }
+                if self.sys.animations {
+                    let (ms, motion) = if full_screen {
+                        (GRID_OPEN_MS, Motion::Grow)
+                    } else {
+                        (
+                            START_OPEN_MS,
+                            Motion::Rise {
+                                from: self.settings.position,
+                            },
+                        )
+                    };
+                    if let Err(e) = sp.animate_open(ms, motion) {
+                        eprintln!("vitrobar: the Start panel could not animate in: {e}");
+                        // Never activate an invisible panel: it would hold the keyboard.
+                        sp.show_static();
                     }
                 }
                 self.start = Some(sp);
@@ -2992,16 +3017,60 @@ impl App {
         }
     }
 
-    /// Closes the Start panel: its visuals and window go, and its icons leave the cache
-    /// (unless a bar shows them). True if it was open.
+    /// Closes the Start panel: it fades out (with "Animation effects" on) and its window
+    /// goes a moment later; its icons leave the cache (unless a bar shows them) at once.
+    /// True if it was open.
     fn close_start(&mut self) -> bool {
+        self.close_start_as(true)
+    }
+
+    /// [`Self::close_start`] without the animation, for when the panel cannot be kept
+    /// (monitor, theme or device change, Explorer restart): the window goes now, along with
+    /// any panel still fading.
+    fn close_start_now(&mut self) -> bool {
+        self.drop_start_closing();
+        self.close_start_as(false)
+    }
+
+    fn close_start_as(&mut self, animate: bool) -> bool {
         let Some(sp) = self.start.take() else {
             return false;
         };
+        // Only one panel fades at a time.
+        self.drop_start_closing();
         let srcs = sp.icon_srcs.clone();
         // The next panel's query revisions continue after this one's.
         self.start_data.last_rev = self.start_data.last_rev.max(sp.state.query_rev);
-        drop(sp);
+        if animate && self.sys.animations {
+            let (ms, motion) = if sp.state.grid {
+                (GRID_CLOSE_MS, Motion::Grow)
+            } else {
+                (
+                    START_CLOSE_MS,
+                    Motion::Rise {
+                        from: self.settings.position,
+                    },
+                )
+            };
+            match sp.animate_close(ms, motion) {
+                Ok(()) => {
+                    self.start_closing = Some(sp);
+                    // SAFETY: one-shot timer on our own window (killed when it fires).
+                    unsafe {
+                        SetTimer(
+                            Some(self.notify.hwnd),
+                            TIMER_START_CLOSED,
+                            ms + START_CLOSED_SLACK_MS,
+                            None,
+                        )
+                    };
+                }
+                // Dropped at once, as when animations are off.
+                Err(e) => eprintln!("vitrobar: the Start panel could not fade out: {e}"),
+            }
+        } else {
+            drop(sp);
+        }
         let monitors = &self.monitors;
         self.icons.forget(|src| {
             srcs.contains(src)
@@ -3018,6 +3087,13 @@ impl App {
             self.dump_state();
         }
         true
+    }
+
+    /// Destroys the Start panel that is fading out, if any.
+    fn drop_start_closing(&mut self) {
+        if self.start_closing.take().is_some() {
+            self.kill_timer(TIMER_START_CLOSED);
+        }
     }
 
     fn start_look(&self) -> (Rgba, Lang) {
@@ -3055,7 +3131,7 @@ impl App {
         );
         if let Err(e) = drawn {
             eprintln!("vitrobar: the Start panel could not be drawn: {e}");
-            self.close_start();
+            self.close_start_now();
             return false;
         }
         true
@@ -3770,7 +3846,7 @@ impl App {
 
     fn on_device_removed(&mut self, dirty: &mut Dirty) {
         // Its surfaces belonged to the lost device.
-        self.close_start();
+        self.close_start_now();
         self.close_settings();
         // GPU device removed (TDR, driver update): recreate, then redraw everything.
         self.gpu_lost = true;
@@ -3939,7 +4015,7 @@ impl App {
                 self.style = style;
                 redraw = true;
                 // Its glass was made for the old style.
-                self.close_start();
+                self.close_start_now();
                 self.settings_restyle();
                 self.settings_render();
             }

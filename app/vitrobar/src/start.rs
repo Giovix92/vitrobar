@@ -23,7 +23,7 @@ use vitro_core::style::{MaterialStyle, Rgba};
 use vitro_core::text_input::TextInput;
 use vitro_render::compositor::Comp;
 use vitro_render::flyout::PxRect;
-use vitro_render::panel::Panel;
+use vitro_render::panel::{Motion, Panel};
 use vitro_render::start_view::{Item, Layer, Part, StartView};
 use vitro_render::surfaces::{FontKind, Painter};
 use vitro_win::catalog::{list_all_apps, recent_docs_enabled, recent_files, RecentFile};
@@ -1279,9 +1279,14 @@ impl StartPanel {
         Ok(sp)
     }
 
-    /// Fades the panel in (and scales it from 98 %) over `ms`.
-    pub fn animate_open(&self, ms: u32) -> Result<()> {
-        self.panel.animate_open(ms)
+    /// Brings the panel in over `ms` with `motion`.
+    pub fn animate_open(&self, ms: u32, motion: Motion) -> Result<()> {
+        self.panel.animate_open(ms, motion)
+    }
+
+    /// Takes the panel out over `ms` with `motion`; it stops taking input at once.
+    pub fn animate_close(&self, ms: u32, motion: Motion) -> Result<()> {
+        self.panel.animate_close(ms, motion)
     }
 
     /// Final, fully visible state (opacity 1, scale 1): the fallback when the fade fails.

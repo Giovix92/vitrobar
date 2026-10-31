@@ -6,8 +6,10 @@
 use std::cell::RefCell;
 use std::sync::Mutex;
 
+use vitro_core::settings::Position;
 use vitro_core::style::MaterialStyle;
 use windows::core::{h, w, Error, Interface, Result, BOOL, HSTRING, PCWSTR};
+use windows::Foundation::TimeSpan;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_USE_HOSTBACKDROPBRUSH, DWMWA_WINDOW_CORNER_PREFERENCE,
@@ -19,18 +21,46 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetForegroundWindow, GetWindowLongPtrW,
     GetWindowRect, IsIconic, IsWindow, LoadCursorW, LoadIconW, RegisterClassExW,
     SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
-    GWLP_USERDATA, HTCAPTION, HTCLIENT, HWND_TOPMOST, IDC_ARROW, MA_ACTIVATE, SWP_NOACTIVATE,
-    SWP_NOZORDER, SW_RESTORE, SW_SHOW, WA_INACTIVE, WM_ACTIVATE, WM_CLOSE, WM_DPICHANGED,
-    WM_MOUSEACTIVATE, WM_NCHITTEST, WNDCLASSEXW, WS_EX_APPWINDOW, WS_EX_NOREDIRECTIONBITMAP,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    GWLP_USERDATA, GWL_EXSTYLE, HTCAPTION, HTCLIENT, HWND_TOPMOST, IDC_ARROW, MA_ACTIVATE,
+    SWP_NOACTIVATE, SWP_NOZORDER, SW_RESTORE, SW_SHOW, WA_INACTIVE, WM_ACTIVATE, WM_CLOSE,
+    WM_DPICHANGED, WM_MOUSEACTIVATE, WM_NCHITTEST, WNDCLASSEXW, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
+    WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::UI::Composition::Desktop::DesktopWindowTarget;
-use windows::UI::Composition::{ContainerVisual, Visual};
+use windows::UI::Composition::{
+    Compositor, ContainerVisual, CubicBezierEasingFunction, Vector3KeyFrameAnimation, Visual,
+};
 use windows_numerics::{Vector2, Vector3};
 
 use crate::compositor::{window_target, Comp};
 use crate::flyout::PxRect;
 use crate::material::backdrop_visual;
+
+/// How far a rising panel starts from its place, in DIP.
+const RISE_DIP: f32 = 12.0;
+
+/// How a panel appears and disappears.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Motion {
+    /// Fades while scaling between 98 % and 100 % about its centre (the app grid).
+    Grow,
+    /// Fades while sliding [`RISE_DIP`] from the bar's side (the Start panel).
+    Rise { from: Position },
+}
+
+/// Where a rising panel starts, as an offset from its place in px at `scale` px per DIP:
+/// towards the bar it came from (a bottom bar's panel rises from below).
+fn rise_offset(from: Position, scale: f32) -> (f32, f32) {
+    let d = RISE_DIP * scale;
+    match from {
+        Position::Bottom => (0.0, d),
+        Position::Top => (0.0, -d),
+    }
+}
+
+fn duration(ms: u32) -> TimeSpan {
+    TimeSpan::from(std::time::Duration::from_millis(ms as u64))
+}
 
 /// Window class of the panel (found by tests and tools with `FindWindow`).
 pub const PANEL_CLASS: &str = "VitrobarPanel";
@@ -279,44 +309,105 @@ impl Panel {
         &self.root
     }
 
-    /// Fades the panel in over `ms` and scales it from 98 % to 100 % about its centre: a
-    /// composition animation (the compositor runs it, no timer). Call right after `show`.
-    pub fn animate_open(&self, ms: u32) -> Result<()> {
-        use windows::Foundation::TimeSpan;
+    /// Opens the panel over `ms` with `motion`: a composition animation (the compositor runs
+    /// it, no timer). Call right after `show`.
+    pub fn animate_open(&self, ms: u32, motion: Motion) -> Result<()> {
         let comp = self.root.Compositor()?;
-        let size = self.root.Size()?;
-        self.root
-            .SetCenterPoint(Vector3::new(size.X / 2.0, size.Y / 2.0, 0.0))?;
         let ease =
             comp.CreateCubicBezierEasingFunction(Vector2::new(0.1, 0.9), Vector2::new(0.2, 1.0))?;
-        let span = TimeSpan::from(std::time::Duration::from_millis(ms as u64));
+        let span = duration(ms);
         let fade = comp.CreateScalarKeyFrameAnimation()?;
         fade.InsertKeyFrame(0.0, 0.0)?;
         fade.InsertKeyFrameWithEasingFunction(1.0, 1.0, &ease)?;
         fade.SetDuration(span)?;
-        let grow = comp.CreateVector3KeyFrameAnimation()?;
-        grow.InsertKeyFrame(0.0, Vector3::new(0.98, 0.98, 1.0))?;
-        grow.InsertKeyFrameWithEasingFunction(1.0, Vector3::new(1.0, 1.0, 1.0), &ease)?;
-        grow.SetDuration(span)?;
+        let mv = self.motion_animation(&comp, motion, true, &ease, span)?;
         self.root.SetOpacity(0.0)?;
         // Once the root is transparent, any failure must put it back: an invisible panel
         // that still takes the foreground would hold the keyboard with nothing on screen.
         or_restore(
             || {
                 self.root.StartAnimation(h!("Opacity"), &fade)?;
-                self.root.StartAnimation(h!("Scale"), &grow)
+                self.root.StartAnimation(mv.0, &mv.1)
             },
             || self.show_static(),
         )
     }
 
+    /// The reverse of [`Panel::animate_open`]: fades the panel out over `ms` while it slides
+    /// back / shrinks, and stops it taking input at once (clicks pass through to what is
+    /// behind, and it can no longer be activated). The owner drops it once `ms` has passed.
+    pub fn animate_close(&self, ms: u32, motion: Motion) -> Result<()> {
+        // SAFETY: plain calls on our own window.
+        unsafe {
+            let ex = GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE);
+            SetWindowLongPtrW(
+                self.hwnd,
+                GWL_EXSTYLE,
+                ex | (WS_EX_TRANSPARENT.0 | WS_EX_NOACTIVATE.0) as isize,
+            );
+        }
+        let comp = self.root.Compositor()?;
+        let ease =
+            comp.CreateCubicBezierEasingFunction(Vector2::new(0.4, 0.0), Vector2::new(1.0, 1.0))?;
+        let span = duration(ms);
+        let fade = comp.CreateScalarKeyFrameAnimation()?;
+        fade.InsertKeyFrame(0.0, 1.0)?;
+        fade.InsertKeyFrameWithEasingFunction(1.0, 0.0, &ease)?;
+        fade.SetDuration(span)?;
+        let mv = self.motion_animation(&comp, motion, false, &ease, span)?;
+        self.root.StartAnimation(h!("Opacity"), &fade)?;
+        self.root.StartAnimation(mv.0, &mv.1)
+    }
+
+    /// The position / scale animation of `motion`, opening (`opening`) or closing, with the
+    /// property it drives.
+    fn motion_animation(
+        &self,
+        comp: &Compositor,
+        motion: Motion,
+        opening: bool,
+        ease: &CubicBezierEasingFunction,
+        span: TimeSpan,
+    ) -> Result<(&'static HSTRING, Vector3KeyFrameAnimation)> {
+        let anim = comp.CreateVector3KeyFrameAnimation()?;
+        let (prop, rest, away) = match motion {
+            Motion::Grow => {
+                let size = self.root.Size()?;
+                self.root
+                    .SetCenterPoint(Vector3::new(size.X / 2.0, size.Y / 2.0, 0.0))?;
+                (
+                    h!("Scale"),
+                    Vector3::new(1.0, 1.0, 1.0),
+                    Vector3::new(0.98, 0.98, 1.0),
+                )
+            }
+            Motion::Rise { from } => {
+                let base = self.root.Offset()?;
+                let (dx, dy) = rise_offset(from, self.scale);
+                (
+                    h!("Offset"),
+                    base,
+                    Vector3::new(base.X + dx, base.Y + dy, base.Z),
+                )
+            }
+        };
+        let (start, end) = if opening { (away, rest) } else { (rest, away) };
+        anim.InsertKeyFrame(0.0, start)?;
+        anim.InsertKeyFrameWithEasingFunction(1.0, end, ease)?;
+        anim.SetDuration(span)?;
+        Ok((prop, anim))
+    }
+
     /// Puts the panel in its final, fully visible state: animations stopped, opacity 1,
-    /// scale 1. Best effort (each step is tried even if an earlier one fails).
+    /// scale 1, offset 0 (the root never sits anywhere else). Best effort (each step is
+    /// tried even if an earlier one fails).
     pub fn show_static(&self) {
         let _ = self.root.StopAnimation(h!("Opacity"));
         let _ = self.root.StopAnimation(h!("Scale"));
+        let _ = self.root.StopAnimation(h!("Offset"));
         let _ = self.root.SetOpacity(1.0);
         let _ = self.root.SetScale(Vector3::new(1.0, 1.0, 1.0));
+        let _ = self.root.SetOffset(Vector3::new(0.0, 0.0, 0.0));
     }
 
     /// Makes the top `dip` band of the panel a window caption (drag to move). Default 0.
@@ -450,6 +541,12 @@ mod tests {
             !restored.get(),
             "a success must leave the animation running"
         );
+    }
+
+    #[test]
+    fn rise_starts_on_the_bar_side() {
+        assert_eq!(rise_offset(Position::Bottom, 2.0), (0.0, 24.0));
+        assert_eq!(rise_offset(Position::Top, 2.0), (0.0, -24.0));
     }
 
     #[test]

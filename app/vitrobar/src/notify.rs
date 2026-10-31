@@ -76,6 +76,8 @@ pub const TIMER_REASSERT: usize = 0x5706;
 pub const TIMER_TRAY_TIP: usize = 0x5707;
 /// One-shot after the takeover: read the Start app catalog ahead of the first open.
 pub const TIMER_START_PREFETCH: usize = 0x5708;
+/// One-shot after the Start panel's close animation: the fading panel can be destroyed.
+pub const TIMER_START_CLOSED: usize = 0x5709;
 
 /// Everything the notify window received since the last [`take_inbox`].
 #[derive(Debug, Default, PartialEq)]
