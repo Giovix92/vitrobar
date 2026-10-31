@@ -3062,13 +3062,14 @@ impl App {
     }
 
     /// The catalog, recent files or account name arrived.
-    fn start_refresh(&mut self, apps_changed: bool) {
+    /// The Start data changed; `keep` is the selection's identity from before the change.
+    fn start_refresh(&mut self, apps_changed: bool, keep: Option<String>) {
         let lang = ui_lang(&self.settings);
         let Some(sp) = self.start.as_mut() else {
             return;
         };
         if apps_changed {
-            sp.research(&self.start_data, lang, true);
+            sp.research_kept(&self.start_data, lang, keep);
         }
         self.start_render();
     }
@@ -3819,10 +3820,16 @@ impl App {
         if inbox.start_data {
             // Always drained (a pending wake-up blocks the next one), shown only while open.
             let was_loading = self.start_data.apps_loading();
+            // Before the drain: a new catalog renumbers the apps the selection points at.
+            let keep = self
+                .start
+                .as_ref()
+                .and_then(|sp| sp.selection_key(&self.start_data));
             let (apps_changed, any) = self.start_data.drain();
             if any {
                 // The end of the catalog read also takes the "Loading apps…" row away.
-                self.start_refresh(apps_changed || was_loading != self.start_data.apps_loading());
+                let changed = apps_changed || was_loading != self.start_data.apps_loading();
+                self.start_refresh(changed, keep);
             }
         }
         if inbox.files {

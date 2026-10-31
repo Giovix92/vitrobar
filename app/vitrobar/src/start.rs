@@ -389,6 +389,28 @@ pub fn grid_results(text: &str, apps: &[Pin], files: &[FileHit], lang: Lang) -> 
     rows
 }
 
+/// Identity of one result, stable when the results are ranked again or the catalog is
+/// renumbered (an app is known by its AUMID and name, not its index).
+fn result_key(kind: &ResultKind, apps: &[Pin], files: &[FileHit]) -> Option<String> {
+    Some(match kind {
+        ResultKind::Math(_) => "m".into(),
+        ResultKind::Loading => "l".into(),
+        ResultKind::App(a) => {
+            let p = apps.get(*a)?;
+            format!("a:{}:{}", p.aumid.as_deref().unwrap_or(""), p.name)
+        }
+        ResultKind::Setting(s) => format!("s:{s}"),
+        ResultKind::File(f) => format!("f:{}", files.get(*f)?.path),
+    })
+}
+
+/// Where the result identified by `key` is in `results`.
+fn find_key(results: &[ResultKind], apps: &[Pin], files: &[FileHit], key: &str) -> Option<usize> {
+    results
+        .iter()
+        .position(|k| result_key(k, apps, files).as_deref() == Some(key))
+}
+
 /// How the results are laid out: the list fits `n` rows on its first screen, the grid
 /// shows everything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1321,22 +1343,25 @@ impl StartPanel {
     /// The query text changed (or the catalog did): search again. Returns the query to hand
     /// to the file search when the text changed since the last search.
     pub fn research(&mut self, data: &StartData, lang: Lang, force: bool) -> Option<(u64, String)> {
-        let keep = self.key_of(self.state.selected, data);
+        let keep = self.selection_key(data);
         self.research_keeping(data, lang, force, keep)
+    }
+
+    /// Identity of the selected result. Taken before `data` changes (a catalog refresh
+    /// renumbers the apps) and handed to [`Self::research_kept`] after.
+    pub fn selection_key(&self, data: &StartData) -> Option<String> {
+        self.key_of(self.state.selected, data)
+    }
+
+    /// The catalog changed under the same query: rank again, the selection staying on the
+    /// item `keep` (from [`Self::selection_key`] before the change) identifies.
+    pub fn research_kept(&mut self, data: &StartData, lang: Lang, keep: Option<String>) {
+        self.research_keeping(data, lang, true, keep);
     }
 
     /// Identity of result `i` (stable when the results are ranked again).
     fn key_of(&self, i: usize, data: &StartData) -> Option<String> {
-        Some(match self.results.get(i)? {
-            ResultKind::Math(_) => "m".into(),
-            ResultKind::Loading => "l".into(),
-            ResultKind::App(a) => {
-                let p = data.apps.get(*a)?;
-                format!("a:{}:{}", p.aumid.as_deref().unwrap_or(""), p.name)
-            }
-            ResultKind::Setting(s) => format!("s:{s}"),
-            ResultKind::File(f) => format!("f:{}", self.files.get(*f)?.path),
-        })
+        result_key(self.results.get(i)?, &data.apps, &self.files)
     }
 
     fn research_keeping(
@@ -1367,9 +1392,7 @@ impl StartPanel {
             // Same query ranked again (files or the catalog arrived): the selection stays
             // on the same item.
             if let Some(k) = keep {
-                let found = (0..self.results.len())
-                    .find(|&i| self.key_of(i, data).as_deref() == Some(k.as_str()));
-                if let Some(i) = found {
+                if let Some(i) = find_key(&self.results, &data.apps, &self.files, &k) {
                     self.state.selected = i;
                 }
             }
@@ -2115,6 +2138,22 @@ mod tests {
         f.apps = data.apps.clone();
         s.selected = 0;
         assert!(matches!(key(&mut s, &f, VK_RETURN), StartAction::Launch(_)));
+    }
+
+    #[test]
+    fn a_catalog_refresh_keeps_the_selection_on_the_same_app() {
+        let old = vec![pin("Paint"), pin("Photos")];
+        let results = [ResultKind::App(0), ResultKind::App(1)];
+        // "Photos" is selected; its identity is taken before the refresh ...
+        let key = result_key(&results[1], &old, &[]).unwrap();
+        // ... which adds an app in front: indices move.
+        let new = vec![pin("Paint 3D"), pin("Paint"), pin("Photos")];
+        let ranked = [ResultKind::App(0), ResultKind::App(1), ResultKind::App(2)];
+        assert_eq!(find_key(&ranked, &new, &[], &key), Some(2));
+        // Taken after the refresh, the old index would name another app.
+        let late = result_key(&results[1], &new, &[]).unwrap();
+        assert_eq!(find_key(&ranked, &new, &[], &late), Some(1));
+        assert_ne!(late, key);
     }
 
     #[test]
