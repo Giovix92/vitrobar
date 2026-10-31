@@ -172,7 +172,9 @@ pub fn load_with_status(path: &Path) -> (Settings, LoadStatus) {
 }
 
 /// Builds settings field by field: a missing or invalid value gives that field's default
-/// and nothing else; unknown keys are ignored.
+/// and nothing else; unknown keys are ignored (keys are case-sensitive: `Shape` is not
+/// `shape`). One exception: a `first-run-done` that is present but not a boolean reads as
+/// `true`, so a damaged value never re-runs the first-run import over the user's pins.
 fn from_table(t: &toml::Table) -> Settings {
     let d = Settings::default();
     fn get<T: serde::de::DeserializeOwned>(t: &toml::Table, key: &str, default: T) -> T {
@@ -207,7 +209,10 @@ fn from_table(t: &toml::Table) -> Settings {
         language: get(t, "language", d.language),
         pins: get_list(t, "pins"),
         tray_promoted: get_list(t, "tray-promoted"),
-        first_run_done: get(t, "first-run-done", d.first_run_done),
+        first_run_done: match t.get("first-run-done") {
+            None => d.first_run_done,
+            Some(v) => v.as_bool().unwrap_or(true),
+        },
         start_style: get(t, "start-style", d.start_style),
         win_key_opens_start: get(t, "win-key-opens-start", d.win_key_opens_start),
         start_pins: get_list(t, "start-pins"),
@@ -304,6 +309,79 @@ mod tests {
         save(&p, &original).unwrap();
         assert!(!d.path().join("settings.toml.tmp").exists());
         assert_eq!(load(&p), original);
+    }
+
+    #[test]
+    fn roundtrip_every_field_non_default() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("settings.toml");
+        let pin = |n: &str| Pin {
+            aumid: Some(format!("{n}!App")),
+            path: Some(format!(r"C:\Apps\{n}.exe")),
+            name: n.into(),
+            link: Some(format!(r"C:\Links\{n}.lnk")),
+        };
+        // Spelled out (no `..Default`): a new field must be added here to compile.
+        let original = Settings {
+            shape: Shape::Full,
+            material: Material::Liquid,
+            hover: HoverEffect::Sweep,
+            icon_size: IconSize::Large,
+            position: Position::Top,
+            reserve_space_floating: false,
+            stock_taskbar: StockTaskbar::AutoHide,
+            theme: ThemeChoice::Dark,
+            accent: Some(0xA1B2C3),
+            battery_fallback: false,
+            live_refraction: true,
+            start_with_windows: false,
+            language: Some("it".into()),
+            pins: vec![pin("Edge"), pin("Paint")],
+            tray_promoted: vec!["vol".into(), "net".into()],
+            first_run_done: true,
+            start_style: StartStyle::FullScreen,
+            win_key_opens_start: false,
+            start_pins: vec![pin("Calc")],
+            start_pins_initialized: true,
+        };
+        let d0 = Settings::default();
+        assert_ne!(original.hover, d0.hover);
+        assert_ne!(original.icon_size, d0.icon_size);
+        assert_ne!(original.position, d0.position);
+        assert_ne!(original.theme, d0.theme);
+        assert_ne!(original.start_style, d0.start_style);
+        save(&p, &original).unwrap();
+        assert_eq!(load(&p), original);
+    }
+
+    #[test]
+    fn mis_cased_keys_are_ignored() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("settings.toml");
+        let text = [
+            "Shape = \"full\"",
+            "ICON-SIZE = \"large\"",
+            "position = \"top\"",
+        ];
+        fs::write(&p, text.join("\n")).unwrap();
+        let s = load(&p);
+        assert_eq!(s.shape, Shape::Pill);
+        assert_eq!(s.icon_size, IconSize::Medium);
+        assert_eq!(s.position, Position::Top);
+    }
+
+    #[test]
+    fn an_invalid_first_run_done_counts_as_done() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("settings.toml");
+        for bad in ["\"yes\"", "1", "\"false\"", "[]"] {
+            fs::write(&p, format!("first-run-done = {bad}")).unwrap();
+            assert!(load(&p).first_run_done, "{bad} must read as done");
+        }
+        fs::write(&p, "first-run-done = false").unwrap();
+        assert!(!load(&p).first_run_done);
+        fs::write(&p, "shape = \"full\"").unwrap();
+        assert!(!load(&p).first_run_done, "absent is still a first run");
     }
 
     #[test]
