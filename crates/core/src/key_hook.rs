@@ -18,7 +18,9 @@
 //! - Win+T / Win+B enter focus mode at once (the UI thread turns it off if there is nothing
 //!   to focus). In focus mode the navigation keys are swallowed and reported; any other key
 //!   leaves it.
-//! - Stuck-key safety: a key-up is swallowed exactly when its key-down was.
+//! - Stuck-key safety: a key-up is swallowed exactly when its key-down was, unless that
+//!   down is older than [`SWALLOW_TTL_MS`] (its up was lost) or the session switched.
+//! - A mouse button anywhere ends focus mode ([`HookState::on_mouse_down`]).
 
 /// Virtual-key codes the decisions use (Win32 values; `vitro-core` has no `windows` crate).
 pub const VK_TAB: u32 = 0x09;
@@ -68,7 +70,8 @@ pub enum HookDecision {
 /// Work for the UI thread (queued, then a payload-free wake-up).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookOutput {
-    OpenStart,
+    /// With the Windows-key up's event time (ms, the `GetTickCount` clock).
+    OpenStart(u32),
     /// Win+n, `n` in 1..=9.
     LaunchNth(u8),
     FocusApps,
@@ -87,6 +90,10 @@ pub struct Held {
     pub win: bool,
     pub modifier: bool,
 }
+
+/// A swallowed key whose up has not come within this long (no auto-repeat refreshed it) is
+/// forgotten.
+pub const SWALLOW_TTL_MS: u32 = 2000;
 
 /// The navigation keys focus mode swallows.
 pub const FOCUS_KEYS: [u32; 11] = [
@@ -151,8 +158,11 @@ pub struct HookState {
     other_pressed: bool,
     /// We swallowed a key of the current Windows-key combination: its up must be masked.
     swallowed_combo: bool,
-    /// Keys whose down we swallowed and whose up we have not seen yet.
+    /// Keys whose down we swallowed and whose up we have not seen yet ...
     swallowed: VkSet,
+    /// ... and when (event time, ms) each last went down: older than [`SWALLOW_TTL_MS`],
+    /// an entry is forgotten (its up was lost; the next press must not be eaten).
+    swallowed_at: [u32; 256],
     /// Shift / Ctrl / Alt held (any side).
     mods: VkSet,
 }
@@ -166,6 +176,7 @@ impl HookState {
             other_pressed: false,
             swallowed_combo: false,
             swallowed: VkSet::default(),
+            swallowed_at: [0; 256],
             mods: VkSet::default(),
         }
     }
@@ -204,12 +215,51 @@ impl HookState {
         }
     }
 
+    /// The session or the input desktop changed: ups may have been lost.
+    pub fn forget_swallowed(&mut self) {
+        self.swallowed.clear();
+    }
+
+    /// A mouse button went down anywhere (the mouse hook runs only in focus mode): focus
+    /// mode ends at once, so the next key reaches the app that was clicked.
+    pub fn on_mouse_down(&mut self) -> Option<HookOutput> {
+        std::mem::take(&mut self.focus_mode).then_some(HookOutput::ExitFocus)
+    }
+
+    fn swallow(&mut self, vk: u32, now: u32) {
+        self.swallowed.insert(vk);
+        if let Some(t) = self.swallowed_at.get_mut(vk as usize) {
+            *t = now;
+        }
+    }
+
+    /// `vk` was swallowed and that is still current (a stale entry is dropped here).
+    fn still_swallowed(&mut self, vk: u32, now: u32) -> bool {
+        if !self.swallowed.contains(vk) {
+            return false;
+        }
+        let at = self.swallowed_at.get(vk as usize).copied().unwrap_or(now);
+        // Signed: event times can come very slightly out of order.
+        if now.wrapping_sub(at) as i32 > SWALLOW_TTL_MS as i32 {
+            self.swallowed.remove(vk);
+            return false;
+        }
+        true
+    }
+
+    /// [`HookState::on_event_at`] with no clock (tests: nothing ever ages).
     pub fn on_event(&mut self, ev: KeyEv) -> (HookDecision, Option<HookOutput>) {
+        self.on_event_at(ev, 0)
+    }
+
+    /// Decides on one event; `now` is its time stamp (ms, `KBDLLHOOKSTRUCT::time`).
+    pub fn on_event_at(&mut self, ev: KeyEv, now: u32) -> (HookDecision, Option<HookOutput>) {
         use HookDecision::*;
         match ev {
             KeyEv::Up(vk) => {
                 // Whatever else changed: a swallowed down gets its up swallowed, nothing else.
-                if self.swallowed.remove(vk) {
+                if self.still_swallowed(vk, now) {
+                    self.swallowed.remove(vk);
                     return (Swallow, None);
                 }
                 if is_modifier(vk) {
@@ -226,7 +276,7 @@ impl HookState {
                         return (PassAndMask, None);
                     }
                     if self.enabled && lone {
-                        return (PassAndMask, Some(HookOutput::OpenStart));
+                        return (PassAndMask, Some(HookOutput::OpenStart(now)));
                     }
                 }
                 (Pass, None)
@@ -242,8 +292,9 @@ impl HookState {
                     self.wins.insert(vk);
                     return self.pass_or_exit_focus();
                 }
-                if self.swallowed.contains(vk) {
+                if self.still_swallowed(vk, now) {
                     // Auto-repeat of a key we swallowed: still ours. Arrows repeat the move.
+                    self.swallow(vk, now);
                     let out = (self.focus_mode && FOCUS_KEYS.contains(&vk))
                         .then_some(HookOutput::FocusKey(vk));
                     return (Swallow, out);
@@ -269,18 +320,19 @@ impl HookState {
                         _ => None,
                     };
                     if out.is_some() {
-                        self.swallowed.insert(vk);
+                        self.swallow(vk, now);
                         self.swallowed_combo = true;
                         // Focus mode starts now, not when the UI thread gets to it.
                         self.focus_mode |=
                             matches!(out, Some(HookOutput::FocusApps | HookOutput::FocusTray));
                         return (Swallow, out);
                     }
-                    return (Pass, None);
+                    // Win+Arrow, Win+Tab, Win+D, ...: Windows' own, and the end of focus mode.
+                    return self.pass_or_exit_focus();
                 }
                 if self.focus_mode {
                     if FOCUS_KEYS.contains(&vk) {
-                        self.swallowed.insert(vk);
+                        self.swallow(vk, now);
                         return (Swallow, Some(HookOutput::FocusKey(vk)));
                     }
                     return self.pass_or_exit_focus();
@@ -315,7 +367,7 @@ mod tests {
     fn lone_win_tap_opens_start_with_mask() {
         let mut h = HookState::new(true);
         assert_eq!(h.on_event(Down(VK_LWIN)).0, Pass);
-        assert_eq!(h.on_event(Up(VK_LWIN)), (PassAndMask, Some(OpenStart)));
+        assert_eq!(h.on_event(Up(VK_LWIN)), (PassAndMask, Some(OpenStart(0))));
     }
 
     #[test]
@@ -473,7 +525,7 @@ mod tests {
         let mut h = HookState::new(true);
         h.set_focus_mode(true);
         assert_eq!(h.on_event(Down(VK_LWIN)), (Pass, Some(ExitFocus)));
-        assert_eq!(h.on_event(Up(VK_LWIN)), (PassAndMask, Some(OpenStart)));
+        assert_eq!(h.on_event(Up(VK_LWIN)), (PassAndMask, Some(OpenStart(0))));
     }
 
     #[test]
@@ -521,7 +573,7 @@ mod tests {
     fn rwin_works_like_lwin() {
         let mut h = HookState::new(true);
         assert_eq!(h.on_event(Down(VK_RWIN)), (Pass, None));
-        assert_eq!(h.on_event(Up(VK_RWIN)), (PassAndMask, Some(OpenStart)));
+        assert_eq!(h.on_event(Up(VK_RWIN)), (PassAndMask, Some(OpenStart(0))));
         h.on_event(Down(VK_RWIN));
         assert_eq!(h.on_event(Down(0x37)), (Swallow, Some(LaunchNth(7))));
         h.on_event(Up(0x37));
@@ -583,6 +635,84 @@ mod tests {
         let mut h = HookState::new(true);
         assert_eq!(h.on_event(Up(VK_LWIN)), (Pass, None));
         assert_eq!(h.on_event(Up(0x33)), (Pass, None));
+    }
+
+    #[test]
+    fn open_start_carries_the_event_time() {
+        let mut h = HookState::new(true);
+        h.on_event_at(Down(VK_LWIN), 100);
+        assert_eq!(
+            h.on_event_at(Up(VK_LWIN), 180),
+            (PassAndMask, Some(OpenStart(180)))
+        );
+    }
+
+    #[test]
+    fn a_lost_up_does_not_eat_the_next_press() {
+        let mut h = HookState::new(true);
+        h.on_event_at(Down(VK_LWIN), 0);
+        assert_eq!(h.on_event_at(Down(0x33), 10), (Swallow, Some(LaunchNth(3))));
+        // The Up of 3 never arrives (lost); Win goes up.
+        assert_eq!(h.on_event_at(Up(VK_LWIN), 100), (PassAndMask, None));
+        // 3 s later a plain 3 is a plain 3, down and up.
+        assert_eq!(h.on_event_at(Down(0x33), 3000), (Pass, None));
+        assert_eq!(h.on_event_at(Up(0x33), 3050), (Pass, None));
+    }
+
+    #[test]
+    fn a_long_hold_keeps_its_up_swallowed() {
+        let mut h = HookState::new(true);
+        h.on_event_at(Down(VK_LWIN), 0);
+        h.on_event_at(Down(0x32), 0);
+        // Auto-repeat refreshes the entry.
+        for t in (500..=3000).step_by(500) {
+            assert_eq!(h.on_event_at(Down(0x32), t), (Swallow, None), "{t}");
+        }
+        assert_eq!(h.on_event_at(Up(0x32), 3030), (Swallow, None));
+    }
+
+    #[test]
+    fn a_session_switch_forgets_swallowed_keys() {
+        let mut h = HookState::new(true);
+        h.on_event(Down(VK_LWIN));
+        h.on_event(Down(0x35));
+        h.forget_swallowed();
+        assert_eq!(h.on_event(Up(0x35)), (Pass, None));
+        // The combination still had a swallowed key: Win-up stays masked, no Start.
+        assert_eq!(h.on_event(Up(VK_LWIN)), (PassAndMask, None));
+    }
+
+    #[test]
+    fn win_shortcuts_in_focus_mode_pass_and_end_it() {
+        for vk in [VK_RIGHT, VK_LEFT, VK_UP, VK_TAB, 0x44] {
+            let mut h = HookState::new(true);
+            h.on_event(Down(VK_LWIN));
+            h.on_event(Down(0x54));
+            h.on_event(Up(0x54));
+            assert!(h.focus_mode());
+            // Win still held: Win+Right snaps, Win+Tab is Task view, Win+D the desktop.
+            assert_eq!(h.on_event(Down(vk)), (Pass, Some(ExitFocus)), "{vk:#x}");
+            assert!(!h.focus_mode());
+            assert_eq!(h.on_event(Up(vk)), (Pass, None));
+            assert_eq!(h.on_event(Up(VK_LWIN)), (PassAndMask, None));
+        }
+    }
+
+    #[test]
+    fn a_mouse_button_ends_focus_mode_at_once() {
+        let mut h = HookState::new(true);
+        assert_eq!(h.on_mouse_down(), None);
+        h.set_focus_mode(true);
+        assert_eq!(h.on_mouse_down(), Some(ExitFocus));
+        assert!(!h.focus_mode());
+        // The very next key reaches the app that was clicked.
+        assert_eq!(tap(&mut h, VK_RETURN), [(Pass, None), (Pass, None)]);
+        assert_eq!(h.on_mouse_down(), None);
+        // A nav key held across the click still gets its up swallowed.
+        h.set_focus_mode(true);
+        h.on_event(Down(VK_SPACE));
+        assert_eq!(h.on_mouse_down(), Some(ExitFocus));
+        assert_eq!(h.on_event(Up(VK_SPACE)), (Swallow, None));
     }
 
     #[test]

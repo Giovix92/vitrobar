@@ -79,23 +79,26 @@ use windows::Win32::System::Console::{
     SetConsoleCtrlHandler, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
 };
 use windows::Win32::System::SystemInformation::GetTickCount;
-use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetKeyState, VK_CONTROL, VK_ESCAPE, VK_F4, VK_MENU,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetForegroundWindow, GetMessagePos, IsWindow, KillTimer,
-    MsgWaitForMultipleObjectsEx, PeekMessageW, PostMessageW, PostQuitMessage, PostThreadMessageW,
-    SetTimer, TranslateMessage, MSG, MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT, WM_CHAR,
-    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NULL, WM_QUIT,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
+    DispatchMessageW, GetForegroundWindow, GetMessagePos, GetWindowThreadProcessId, IsWindow,
+    KillTimer, MsgWaitForMultipleObjectsEx, PeekMessageW, PostMessageW, PostQuitMessage,
+    PostThreadMessageW, SetTimer, TranslateMessage, MSG, MWMO_INPUTAVAILABLE, PM_REMOVE,
+    QS_ALLINPUT, WM_CHAR, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_NULL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
 };
 
 use crate::bar_window::{
     create_bar_window, hit_test, mouse_pos, track_leave, BarWindow, Hit, MarginMode, PxRect,
 };
 use crate::icon_loader::{IconLoader, IconSrc, Lookup, TrayImage, MAX_ICON_PX};
-use crate::keys::{first_in, launch_action, step, Counts, Focus, Keys, Step, Zone};
+use crate::keys::{
+    activation_ends_focus, first_in, launch_action, open_start_fresh, step, Counts, Focus, Keys,
+    Step, Zone,
+};
 use crate::launcher::{Job, Launcher};
 use crate::menus::{app_menu, bar_menu, power_menu, start_item_menu, MenuChoice};
 use crate::notify::{
@@ -345,6 +348,17 @@ fn foreground() -> Option<Hwnd> {
     (!h.0.is_null()).then_some(h.0 as usize as Hwnd)
 }
 
+/// `h` belongs to this process (a bar, the Start panel, a flyout). Read while it exists.
+fn is_own_window(h: Option<Hwnd>) -> bool {
+    let Some(h) = h else { return false };
+    let mut pid = 0u32;
+    // SAFETY: plain queries; a stale handle yields thread 0 and leaves `pid` at 0.
+    unsafe {
+        GetWindowThreadProcessId(hwnd_of(h), Some(&mut pid));
+        pid != 0 && pid == GetCurrentProcessId()
+    }
+}
+
 fn icon_sources(g: &AppGroup) -> Vec<IconSrc> {
     let mut v = match &g.key {
         GroupKey::Aumid(a) => vec![IconSrc::Aumid(a.clone())],
@@ -551,6 +565,8 @@ struct App {
     hover_style: HoverStyle,
     windows: WindowSet,
     foreground: Option<Hwnd>,
+    /// `foreground` is one of our own windows (read when it became the foreground).
+    foreground_ours: bool,
     clock_text: String,
     clock_w: f32,
     hover: Option<Hit>,
@@ -659,6 +675,7 @@ impl App {
             sys,
             windows: WindowSet::new(),
             foreground: foreground(),
+            foreground_ours: false,
             clock_text: String::new(),
             clock_w: CLOCK_MIN_DIP,
             hover: None,
@@ -1563,12 +1580,16 @@ impl App {
                 if let Some(h) = fg {
                     dirty.regroup |= self.windows.set_flashing(h, false);
                 }
-                if self.foreground != fg {
-                    dirty.regroup = true;
-                    // Another window in front ends the keyboard focus mode.
+                let changed = self.foreground != fg;
+                dirty.regroup |= changed;
+                // Another window in front ends the keyboard focus mode, unless the change
+                // only leaves one of our own windows (the Start panel or the overflow that
+                // entering focus mode just closed).
+                if activation_ends_focus(changed, self.foreground_ours) {
                     self.leave_focus(dirty);
                 }
                 self.foreground = fg;
+                self.foreground_ours = is_own_window(fg);
                 dirty.fullscreen = true;
                 self.start_foreground_changed(fg);
                 // A foreground change is when the shell reorders the topmost band: keep our
@@ -1591,9 +1612,12 @@ impl App {
                 let fg = foreground();
                 dirty.regroup |= self.foreground != fg;
                 self.foreground = fg;
+                self.foreground_ours = is_own_window(fg);
                 dirty.fullscreen = true;
             }
             WindowEvent::DesktopSwitched => {
+                // A key-up may have been lost in the switch.
+                self.keys.forget_swallowed();
                 // Every bar shows only the current desktop's windows; pins stay.
                 let changed = self.windows.refresh_desktops(&self.desktops);
                 dirty.regroup |= changed;
@@ -2581,11 +2605,16 @@ impl App {
     fn on_hook_output(&mut self, out: HookOutput, dirty: &mut Dirty) {
         // Never logged: what the user typed stays between the hook and this match.
         match out {
-            HookOutput::OpenStart => {
+            HookOutput::OpenStart(at) => {
                 self.leave_focus(dirty);
+                // SAFETY: plain query.
+                if !open_start_fresh(at, unsafe { GetTickCount() }) {
+                    // The UI thread was too long busy: a late Start would surprise.
+                    return;
+                }
                 let k = self.key_monitor();
-                // SAFETY: plain query (the open time is measured from the Windows-key up).
-                self.input_time = unsafe { GetTickCount() };
+                // The open time is measured from the Windows-key up.
+                self.input_time = at;
                 self.toggle_start(k, dirty);
                 if let Some(sp) = self.start.as_mut().filter(|s| !s.activated) {
                     // The mask key the hook injected is normally the latest input, which
@@ -2611,6 +2640,15 @@ impl App {
             HookOutput::FocusTray => self.enter_focus(Zone::Tray, dirty),
             HookOutput::FocusKey(vk) => self.focus_key(vk, dirty),
             HookOutput::ExitFocus => self.leave_focus(dirty),
+        }
+    }
+
+    /// `Settings.win_key_opens_start` changed: off, the hook lets every key through and the
+    /// focus ring (if any) goes.
+    #[allow(dead_code)] // Called by the settings window (Task 9).
+    fn set_win_key(&mut self, on: bool, dirty: &mut Dirty) {
+        if let Some(m) = self.keys.set_enabled(on) {
+            dirty.bars.insert(m);
         }
     }
 
@@ -3457,6 +3495,10 @@ impl App {
         // really changed.
         dirty.monitors |= inbox.display || inbox.dpi || inbox.workarea || inbox.session;
         dirty.display |= inbox.display || inbox.session;
+        if inbox.session {
+            // Back from the lock screen or another session: key-ups may have been lost.
+            self.keys.forget_swallowed();
+        }
         if inbox.start_data {
             // Always drained (a pending wake-up blocks the next one), shown only while open.
             let (apps_changed, any) = self.start_data.drain();

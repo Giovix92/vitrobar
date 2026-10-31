@@ -14,10 +14,19 @@
 //! Nothing about the keys is stored, logged or sent anywhere; the only statistics kept are a
 //! call counter and the longest time spent in the procedure (no key codes).
 //!
-//! If the process dies, Windows removes the hook with it. Dropping [`KeyHook`] posts `WM_QUIT`
-//! to the hook thread, which unhooks and exits (waited for at most one second).
+//! While (and only while) focus mode is on, the same thread also runs a low-level mouse hook
+//! (`WH_MOUSE_LL`, ruling S6): any button going down anywhere ends focus mode in the hook state
+//! at once (so the very next key passes) and queues `ExitFocus`. It never swallows a mouse
+//! event, keeps no coordinates, and is removed as soon as focus mode ends. Focus-mode changes
+//! (from the UI thread or from the hooks themselves) post [`WM_SYNC_MOUSE`] to the hook
+//! thread, which installs or removes the mouse hook to match.
+//!
+//! If the process dies, Windows removes the hooks with it. Dropping [`KeyHook`] posts
+//! `WM_QUIT` to the hook thread, which unhooks and exits (waited for at most one second; if it
+//! does not exit in time, `RUNNING` stays set and a later [`KeyHook::start`] in this process
+//! is refused: the old thread still decides correctly until it gets to the quit message).
 
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -33,14 +42,19 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, GetMessageW, PeekMessageW, PostMessageW, PostThreadMessageW, SetWindowsHookExW,
-    UnhookWindowsHookEx, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, PM_NOREMOVE,
-    WH_KEYBOARD_LL, WM_APP, WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    UnhookWindowsHookEx, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, PM_NOREMOVE,
+    WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_MBUTTONDOWN,
+    WM_QUIT, WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN,
 };
 
 use crate::event_queue::WakeQueue;
 
 /// Payload-free wake-up: hook outputs are waiting in [`KeyHook::drain`] (ruling S2).
 pub const WM_VITRO_KEY: u32 = WM_APP + 0x24;
+
+/// Thread message to the hook thread: install or remove the mouse hook to match focus mode.
+/// Posted only to our own thread (thread messages are never seen by any window).
+pub const WM_SYNC_MOUSE: u32 = WM_APP + 0x01;
 
 /// How long [`KeyHook`]'s drop waits for the hook thread.
 const JOIN_TIMEOUT: Duration = Duration::from_secs(1);
@@ -49,6 +63,8 @@ const JOIN_TIMEOUT: Duration = Duration::from_secs(1);
 static STATE: Mutex<Option<HookState>> = Mutex::new(None);
 static RUNNING: AtomicBool = AtomicBool::new(false);
 static INSTALLED: AtomicBool = AtomicBool::new(false);
+static MOUSE_INSTALLED: AtomicBool = AtomicBool::new(false);
+static HOOK_THREAD: AtomicU32 = AtomicU32::new(0);
 static NOTIFY: AtomicIsize = AtomicIsize::new(0);
 /// Single producer: the hook thread.
 static OUTPUTS: WakeQueue<HookOutput> = WakeQueue::new();
@@ -65,6 +81,8 @@ pub struct HookStats {
     pub installed: bool,
     pub enabled: bool,
     pub focus_mode: bool,
+    /// The focus-mode mouse hook is installed.
+    pub mouse_hook: bool,
     /// Hook procedure calls since start (injected ones included).
     pub calls: u64,
     /// The longest time one call took, in microseconds.
@@ -123,10 +141,29 @@ pub fn inject_mask_key() {
     }
 }
 
-/// Decides on one physical event; `true` = swallow.
-fn decide(ev: KeyEv) -> bool {
+/// Asks the hook thread to install / remove the mouse hook to match focus mode.
+fn post_sync() {
+    let tid = HOOK_THREAD.load(Ordering::Acquire);
+    if tid != 0 {
+        // SAFETY: posting to our own thread never blocks.
+        let _ = unsafe { PostThreadMessageW(tid, WM_SYNC_MOUSE, WPARAM(0), LPARAM(0)) };
+    }
+}
+
+fn queue_output(out: HookOutput) {
+    if OUTPUTS.push(out) {
+        let notify = HWND(NOTIFY.load(Ordering::Acquire) as *mut _);
+        // SAFETY: posting never blocks on the receiver.
+        if unsafe { PostMessageW(Some(notify), WM_VITRO_KEY, WPARAM(0), LPARAM(0)) }.is_err() {
+            OUTPUTS.wake_failed();
+        }
+    }
+}
+
+/// Decides on one physical event at `time` (ms); `true` = swallow.
+fn decide(ev: KeyEv, time: u32) -> bool {
     let held = matches!(ev, KeyEv::Down(_)).then(physical_held);
-    let (decision, output) = {
+    let (decision, output, focus_changed) = {
         let mut guard = state();
         let Some(st) = guard.as_mut() else {
             return false;
@@ -134,23 +171,48 @@ fn decide(ev: KeyEv) -> bool {
         if let Some(h) = held {
             st.sync_held(h);
         }
-        st.on_event(ev)
+        let before = st.focus_mode();
+        let (d, o) = st.on_event_at(ev, time);
+        (d, o, before != st.focus_mode())
     };
+    if focus_changed {
+        post_sync();
+    }
     if decision == HookDecision::PassAndMask {
         // Before the UI thread is woken: the Start panel it opens asks for the foreground
         // right after, and the mask key must already be the latest input by then.
         inject_mask_key();
     }
     if let Some(out) = output {
-        if OUTPUTS.push(out) {
-            let notify = HWND(NOTIFY.load(Ordering::Acquire) as *mut _);
-            // SAFETY: posting never blocks on the receiver.
-            if unsafe { PostMessageW(Some(notify), WM_VITRO_KEY, WPARAM(0), LPARAM(0)) }.is_err() {
-                OUTPUTS.wake_failed();
-            }
-        }
+        queue_output(out);
     }
     decision == HookDecision::Swallow
+}
+
+fn record_call(t0: Instant) {
+    CALLS.fetch_add(1, Ordering::Relaxed);
+    MAX_NS.fetch_max(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+}
+
+/// The focus-mode mouse hook: a button down ends focus mode. Never swallows; reads nothing
+/// but the message id.
+unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let t0 = Instant::now();
+    if code == HC_ACTION as i32
+        && matches!(
+            wparam.0 as u32,
+            WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN
+        )
+    {
+        let out = state().as_mut().and_then(HookState::on_mouse_down);
+        if let Some(out) = out {
+            queue_output(out);
+            post_sync();
+        }
+    }
+    record_call(t0);
+    // SAFETY: passes the event on unchanged.
+    unsafe { CallNextHookEx(None, code, wparam, lparam) }
 }
 
 unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -161,12 +223,11 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         let kb = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
         if (kb.flags.0 & LLKHF_INJECTED.0) == 0 {
             if let Some(ev) = key_event(wparam.0 as u32, kb.vkCode) {
-                swallow = decide(ev);
+                swallow = decide(ev, kb.time);
             }
         }
     }
-    CALLS.fetch_add(1, Ordering::Relaxed);
-    MAX_NS.fetch_max(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    record_call(t0);
     if swallow {
         LRESULT(1)
     } else {
@@ -227,11 +288,20 @@ impl KeyHook {
         if let Some(st) = state().as_mut() {
             st.set_enabled(on);
         }
+        post_sync();
     }
 
     pub fn set_focus_mode(&self, on: bool) {
         if let Some(st) = state().as_mut() {
             st.set_focus_mode(on);
+        }
+        post_sync();
+    }
+
+    /// The session or the input desktop switched: key-ups may have been lost.
+    pub fn forget_swallowed(&self) {
+        if let Some(st) = state().as_mut() {
+            st.forget_swallowed();
         }
     }
 
@@ -248,6 +318,7 @@ impl KeyHook {
             installed: INSTALLED.load(Ordering::Acquire),
             enabled,
             focus_mode,
+            mouse_hook: MOUSE_INSTALLED.load(Ordering::Acquire),
             calls: CALLS.load(Ordering::Relaxed),
             max_us: MAX_NS.load(Ordering::Relaxed) / 1000,
         }
@@ -260,6 +331,7 @@ pub fn hook_thread_running() -> bool {
 }
 
 fn cleanup() {
+    HOOK_THREAD.store(0, Ordering::Release);
     *state() = None;
     OUTPUTS.clear();
     NOTIFY.store(0, Ordering::Release);
@@ -286,17 +358,56 @@ fn hook_thread(ready: mpsc::Sender<Result<u32>>, done: mpsc::Sender<()>) {
     };
     INSTALLED.store(true, Ordering::Release);
     // SAFETY: plain call.
-    let _ = ready.send(Ok(unsafe { GetCurrentThreadId() }));
-    // Nothing else happens on this thread: the loop only lets the hook callbacks run.
+    let tid = unsafe { GetCurrentThreadId() };
+    HOOK_THREAD.store(tid, Ordering::Release);
+    let _ = ready.send(Ok(tid));
+    let mut mouse: Option<HHOOK> = None;
+    // Nothing else happens on this thread: the loop only lets the hook callbacks run and
+    // keeps the mouse hook in step with focus mode.
     // SAFETY: standard message retrieval; there are no windows to dispatch to.
-    while unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {}
-    // SAFETY: our own hook, removed once.
+    while unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {
+        if msg.message == WM_SYNC_MOUSE && msg.hwnd.is_invalid() {
+            sync_mouse_hook(&mut mouse);
+        }
+    }
+    // SAFETY: our own hooks, each removed once.
     unsafe {
+        if let Some(m) = mouse.take() {
+            let _ = UnhookWindowsHookEx(m);
+        }
         let _ = UnhookWindowsHookEx(hook);
     }
+    MOUSE_INSTALLED.store(false, Ordering::Release);
     INSTALLED.store(false, Ordering::Release);
     cleanup();
     let _ = done.send(());
+}
+
+/// Installs the mouse hook while focus mode is on, removes it otherwise (hook thread only).
+fn sync_mouse_hook(mouse: &mut Option<HHOOK>) {
+    let want = state().as_ref().is_some_and(HookState::focus_mode);
+    match (want, mouse.is_some()) {
+        (true, false) => {
+            // SAFETY: a low-level hook whose callbacks run on this thread's loop.
+            let hook = unsafe {
+                GetModuleHandleW(None).and_then(|module| {
+                    SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), Some(module.into()), 0)
+                })
+            };
+            // Without it a click simply does not end focus mode (keys still do).
+            *mouse = hook.ok();
+        }
+        (false, true) => {
+            if let Some(m) = mouse.take() {
+                // SAFETY: our own hook, removed once.
+                unsafe {
+                    let _ = UnhookWindowsHookEx(m);
+                }
+            }
+        }
+        _ => {}
+    }
+    MOUSE_INSTALLED.store(mouse.is_some(), Ordering::Release);
 }
 
 impl Drop for KeyHook {
@@ -310,7 +421,8 @@ impl Drop for KeyHook {
             }
         } else {
             // The thread keeps deciding correctly until it gets to the quit message; the
-            // process exit removes the hook in any case.
+            // process exit removes the hook in any case. RUNNING stays set (the thread
+            // clears it as its last step), so a new start in this process is refused.
             eprintln!("vitrobar: the keyboard hook thread did not stop within 1 s");
         }
     }
@@ -333,8 +445,8 @@ mod tests {
     fn no_hook_no_state() {
         // Without a running hook the setters and the decision are no-ops that pass.
         if !hook_thread_running() {
-            assert!(!decide(KeyEv::Down(0x5B)));
-            assert!(!decide(KeyEv::Up(0x5B)), "no mask, nothing swallowed");
+            assert!(!decide(KeyEv::Down(0x5B), 0));
+            assert!(!decide(KeyEv::Up(0x5B), 0), "no mask, nothing swallowed");
         }
     }
 }

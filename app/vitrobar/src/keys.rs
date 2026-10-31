@@ -118,6 +118,24 @@ pub fn step(zone: Zone, item: BarFocus, vk: u32, c: Counts) -> Step {
     }
 }
 
+/// A Win-key `OpenStart` this much older than now (ms) is dropped: the UI thread was too
+/// busy, and a Start that opens long after the tap would surprise.
+pub const OPEN_START_MAX_AGE_MS: u32 = 500;
+
+/// Whether an `OpenStart` stamped `event_ms` is still worth acting on at `now_ms` (both on
+/// the `GetTickCount` clock, which wraps).
+pub fn open_start_fresh(event_ms: u32, now_ms: u32) -> bool {
+    (now_ms.wrapping_sub(event_ms) as i32) <= OPEN_START_MAX_AGE_MS as i32
+}
+
+/// Whether a foreground change ends focus mode. A change away from one of our own windows
+/// does not: entering focus mode closes an open Start panel or overflow, and the foreground
+/// then goes back to the app that had it before, which must not cancel the mode just
+/// entered.
+pub fn activation_ends_focus(changed: bool, previous_was_ours: bool) -> bool {
+    changed && !previous_was_ours
+}
+
 /// Win+n on an app: as a click, except that a group with several windows activates the
 /// next one (after the foreground one, or the first) instead of showing the thumbnails.
 pub fn launch_action(g: &AppGroup, foreground: Option<Hwnd>) -> ClickAction {
@@ -154,14 +172,25 @@ impl Keys {
     }
 
     /// `Settings.win_key_opens_start` changed (the settings window): off, the hook stays
-    /// installed but lets every key through.
-    #[allow(dead_code)] // Called by the settings window (Task 9).
-    pub fn set_enabled(&mut self, on: bool) {
-        if !on {
-            self.focus = None;
-        }
+    /// installed but lets every key through. Returns the monitor whose bar showed the focus
+    /// ring (it must be redrawn without it).
+    #[allow(dead_code)] // Called by the settings window (Task 9) through `App::set_win_key`.
+    pub fn set_enabled(&mut self, on: bool) -> Option<u64> {
+        let ringed = if on {
+            None
+        } else {
+            self.focus.take().map(|f| f.monitor)
+        };
         if let Some(h) = &self.hook {
             h.set_enabled(on);
+        }
+        ringed
+    }
+
+    /// The session or the input desktop switched: key-ups may have been lost.
+    pub fn forget_swallowed(&self) {
+        if let Some(h) = &self.hook {
+            h.forget_swallowed();
         }
     }
 
@@ -191,8 +220,8 @@ impl Keys {
             Some(Zone::Tray) => "tray",
         };
         format!(
-            "{{\"hook\":{},\"enabled\":{},\"focus\":\"{}\",\"calls\":{},\"max_us\":{}}}",
-            s.installed, s.enabled, focus, s.calls, s.max_us
+            "{{\"hook\":{},\"enabled\":{},\"focus\":\"{}\",\"mouse_hook\":{},\"calls\":{},\"max_us\":{}}}",
+            s.installed, s.enabled, focus, s.mouse_hook, s.calls, s.max_us
         )
     }
 }
@@ -312,11 +341,47 @@ mod tests {
     }
 
     #[test]
+    fn closing_our_own_panel_does_not_cancel_focus_mode() {
+        // Win+T with the Start panel open: the panel closes, the previous app comes back.
+        assert!(!activation_ends_focus(true, true));
+        // A real switch to another app (or a click into one) ends it.
+        assert!(activation_ends_focus(true, false));
+        assert!(!activation_ends_focus(false, false));
+    }
+
+    #[test]
+    fn stale_open_start_is_dropped() {
+        assert!(open_start_fresh(1000, 1000));
+        assert!(open_start_fresh(1000, 1500));
+        assert!(!open_start_fresh(1000, 1501));
+        // Across the 49.7-day wrap of GetTickCount.
+        assert!(open_start_fresh(u32::MAX - 100, 200));
+        assert!(!open_start_fresh(u32::MAX - 100, 900));
+        // An event stamped a little after "now" (clock skew) counts as fresh.
+        assert!(open_start_fresh(1010, 1000));
+    }
+
+    #[test]
+    fn disabling_returns_the_ringed_bar() {
+        let mut k = Keys::default();
+        k.set_focus(Some(Focus {
+            monitor: 7,
+            zone: Zone::Apps,
+            item: BarFocus::App(0),
+        }));
+        assert_eq!(k.set_enabled(true), None);
+        assert!(k.focus().is_some());
+        assert_eq!(k.set_enabled(false), Some(7));
+        assert_eq!(k.focus(), None);
+        assert_eq!(k.set_enabled(false), None);
+    }
+
+    #[test]
     fn dump_without_hook_has_counts_only() {
         let k = Keys::default();
         assert_eq!(
             k.dump(),
-            "{\"hook\":false,\"enabled\":false,\"focus\":\"none\",\"calls\":0,\"max_us\":0}"
+            "{\"hook\":false,\"enabled\":false,\"focus\":\"none\",\"mouse_hook\":false,\"calls\":0,\"max_us\":0}"
         );
     }
 }

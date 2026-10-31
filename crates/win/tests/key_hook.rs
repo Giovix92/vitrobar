@@ -9,6 +9,8 @@
 //! through untouched by design, so they exercise only the hook procedure's fast path; the
 //! real Windows-key behaviour is checked by hand (release checklist, "Keyboard"). A guard
 //! always unhooks, even when an assertion fails, and checks that no Windows key is left down.
+//! The focus-mode mouse hook is installed and removed (no mouse input is injected: it would
+//! reach whatever window is under the cursor).
 
 use std::time::{Duration, Instant};
 
@@ -149,9 +151,33 @@ fn hook_answers_while_the_ui_thread_is_blocked_and_unhooks_on_drop() {
         hook.drain().is_empty(),
         "injected keys are never decided on"
     );
-    hook.set_enabled(false);
+    // Focus mode brings the mouse hook (on the hook thread), leaving it removes it.
+    let wait_for = |want: bool| {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while hook.stats().mouse_hook != want && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        hook.stats().mouse_hook == want
+    };
+    assert!(!hook.stats().mouse_hook, "no mouse hook outside focus mode");
     hook.set_focus_mode(true);
+    assert!(hook.stats().focus_mode);
+    assert!(wait_for(true), "mouse hook installed in focus mode");
+    hook.set_focus_mode(false);
+    assert!(wait_for(false), "mouse hook removed when focus mode ends");
+    hook.set_focus_mode(true);
+    assert!(wait_for(true));
+    // Disabling ends focus mode, and with it the mouse hook.
+    hook.set_enabled(false);
     assert!(!hook.stats().enabled && !hook.stats().focus_mode);
+    assert!(wait_for(false));
+    hook.set_focus_mode(true);
+    assert!(!hook.stats().focus_mode, "no focus mode while disabled");
+    hook.set_enabled(true);
+    hook.set_focus_mode(true);
+    assert!(wait_for(true));
+    hook.forget_swallowed();
+    // Dropped below while the mouse hook is in: the thread removes both.
 
     // Dropping unhooks and ends the thread (bounded wait inside the drop).
     drop(guard.hook.take());
@@ -161,6 +187,10 @@ fn hook_answers_while_the_ui_thread_is_blocked_and_unhooks_on_drop() {
     // Installs again (as after a watchdog restart), and goes again.
     guard.hook = Some(KeyHook::start(window, false).expect("hook installs again"));
     assert!(guard.hook.as_ref().unwrap().stats().installed);
+    assert!(
+        !guard.hook.as_ref().unwrap().stats().mouse_hook,
+        "the old mouse hook went with its thread"
+    );
     drop(guard.hook.take());
     assert!(!hook_thread_running());
     drop(guard);

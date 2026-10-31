@@ -287,7 +287,8 @@ Introduced by stage 2, Task 8. A low-level keyboard hook (its own thread, `vitro
 gives the Windows key to Vitrobar: a lone tap opens Vitrobar's Start, Win+1…9 act on the bar's
 apps, Win+T / Win+B put a focus ring on the bar's apps / tray. Every other Windows shortcut
 stays exactly stock. The hook never stores or logs keys (`--debug-state` shows only
-`"keys":{"hook","enabled","focus","calls","max_us"}`). The actions apply to the bar of the
+`"keys":{"hook","enabled","focus","mouse_hook","calls","max_us"}`). While the focus ring
+shows (and only then) a low-level mouse hook is installed too, so any click ends the mode. The actions apply to the bar of the
 monitor showing the foreground window. These steps need a real keyboard: injected keys are
 ignored by the hook by design.
 
@@ -310,8 +311,11 @@ ignored by the hook by design.
    Home/End jump, Enter or Space click the app, the menu key opens the app's menu (Shift and
    the other modifiers end the mode), Tab moves to the tray and back, Esc leaves. Typing any
    other key leaves the mode and the key reaches the app in front (e.g. `a` in an editor);
-   clicking anywhere on the bar or switching apps leaves it too. While the ring shows, the
-   arrows do not reach the app in front.
+   clicking anywhere (on the bar, on the desktop, or inside the app already in front) or
+   switching apps leaves it too, and the very next key reaches the app (`"mouse_hook"` goes
+   back to `false`). Win+←/→ or Win+Tab with the ring showing: Windows snaps / opens Task
+   view and the ring goes. While the ring shows, the arrows do not reach the app in front.
+   With Start (or the tray overflow) open, Win+T closes it and the ring stays on the bar.
 6. Win+B: the ring goes on the first promoted tray icon (or the overflow chevron when none is
    promoted). Enter on an icon is a left click on it, the menu key a right click; Enter on the
    chevron opens the overflow.
@@ -328,6 +332,14 @@ ignored by the hook by design.
    again (`"hook":true` in its dump).
 10. Busy bar: while the bar is busy (e.g. opening All apps the first time) typing in another
     app never lags; with `--debug-state`, `"max_us"` stays in single or low double digits.
+11. Elevated window in front (e.g. Task Manager or a terminal run as administrator): Windows
+    does not pass its keys to a non-elevated hook (UIPI), so the Windows key, Win+1…9,
+    Win+T and Win+B all behave exactly as stock there (the stock Start opens). Switching back
+    to a normal window: Vitrobar handles the Windows key again and no key is stuck.
+12. Win+click: hold the Windows key, click somewhere (the desktop, a window), release the key.
+    The keyboard hook sees no other key, so Vitrobar's Start opens as for a lone tap; compare
+    with stock Windows (setting off) and note any difference. Hold Win, press a mouse button
+    and Win+E as well: Explorer opens, no Start.
 
 ## Safety net
 
