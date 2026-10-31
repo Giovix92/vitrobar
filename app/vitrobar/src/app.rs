@@ -3488,6 +3488,10 @@ impl App {
         }
     }
 
+    /// The foreground window changed. When the panel never got the foreground (activation
+    /// refused), it cannot hear its deactivation: it closes as soon as the foreground moves
+    /// away from the window that had it at open (fallback for carry 12). Getting the
+    /// foreground itself (a click on it) makes it a normal activated panel.
     fn start_foreground_changed(&mut self, fg: Option<Hwnd>) {
         let Some(sp) = self.start.as_mut() else {
             return;
