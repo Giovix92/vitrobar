@@ -10,6 +10,9 @@ vitro-core = { path = "../core" }
 # The `#[interface]` / `#[implement]` macros expand to `windows_core::` paths.
 windows-core = "0.62.2"
 windows = { version = "0.62.2", features = [
+    "Devices_Radios",
+    "Foundation",
+    "Foundation_Collections",
     "UI",
     "UI_ViewManagement",
     "Win32_Devices_Display",
@@ -17,6 +20,8 @@ windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_Media_Audio",
     "Win32_Media_Audio_Endpoints",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_NetworkManagement_WiFi",
     "Win32_Graphics_Dwm",
     "Win32_Globalization",
     "Win32_Graphics_Gdi",

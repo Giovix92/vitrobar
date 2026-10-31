@@ -237,10 +237,10 @@ impl Drop for Brightness {
 }
 
 /// Initialises COM for the thread and uninitialises it (only if it succeeded) on drop.
-struct ComGuard(bool);
+pub(crate) struct ComGuard(bool);
 
 impl ComGuard {
-    fn init() -> Self {
+    pub(crate) fn init() -> Self {
         // SAFETY: worker-thread MTA init, balanced by `CoUninitialize` in Drop on success.
         Self(unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok())
     }
