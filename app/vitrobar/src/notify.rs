@@ -138,6 +138,12 @@ pub fn inbox_pending() -> bool {
     INBOX.with(|i| *i.borrow() != Inbox::default())
 }
 
+/// The keyboard hook has output waiting for the app (`WM_VITRO_KEY` arrived and was not
+/// taken yet).
+pub fn keys_pending() -> bool {
+    INBOX.with(|i| i.borrow().keys)
+}
+
 fn with_inbox(f: impl FnOnce(&mut Inbox)) {
     INBOX.with(|i| f(&mut i.borrow_mut()));
 }

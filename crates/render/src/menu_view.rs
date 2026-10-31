@@ -99,7 +99,11 @@ impl MenuView {
         let text_w = |t: &str| {
             painter
                 .measure(t, FontKind::Text, FONT_DIP)
-                .map_or(t.chars().count() as f32 * FONT_DIP * 0.6, |(w, _)| w.ceil())
+                .map(|(w, _)| w.ceil())
+                .unwrap_or_else(|e| {
+                    eprintln!("vitrobar: could not measure a menu text: {e}");
+                    t.chars().count() as f32 * FONT_DIP * 0.6
+                })
         };
         let lay = layout(entries, &text_w);
         let size_px = (
@@ -223,7 +227,8 @@ impl MenuView {
         )
     }
 
-    /// Whether `client_px` (menu client px) lies inside the menu.
+    /// Whether `client_px` (menu client px) lies inside the menu. Only matters while the mouse
+    /// is captured (the menu then also gets clicks that land outside it).
     pub fn contains_px(&self, client_px: (i32, i32)) -> bool {
         let (l, t, r, b) = self.flyout.rect_px();
         client_px.0 >= 0 && client_px.1 >= 0 && client_px.0 < r - l && client_px.1 < b - t

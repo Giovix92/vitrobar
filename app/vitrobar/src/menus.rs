@@ -6,6 +6,8 @@
 //! Esc, a click anywhere outside it, losing the activation (Alt+Tab, the Win key) or
 //! `WM_QUIT` (which is posted again afterwards).
 
+use std::cell::Cell;
+
 use vitro_core::i18n::{tr, Key, Lang};
 use vitro_core::menu_model::{step, Entry, NavKey};
 use vitro_core::settings::Settings;
@@ -16,15 +18,23 @@ use vitro_render::menu_view::MenuView;
 use vitro_render::panel::{note_deactivated, PANEL_CLASS};
 use vitro_render::surfaces::Painter;
 use vitro_win::power::PowerAction;
+
+use crate::notify::keys_pending;
 use windows::Win32::Foundation::{HWND, LPARAM};
+use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_RETURN, VK_SPACE, VK_UP,
+    ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_DOWN, VK_END,
+    VK_ESCAPE, VK_HOME, VK_RETURN, VK_SPACE, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetClassNameW, GetForegroundWindow, GetMessageW, PostQuitMessage,
-    SetForegroundWindow, TranslateMessage, MSG, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_NCLBUTTONDOWN, WM_NCRBUTTONDOWN, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    SetForegroundWindow, TranslateMessage, EVENT_SYSTEM_FOREGROUND, MSG, WINEVENT_OUTOFCONTEXT,
+    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_NCLBUTTONDOWN,
+    WM_NCRBUTTONDOWN, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSCHAR, WM_SYSCOMMAND, WM_SYSKEYDOWN,
 };
+
+/// `WM_MOUSELEAVE` (it lives in the Controls module, which nothing else here needs).
+const WM_MOUSELEAVE: u32 = 0x02A3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuChoice {
@@ -127,6 +137,69 @@ fn command_id(view: &MenuView, i: Option<usize>) -> Option<u32> {
     }
 }
 
+thread_local! {
+    /// The open menu's window and whether the foreground moved away from it (set by
+    /// [`on_foreground`]).
+    static FG: Cell<(isize, bool)> = const { Cell::new((0, false)) };
+}
+
+unsafe extern "system" fn on_foreground(
+    _: HWINEVENTHOOK,
+    _: u32,
+    hwnd: HWND,
+    _: i32,
+    _: i32,
+    _: u32,
+    _: u32,
+) {
+    FG.with(|f| {
+        let (me, _) = f.get();
+        if hwnd.0 as isize != me {
+            f.set((me, true));
+        }
+    });
+}
+
+/// Watches the foreground for the menu's lifetime (a menu that could not take it would
+/// otherwise never hear that the user went elsewhere); unhooked on drop.
+struct ForegroundWatch(HWINEVENTHOOK);
+
+impl ForegroundWatch {
+    fn new(me: HWND) -> Self {
+        FG.with(|f| f.set((me.0 as isize, false)));
+        // SAFETY: an out-of-context hook with a static callback; it is delivered through
+        // this thread's message loop and removed in Drop.
+        Self(unsafe {
+            SetWinEventHook(
+                EVENT_SYSTEM_FOREGROUND,
+                EVENT_SYSTEM_FOREGROUND,
+                None,
+                Some(on_foreground),
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT,
+            )
+        })
+    }
+
+    /// The foreground moved to another window since the watch began.
+    fn moved(&self) -> bool {
+        FG.with(|f| f.get().1)
+    }
+}
+
+impl Drop for ForegroundWatch {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            // SAFETY: unhooks the hook this value created.
+            unsafe {
+                let _ = UnhookWinEvent(self.0);
+            }
+        }
+        FG.with(|f| f.set((0, false)));
+    }
+}
+
 /// Shows `entries` at `at` (screen px) and runs the menu until it ends: the chosen command's
 /// id, or 0 when it was dismissed. `owner` is the window the menu belongs to; a panel (Start)
 /// gets the foreground back afterwards.
@@ -149,6 +222,8 @@ fn run(owner: HWND, ctx: &MenuCtx, at: (i32, i32), entries: &[Entry]) -> u32 {
             let _ = SetCapture(me);
         }
     }
+    let watch = ForegroundWatch::new(me);
+    let (mut tracking, mut mouse_hot) = (false, false);
     let mut quit = None;
     let mut msg = MSG::default();
     let picked = loop {
@@ -164,9 +239,30 @@ fn run(owner: HWND, ctx: &MenuCtx, at: (i32, i32), entries: &[Entry]) -> u32 {
         if msg.hwnd == me {
             match msg.message {
                 WM_MOUSEMOVE => {
+                    if !tracking {
+                        let mut t = TRACKMOUSEEVENT {
+                            cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                            dwFlags: TME_LEAVE,
+                            hwndTrack: me,
+                            dwHoverTime: 0,
+                        };
+                        // SAFETY: `t` is a sized local.
+                        tracking = unsafe { TrackMouseEvent(&mut t) }.is_ok();
+                    }
+                    mouse_hot = true;
                     let hot = view.hit_px(client_pt(msg.lParam));
                     let _ = view.set_hot(hot);
                 }
+                WM_MOUSELEAVE => {
+                    tracking = false;
+                    if mouse_hot {
+                        mouse_hot = false;
+                        let _ = view.set_hot(None);
+                    }
+                }
+                // Alt (and so Alt+F4) dismisses; the system never handles these on the menu.
+                WM_SYSKEYDOWN => break 0,
+                WM_SYSCHAR | WM_SYSCOMMAND => {}
                 WM_LBUTTONUP | WM_RBUTTONUP => {
                     if let Some(id) = command_id(&view, view.hit_px(client_pt(msg.lParam))) {
                         break id;
@@ -189,6 +285,7 @@ fn run(owner: HWND, ctx: &MenuCtx, at: (i32, i32), entries: &[Entry]) -> u32 {
                     .find(|(k, _)| *k == key)
                     .map(|(_, n)| *n);
                     if let Some(n) = nav {
+                        mouse_hot = false;
                         let next = step(view.entries(), view.hot(), n);
                         let _ = view.set_hot(next);
                     } else if key == VK_ESCAPE.0 {
@@ -227,10 +324,16 @@ fn run(owner: HWND, ctx: &MenuCtx, at: (i32, i32), entries: &[Entry]) -> u32 {
         }
         // A click elsewhere, Alt+Tab, the Win key. Only our own entry is taken: the overflow
         // flyout's deactivation stays queued for the app.
-        if take_deactivated_of(me) {
+        if take_deactivated_of(me) || watch.moved() {
+            break 0;
+        }
+        // The Win key: the hook swallowed it and left it for the app, which handles it
+        // once the menu is gone (the hook gives up on a stalled UI after 500 ms).
+        if keys_pending() {
             break 0;
         }
     };
+    drop(watch);
     // SAFETY: plain calls on windows of this process.
     unsafe {
         if captured {
