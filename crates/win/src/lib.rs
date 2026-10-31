@@ -21,6 +21,6 @@ pub mod stock_taskbar;
 pub mod system_theme;
 pub mod time_format;
 pub mod tray_host;
-pub mod window_props;
 pub mod wifi;
+pub mod window_props;
 pub mod window_tracker;

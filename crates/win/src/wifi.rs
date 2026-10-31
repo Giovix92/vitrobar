@@ -23,13 +23,13 @@ use std::time::{Duration, Instant};
 use windows::core::{Result, GUID, PCWSTR};
 use windows::Devices::Radios::{Radio, RadioAccessStatus, RadioKind, RadioState};
 use windows::Foundation::TypedEventHandler;
-use windows::Win32::Foundation::{ERROR_NOT_FOUND, HANDLE, HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_NOT_FOUND, HANDLE, HWND, LPARAM, WPARAM};
 use windows::Win32::NetworkManagement::WiFi::{
     dot11_BSS_type_infrastructure, wlan_connection_mode_profile, wlan_interface_state_connected,
     wlan_intf_opcode_current_connection, WlanCloseHandle, WlanConnect, WlanDeleteProfile, WlanDisconnect,
     WlanEnumInterfaces, WlanFreeMemory, WlanGetAvailableNetworkList, WlanOpenHandle, WlanQueryInterface,
     WlanRegisterNotification, WlanScan, WlanSetProfile, DOT11_SSID, L2_NOTIFICATION_DATA,
-    WLAN_AVAILABLE_NETWORK_HAS_PROFILE, WLAN_AVAILABLE_NETWORK_LIST, WLAN_CONNECTION_ATTRIBUTES,
+    WLAN_AVAILABLE_NETWORK, WLAN_AVAILABLE_NETWORK_HAS_PROFILE, WLAN_AVAILABLE_NETWORK_LIST, WLAN_CONNECTION_ATTRIBUTES,
     WLAN_CONNECTION_PARAMETERS, WLAN_INTERFACE_INFO_LIST, WLAN_NOTIFICATION_SOURCES,
     WLAN_NOTIFICATION_SOURCE_ACM, WLAN_NOTIFICATION_SOURCE_MSM,
 };
@@ -180,20 +180,19 @@ pub fn arrange(nets: Vec<Network>, connected: Option<&str>) -> Vec<Network> {
 
 /// Maps a `DOT11_AUTH_ALGORITHM` value to how the network is joined and whether it is
 /// WPA3-SAE. Only open and personal networks can be joined here; everything else (802.1X,
-/// WEP, OWE, unknown) is [`NetKind::Enterprise`], i.e. handed to Windows.
+/// WEP, OWE, legacy WPA-PSK/TKIP, unknown) is [`NetKind::Enterprise`], i.e. handed to Windows.
 pub fn classify_auth(auth: i32, secured: bool) -> (NetKind, bool) {
     match auth {
         1 if !secured => (NetKind::Open, false),
-        4 | 7 => (NetKind::Psk, false),
+        7 => (NetKind::Psk, false),
         9 => (NetKind::Psk, true),
         _ => (NetKind::Enterprise, false),
     }
 }
 
-/// A WPA passphrase: 8..=63 characters, no control characters (which XML cannot carry).
+/// A WPA passphrase: 8..=63 ASCII bytes, no control characters (which XML cannot carry).
 pub fn password_ok(p: &str) -> bool {
-    let n = p.chars().count();
-    (8..=63).contains(&n) && !p.chars().any(|c| c.is_control())
+    p.is_ascii() && (8..=63).contains(&p.len()) && !p.chars().any(|c| c.is_control())
 }
 
 // ---- service ----------------------------------------------------------------------------------
@@ -207,11 +206,13 @@ pub enum Change {
     Radio,
     /// A connection attempt to this SSID failed (wrong passphrase, out of range...).
     ConnectFailed(String),
-    /// A radio change failed.
+    /// A radio change failed, or a connect that used a profile Vitrobar did not create failed
+    /// ([`WifiError::HandOff`]: open Windows' Wi-Fi settings).
     Error(WifiError),
 }
 
-/// A scan that never reports back stops showing as scanning after this long.
+/// A scan that never reports back stops counting as scanning after this long (see
+/// [`Wifi::scan_deadline`]).
 const SCAN_TIMEOUT: Duration = Duration::from_secs(12);
 
 struct Shared {
@@ -225,6 +226,8 @@ struct Shared {
     sae: Mutex<HashSet<String>>,
     /// Profile created by the last connect to a new network (removed again if it fails).
     created: Mutex<Option<String>>,
+    /// SSID being connected through a profile that already existed (not ours: never touched).
+    foreign: Mutex<Option<String>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -265,6 +268,8 @@ const ACM_SCAN_COMPLETE: u32 = 7;
 const ACM_SCAN_FAIL: u32 = 8;
 const ACM_CONNECTION_COMPLETE: u32 = 10;
 const ACM_CONNECTION_ATTEMPT_FAIL: u32 = 11;
+// MSM notification code (WLAN_NOTIFICATION_MSM) for signal-quality changes.
+const MSM_SIGNAL_QUALITY_CHANGE: u32 = 8;
 
 /// `WLAN_CONNECTION_NOTIFICATION_DATA` (wlanapi.h), the `pData` of the connection codes.
 #[repr(C)]
@@ -284,19 +289,41 @@ unsafe extern "system" fn on_notification(data: *mut L2_NOTIFICATION_DATA, ctx: 
     // SAFETY: `ctx` is the `Shared` kept alive by `Wifi` until the callback is unregistered;
     // `data` is valid for the duration of the call.
     let (shared, d) = unsafe { (&*(ctx as *const Shared), &*data) };
-    if d.NotificationSource == WLAN_NOTIFICATION_SOURCE_ACM {
+    if d.NotificationSource == WLAN_NOTIFICATION_SOURCE_MSM {
+        // Signal-quality changes arrive about every second while connected and change nothing
+        // the panel shows between scans.
+        if d.NotificationCode as u32 == MSM_SIGNAL_QUALITY_CHANGE {
+            return;
+        }
+    } else if d.NotificationSource == WLAN_NOTIFICATION_SOURCE_ACM {
         match d.NotificationCode as u32 {
             ACM_SCAN_COMPLETE | ACM_SCAN_FAIL => {
                 *lock(&shared.scanning) = None;
             }
-            ACM_CONNECTION_COMPLETE | ACM_CONNECTION_ATTEMPT_FAIL
+            ACM_CONNECTION_COMPLETE | ACM_CONNECTION_ATTEMPT_FAIL => {
+                let failed_code = d.NotificationCode as u32 == ACM_CONNECTION_ATTEMPT_FAIL;
                 if !d.pData.is_null()
-                    && d.dwDataSize as usize >= std::mem::size_of::<ConnectionNotification>() =>
-            {
-                // SAFETY: size checked above; the structure is plain data.
-                let c = unsafe { std::ptr::read_unaligned(d.pData as *const ConnectionNotification) };
-                if c.reason != 0 || d.NotificationCode as u32 == ACM_CONNECTION_ATTEMPT_FAIL {
-                    shared.wake(Change::ConnectFailed(ssid_string(&c.ssid)));
+                    && d.dwDataSize as usize >= std::mem::size_of::<ConnectionNotification>()
+                {
+                    // SAFETY: size checked above; the structure is plain data.
+                    let c = unsafe { std::ptr::read_unaligned(d.pData as *const ConnectionNotification) };
+                    let ssid = ssid_lossy(&c.ssid);
+                    if c.reason != 0 || failed_code {
+                        shared.wake(Change::ConnectFailed(ssid));
+                    } else {
+                        // Connected: the profile we created is the user's now, keep it.
+                        let mut created = lock(&shared.created);
+                        if created.as_deref() == Some(ssid.as_str()) {
+                            created.take();
+                        }
+                        let mut foreign = lock(&shared.foreign);
+                        if foreign.as_deref() == Some(ssid.as_str()) {
+                            foreign.take();
+                        }
+                    }
+                } else if failed_code {
+                    // No usable payload: the empty SSID means "the attempt we started".
+                    shared.wake(Change::ConnectFailed(String::new()));
                 }
             }
             _ => {}
@@ -335,6 +362,7 @@ impl Wifi {
             radio_on: Mutex::new(None),
             sae: Mutex::new(HashSet::new()),
             created: Mutex::new(None),
+            foreign: Mutex::new(None),
         });
         let ctx = Arc::into_raw(shared.clone());
         // SAFETY: `ctx` stays valid until `Drop` unregisters the callback and then releases it.
@@ -366,21 +394,36 @@ impl Wifi {
     }
 
     /// Takes the queued changes (an empty result means a forged or already-handled wake-up).
-    /// A failed connection to a network we just created a profile for removes that profile.
+    /// A failed attempt removes the profile *this service* created for it (never any other);
+    /// a failed attempt through a pre-existing profile adds `Error(HandOff)`.
     pub fn drain_changes(&self) -> Vec<Change> {
-        let changes = self.shared.queue.drain();
+        let mut changes = self.shared.queue.drain();
+        let mut extra = Vec::new();
         for c in &changes {
             if let Change::ConnectFailed(ssid) = c {
                 let mut created = lock(&self.shared.created);
-                if created.as_deref() == Some(ssid.as_str()) {
-                    created.take();
-                    let name = wide(ssid);
-                    // SAFETY: deletes the profile this service created for the failed attempt.
-                    let _ = unsafe { WlanDeleteProfile(self.handle, &self.guid, PCWSTR(name.as_ptr()), None) };
+                if created.as_deref().is_some_and(|n| ssid.is_empty() || n == ssid) {
+                    if let Some(name) = created.take() {
+                        self.delete_profile(&name);
+                    }
+                }
+                drop(created);
+                let mut foreign = lock(&self.shared.foreign);
+                if foreign.as_deref().is_some_and(|n| ssid.is_empty() || n == ssid) {
+                    foreign.take();
+                    extra.push(Change::Error(WifiError::HandOff));
                 }
             }
         }
+        changes.extend(extra);
         changes
+    }
+
+    /// Deletes a profile this service created.
+    fn delete_profile(&self, name: &str) {
+        let w = wide(name);
+        // SAFETY: NUL-terminated name; the profile was created by this service.
+        let _ = unsafe { WlanDeleteProfile(self.handle, &self.guid, PCWSTR(w.as_ptr()), None) };
     }
 
     /// The current state, read from the WLAN service's cache (no scan, no radio traffic).
@@ -402,13 +445,23 @@ impl Wifi {
         }
     }
 
-    /// Asks Windows to scan; completion arrives as a [`Change::Networks`] wake-up.
+    /// Asks Windows to scan; completion arrives as a [`Change::Networks`] wake-up. The flag is
+    /// set before the call (the completion can arrive before it returns) and cleared if the
+    /// call fails.
     pub fn scan(&self) {
+        *lock(&self.shared.scanning) = Some(Instant::now());
         // SAFETY: plain call with the open handle; returns at once.
         let rc = unsafe { WlanScan(self.handle, &self.guid, None, None, None) };
-        if rc == 0 {
-            *lock(&self.shared.scanning) = Some(Instant::now());
+        if rc != 0 {
+            *lock(&self.shared.scanning) = None;
         }
+    }
+
+    /// When a pending scan stops counting as scanning, if one is pending. The panel arms one
+    /// one-shot timer for this instant and re-reads [`Wifi::snapshot`] then, so a scan that
+    /// never reports back does not leave the spinner on.
+    pub fn scan_deadline(&self) -> Option<Instant> {
+        (*lock(&self.shared.scanning)).map(|t| t + SCAN_TIMEOUT)
     }
 
     /// Switches the Wi-Fi radio on a worker; the outcome is a [`Change::Radio`] or
@@ -431,7 +484,6 @@ impl Wifi {
         if entry.known {
             return self.start_connect(&entry.profile);
         }
-        let sae = lock(&self.shared.sae).contains(ssid);
         let (auth, pw) = match entry.kind {
             NetKind::Enterprise => return Err(WifiError::HandOff),
             NetKind::Open => (Auth::Open, ""),
@@ -440,15 +492,34 @@ impl Wifi {
                 if !password_ok(p) {
                     return Err(WifiError::BadPassword);
                 }
-                (if sae { Auth::Wpa3Sae } else { Auth::Wpa2Psk }, p)
+                (if entry.sae { Auth::Wpa3Sae } else { Auth::Wpa2Psk }, p)
             }
         };
-        let xml = wide(&profile_xml(ssid, pw, auth));
+        // An earlier attempt of ours that never finished is replaced; a profile of another
+        // network that we created is dropped (unless it is the connected one).
+        {
+            let mut created = lock(&self.shared.created);
+            if let Some(old) = created.take() {
+                if old == ssid || self.connected_ssid().as_deref() != Some(old.as_str()) {
+                    self.delete_profile(&old);
+                }
+            }
+        }
+        let mut xml = wide(&profile_xml(ssid, pw, auth));
         let mut reason = 0u32;
-        // SAFETY: NUL-terminated UTF-16 profile; user scope (flag 2), replacing a stale one.
+        // SAFETY: NUL-terminated UTF-16 profile, user scope (flag 2), never overwriting.
         let rc = unsafe {
-            WlanSetProfile(self.handle, &self.guid, 2, PCWSTR(xml.as_ptr()), PCWSTR::null(), true, None, &mut reason)
+            WlanSetProfile(self.handle, &self.guid, 2, PCWSTR(xml.as_ptr()), PCWSTR::null(), false, None, &mut reason)
         };
+        wipe_u16(&mut xml);
+        if rc == ERROR_ALREADY_EXISTS.0 {
+            // Somebody else's profile of that name: use it as it is, and hand off if it fails.
+            *lock(&self.shared.foreign) = Some(ssid.to_string());
+            return self.start_connect(ssid).map_err(|_| {
+                lock(&self.shared.foreign).take();
+                WifiError::HandOff
+            });
+        }
         if rc != 0 {
             return Err(WifiError::Failed);
         }
@@ -501,7 +572,8 @@ impl Wifi {
         // SAFETY: a successful query returns a WLAN_CONNECTION_ATTRIBUTES.
         let attrs = unsafe { &*(data as *const WLAN_CONNECTION_ATTRIBUTES) };
         let out = (attrs.isState == wlan_interface_state_connected)
-            .then(|| ssid_string(&attrs.wlanAssociationAttributes.dot11Ssid));
+            .then(|| ssid_string(&attrs.wlanAssociationAttributes.dot11Ssid))
+            .flatten();
         // SAFETY: frees the block returned by the query.
         unsafe { WlanFreeMemory(data) };
         out.filter(|s| !s.is_empty())
@@ -535,23 +607,27 @@ impl Wifi {
         // SAFETY: `dwNumberOfItems` entries follow the header in one allocation.
         let entries = unsafe {
             let l = &*list;
-            std::slice::from_raw_parts(l.Network.as_ptr(), l.dwNumberOfItems as usize)
+            std::slice::from_raw_parts(
+                std::ptr::addr_of!((*list).Network).cast::<WLAN_AVAILABLE_NETWORK>(),
+                l.dwNumberOfItems as usize,
+            )
         };
         let out = entries
             .iter()
-            .map(|n| {
+            .filter_map(|n| {
+                let ssid = ssid_string(&n.dot11Ssid)?;
                 let secured = n.bSecurityEnabled.as_bool();
                 let (kind, sae) = classify_auth(n.dot11DefaultAuthAlgorithm.0, secured);
                 let end = n.strProfileName.iter().position(|&c| c == 0).unwrap_or(256);
-                RawEntry {
-                    ssid: ssid_string(&n.dot11Ssid),
+                Some(RawEntry {
+                    ssid,
                     profile: String::from_utf16_lossy(&n.strProfileName[..end]),
                     signal: n.wlanSignalQuality.min(100) as u8,
                     secured,
                     kind,
                     sae,
                     known: n.dwFlags & WLAN_AVAILABLE_NETWORK_HAS_PROFILE != 0,
-                }
+                })
             })
             .collect();
         // SAFETY: frees the list returned above.
@@ -573,6 +649,10 @@ struct RawEntry {
 impl Drop for Wifi {
     fn drop(&mut self) {
         self.shared.closed.store(true, Ordering::Release);
+        // A connect that never completed leaves no profile of ours behind.
+        if let Some(name) = lock(&self.shared.created).take() {
+            self.delete_profile(&name);
+        }
         // SAFETY: unregistering waits for a running callback to finish, so the context can
         // be released afterwards; the radio worker ends when `jobs` is dropped.
         unsafe {
@@ -596,9 +676,23 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-fn ssid_string(s: &DOT11_SSID) -> String {
+/// The SSID if it is valid UTF-8 (the only kind we can match, hex-encode and show faithfully).
+fn ssid_string(s: &DOT11_SSID) -> Option<String> {
+    let len = (s.uSSIDLength as usize).min(32);
+    std::str::from_utf8(&s.ucSSID[..len]).ok().map(str::to_owned)
+}
+
+fn ssid_lossy(s: &DOT11_SSID) -> String {
     let len = (s.uSSIDLength as usize).min(32);
     String::from_utf8_lossy(&s.ucSSID[..len]).into_owned()
+}
+
+/// Zeroes a buffer that held a passphrase (volatile so it is not optimised away).
+fn wipe_u16(b: &mut [u16]) {
+    for c in b.iter_mut() {
+        // SAFETY: a valid, exclusive element.
+        unsafe { std::ptr::write_volatile(c, 0) };
+    }
 }
 
 fn first_interface(handle: HANDLE) -> Option<GUID> {
@@ -740,7 +834,7 @@ mod tests {
         assert_eq!(classify_auth(1, false), (NetKind::Open, false));
         assert_eq!(classify_auth(1, true), (NetKind::Enterprise, false), "WEP-like");
         assert_eq!(classify_auth(7, true), (NetKind::Psk, false));
-        assert_eq!(classify_auth(4, true), (NetKind::Psk, false));
+        assert_eq!(classify_auth(4, true), (NetKind::Enterprise, false), "legacy WPA/TKIP handed off");
         assert_eq!(classify_auth(9, true), (NetKind::Psk, true), "SAE");
         assert_eq!(classify_auth(6, true), (NetKind::Enterprise, false));
         assert_eq!(classify_auth(10, true), (NetKind::Enterprise, false), "OWE handed off");
@@ -764,5 +858,6 @@ mod tests {
         assert!(password_ok(&"a".repeat(63)));
         assert!(!password_ok(&"a".repeat(64)));
         assert!(!password_ok("pass\nword1"));
+        assert!(!password_ok("pässwörd12"), "non-ASCII");
     }
 }
