@@ -83,6 +83,7 @@ use windows::core::{Error, Result, BOOL};
 use windows::Win32::Foundation::{
     E_FAIL, HANDLE, HWND, LPARAM, WAIT_FAILED, WAIT_OBJECT_0, WPARAM,
 };
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::Console::{
     SetConsoleCtrlHandler, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
@@ -94,8 +95,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetCursorPos, GetForegroundWindow, GetMessagePos, GetWindowLongPtrW,
-    GetWindowThreadProcessId, IsWindow, KillTimer, MsgWaitForMultipleObjectsEx, PeekMessageW,
-    PostMessageW, PostQuitMessage, PostThreadMessageW, SetForegroundWindow, SetTimer,
+    GetWindowThreadProcessId, IsWindow, IsWindowVisible, KillTimer, MsgWaitForMultipleObjectsEx,
+    PeekMessageW, PostMessageW, PostQuitMessage, PostThreadMessageW, SetForegroundWindow, SetTimer,
     TranslateMessage, GWL_EXSTYLE, MSG, MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT, WM_CHAR,
     WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE,
     WM_MOUSEWHEEL, WM_NULL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WS_EX_TOPMOST,
@@ -367,21 +368,21 @@ fn foreground() -> Option<Hwnd> {
     (!h.0.is_null()).then_some(h.0 as usize as Hwnd)
 }
 
-/// A panel that fades out must not keep the keyboard: if it is the foreground window, hands
-/// the foreground back to the window that had it before Start opened. False when it cannot
-/// (that window is gone, or Windows refuses): the caller then drops the panel at once, so
-/// Windows picks the next window.
-fn give_back_foreground(sp: &StartPanel) -> bool {
-    // SAFETY: plain queries and a foreground request for a window handle we only test.
+/// Whether `h` can be handed the foreground: a live, visible, uncloaked window.
+fn can_take_foreground(h: HWND) -> bool {
+    // SAFETY: plain queries; the attribute value is a local whose size is passed alongside.
     unsafe {
-        if GetForegroundWindow() != sp.hwnd() {
-            return true;
+        if h.0.is_null() || !IsWindow(Some(h)).as_bool() || !IsWindowVisible(h).as_bool() {
+            return false;
         }
-        let prev = HWND(sp.fg_at_open as *mut _);
-        sp.fg_at_open != 0
-            && IsWindow(Some(prev)).as_bool()
-            && SetForegroundWindow(prev).as_bool()
-            && GetForegroundWindow() != sp.hwnd()
+        let mut cloaked = 0u32;
+        let ok = DwmGetWindowAttribute(
+            h,
+            DWMWA_CLOAKED,
+            &mut cloaked as *mut u32 as *mut _,
+            size_of::<u32>() as u32,
+        );
+        ok.is_err() || cloaked == 0
     }
 }
 
@@ -579,6 +580,8 @@ struct App {
     /// The Start panel that is fading out (no longer `start`: it takes no input). Dropped by
     /// `TIMER_START_CLOSED`, by the next `open_start` or by any close that must be immediate.
     start_closing: Option<StartPanel>,
+    /// When `TIMER_START_CLOSED` may drop `start_closing`.
+    start_closing_until: Instant,
     /// What the Start panel shows, cached across opens, and its worker threads.
     start_data: StartData,
     /// The open settings window (its visuals and window go before the compositor and GPU).
@@ -705,6 +708,7 @@ impl App {
             strip: None,
             start: None,
             start_closing: None,
+            start_closing_until: Instant::now(),
             start_data: StartData::new(),
             settings_win: None,
             monitors,
@@ -1765,8 +1769,12 @@ impl App {
                 self.show_tooltip();
             }
             TIMER_START_CLOSED => {
-                self.kill_timer(TIMER_START_CLOSED);
-                self.drop_start_closing();
+                // A timer of an earlier panel, queued before it was re-armed, is not this
+                // panel's: only the deadline of the panel now fading counts.
+                if Instant::now() >= self.start_closing_until {
+                    self.kill_timer(TIMER_START_CLOSED);
+                    self.drop_start_closing();
+                }
             }
             TIMER_START_PREFETCH => {
                 self.kill_timer(TIMER_START_PREFETCH);
@@ -3126,6 +3134,27 @@ impl App {
         self.close_start_as(true)
     }
 
+    /// A closing panel must not keep the keyboard: if it is the foreground window, hands the
+    /// foreground back to the window that had it before Start opened, so keys typed right
+    /// after Esc / the Win key / the Start button reach it (animated close or not). False
+    /// when it cannot (that window is gone, hidden, cloaked, Explorer's hidden taskbar, or
+    /// Windows refuses): the caller then drops the panel at once, so Windows picks the next
+    /// window.
+    fn hand_back_foreground(&self, sp: &StartPanel) -> bool {
+        // SAFETY: plain queries and a foreground request for a window we only test.
+        unsafe {
+            if GetForegroundWindow() != sp.hwnd() {
+                return true;
+            }
+            let prev = HWND(sp.fg_at_open as *mut _);
+            sp.fg_at_open != 0
+                && !self.stock.watches(sp.fg_at_open as u64)
+                && can_take_foreground(prev)
+                && SetForegroundWindow(prev).as_bool()
+                && GetForegroundWindow() != sp.hwnd()
+        }
+    }
+
     /// [`Self::close_start`] without the animation, for when the panel cannot be kept
     /// (monitor, theme or device change, Explorer restart): the window goes now, along with
     /// any panel still fading.
@@ -3143,7 +3172,8 @@ impl App {
         let srcs = sp.icon_srcs.clone();
         // The next panel's query revisions continue after this one's.
         self.start_data.last_rev = self.start_data.last_rev.max(sp.state.query_rev);
-        if animate && self.sys.animations && give_back_foreground(&sp) {
+        let handed_back = !animate || self.hand_back_foreground(&sp);
+        if animate && self.sys.animations && handed_back {
             let (ms, motion) = if sp.state.grid {
                 (GRID_CLOSE_MS, Motion::Grow)
             } else {
@@ -3157,6 +3187,8 @@ impl App {
             match sp.animate_close(ms, motion) {
                 Ok(()) => {
                     self.start_closing = Some(sp);
+                    self.start_closing_until = Instant::now()
+                        + Duration::from_millis(u64::from(ms + START_CLOSED_SLACK_MS));
                     // SAFETY: one-shot timer on our own window (killed when it fires).
                     unsafe {
                         SetTimer(
@@ -3604,6 +3636,9 @@ impl App {
     /// Right-click: the menu of app `app`, or the bar's own menu. Modal.
     fn context_menu(&mut self, app: Option<usize>, dirty: &mut Dirty) {
         self.reset_interaction();
+        // The menu runs its own loop: a panel still fading would sit over Start's area
+        // (hit-testable) for as long as the menu is up.
+        self.drop_start_closing();
         dirty.visuals = true;
         let lang = ui_lang(&self.settings);
         let (owner, pt) = (self.notify.hwnd, self.msg_pt);

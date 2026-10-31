@@ -29,6 +29,8 @@ Also check while you are here:
   Quick Settings, the clock opens the notification centre and calendar.
 - Click the Quick Settings button twice: it opens then closes; same for the clock; Quick
   Settings then the clock switches to the notification centre.
+- On a Quick Settings sub-page (Wi-Fi list, volume mixer) a second click may go back a page
+  instead of closing: note which.
 - An icon that takes long to load shows a soft rounded placeholder first; the bar never
   freezes while icons load.
 - An app asking for attention (e.g. a chat app flashing) gets an accent plate that pulses
@@ -323,6 +325,9 @@ Stage 2.5 (animation):
 - Close Start with Esc and type at once: the keys reach the app you were in.
 - Open and close Start very fast (double-tap Win, or close it while still opening): no jump,
   never two panels, never an invisible panel holding the keyboard.
+- Launch an app from Start: it comes to the front (not behind the previous window).
+- With Start open, right-click the bar, then click where Start was: the click reaches what is
+  underneath.
 
 ## Keyboard
 
