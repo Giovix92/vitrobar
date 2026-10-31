@@ -41,6 +41,7 @@ use vitro_core::key_hook::HookOutput;
 use vitro_core::layout::{compute_layout, diff_monitors, metrics, BarLayout, LayoutInput, Rect};
 use vitro_core::search::ResultKind;
 use vitro_core::settings::{self, Pin, Position, Settings, StartStyle, ThemeChoice};
+use vitro_core::settings_ui::ControlId;
 use vitro_core::start_layout::{panel_layout, place_panel};
 use vitro_core::style::{hover_style, material_style, HoverStyle, MaterialStyle, Rgba, Theme};
 use vitro_core::tray_model::{split_promoted, TrayIcon};
@@ -54,7 +55,10 @@ use vitro_render::bar_visual::{
 use vitro_render::compositor::{init_compositor, Comp};
 use vitro_render::device::{create_gpu_device, GpuDevice};
 use vitro_render::flyout::{live_thumbnails, take_deactivated, Flyout, ThumbnailStrip};
-use vitro_render::panel::take_panel_deactivated;
+use vitro_render::panel::{
+    take_panel_close_requests, take_panel_deactivated, take_panel_dpi_changes,
+};
+use vitro_render::settings_view::{SettingsLook, WINDOW_H_DIP, WINDOW_W_DIP};
 use vitro_render::surfaces::{FontKind, Painter};
 use vitro_render::tray_flyout::{grid_layout, Tooltip, TrayGrid};
 use vitro_win::appbar::{is_fullscreen_on_rect, reserved_rect, AppBar};
@@ -81,11 +85,11 @@ use windows::Win32::System::Console::{
 use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetDoubleClickTime, GetKeyState, VK_CONTROL, VK_ESCAPE, VK_F4, VK_MENU,
+    GetDoubleClickTime, GetKeyState, VK_CONTROL, VK_ESCAPE, VK_F4, VK_MENU, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetForegroundWindow, GetMessagePos, GetWindowThreadProcessId, IsWindow,
-    KillTimer, MsgWaitForMultipleObjectsEx, PeekMessageW, PostMessageW, PostQuitMessage,
+    DispatchMessageW, GetCursorPos, GetForegroundWindow, GetMessagePos, GetWindowThreadProcessId,
+    IsWindow, KillTimer, MsgWaitForMultipleObjectsEx, PeekMessageW, PostMessageW, PostQuitMessage,
     PostThreadMessageW, SetTimer, TranslateMessage, MSG, MWMO_INPUTAVAILABLE, PM_REMOVE,
     QS_ALLINPUT, WM_CHAR, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
     WM_NULL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
@@ -105,6 +109,7 @@ use crate::notify::{
     inbox_pending, take_inbox, Inbox, NotifyWindow, TIMER_CLOCK, TIMER_GPU_RETRY, TIMER_HOVER_HIDE,
     TIMER_HOVER_SHOW, TIMER_MARGIN_COLLAPSE, TIMER_REASSERT, TIMER_TRAY_TIP, WM_APP_TAKE_OVER,
 };
+use crate::settings_window::{apply_choice, Effect, SettingsAction, SettingsInput, SettingsWindow};
 use crate::shell::{self, StockGuard};
 use crate::start::{
     launch_job, same_app, Look, MenuItem, StartAction, StartData, StartInput, StartPanel,
@@ -541,6 +546,8 @@ struct App {
     start: Option<StartPanel>,
     /// What the Start panel shows, cached across opens, and its worker threads.
     start_data: StartData,
+    /// The open settings window (its visuals and window go before the compositor and GPU).
+    settings_win: Option<SettingsWindow>,
     /// One per monitor, in [`current_monitors`] order: the first carries the tray area.
     monitors: Vec<MonitorBar>,
     tracker: WindowTracker,
@@ -656,6 +663,7 @@ impl App {
             strip: None,
             start: None,
             start_data: StartData::new(),
+            settings_win: None,
             monitors,
             tracker,
             icons,
@@ -1514,16 +1522,29 @@ impl App {
             .map_or("null".to_string(), |t| (t.hwnd().0 as usize).to_string());
         let st = &self.settings;
         let settings = format!(
-            "{{\"shape\":\"{:?}\",\"material\":\"{:?}\",\"hover\":\"{:?}\",\"icon_size\":\"{:?}\",\"position\":\"{:?}\",\"start_with_windows\":{}}}",
-            st.shape, st.material, st.hover, st.icon_size, st.position, st.start_with_windows
+            "{{\"shape\":\"{:?}\",\"material\":\"{:?}\",\"hover\":\"{:?}\",\"icon_size\":\"{:?}\",\"position\":\"{:?}\",\"start_with_windows\":{},\"theme\":\"{:?}\",\"accent\":{},\"start_style\":\"{:?}\",\"win_key\":{},\"stock_taskbar\":\"{:?}\",\"language\":{}}}",
+            st.shape,
+            st.material,
+            st.hover,
+            st.icon_size,
+            st.position,
+            st.start_with_windows,
+            st.theme,
+            st.accent.map_or("null".to_string(), |a| a.to_string()),
+            st.start_style,
+            st.win_key_opens_start,
+            st.stock_taskbar,
+            st.language.as_deref().map_or("null".to_string(), json_str),
         );
+        let settings_window = self.dump_settings_window();
         let pins: Vec<String> = st.pins.iter().map(|p| json_str(&p.name)).collect();
         let start = self.dump_start();
         let keys = self.keys.dump();
         let dump = format!(
-            "{{\"keys\":{},\"start\":{},\"settings\":{},\"pins\":[{}],\"tray_host\":{},\"chevron\":{},\"tray\":[{}],\"overflow\":{},\"tooltip\":{},\"fullscreen\":{},\"stock_taken\":{},\"appbar\":{},\"hover\":{},\"strip\":{},\"live_thumbnails\":{},\"bars\":[{}],\"groups\":{},\"shown\":{},\"start_button\":{},\"quick\":{},\"clock\":{},\"clock_text\":{},\"more\":{},\"apps\":[{}],\"cur\":{},\"monitors\":[{}]}}",
+            "{{\"keys\":{},\"start\":{},\"settings_window\":{},\"settings\":{},\"pins\":[{}],\"tray_host\":{},\"chevron\":{},\"tray\":[{}],\"overflow\":{},\"tooltip\":{},\"fullscreen\":{},\"stock_taken\":{},\"appbar\":{},\"hover\":{},\"strip\":{},\"live_thumbnails\":{},\"bars\":[{}],\"groups\":{},\"shown\":{},\"start_button\":{},\"quick\":{},\"clock\":{},\"clock_text\":{},\"more\":{},\"apps\":[{}],\"cur\":{},\"monitors\":[{}]}}",
             keys,
             start,
+            settings_window,
             settings,
             pins.join(","),
             tray_host,
@@ -1730,6 +1751,9 @@ impl App {
         self.input_time = msg.time;
         if self.start.as_ref().is_some_and(|s| s.hwnd() == msg.hwnd) {
             return self.on_start_mouse(msg, dirty);
+        }
+        if self.is_settings(msg.hwnd) {
+            return self.on_settings_mouse(msg, dirty);
         }
         if self
             .strip
@@ -2186,6 +2210,10 @@ impl App {
     fn on_key(&mut self, msg: &MSG, dirty: &mut Dirty) -> bool {
         if self.start.as_ref().is_some_and(|s| s.hwnd() == msg.hwnd) {
             self.on_start_key(msg, dirty);
+            return true;
+        }
+        if self.is_settings(msg.hwnd) {
+            self.on_settings_key(msg, dirty);
             return true;
         }
         let ours = self
@@ -2645,7 +2673,6 @@ impl App {
 
     /// `Settings.win_key_opens_start` changed: off, the hook lets every key through and the
     /// focus ring (if any) goes.
-    #[allow(dead_code)] // Called by the settings window (Task 9).
     fn set_win_key(&mut self, on: bool, dirty: &mut Dirty) {
         if let Some(m) = self.keys.set_enabled(on) {
             dirty.bars.insert(m);
@@ -3412,31 +3439,294 @@ impl App {
     }
 
     fn apply_bar_choice(&mut self, choice: MenuChoice, dirty: &mut Dirty) {
-        let s = &mut self.settings;
-        let changed = match choice {
-            MenuChoice::SetShape(v) => std::mem::replace(&mut s.shape, v) != v,
-            MenuChoice::SetMaterial(v) => std::mem::replace(&mut s.material, v) != v,
-            MenuChoice::SetHover(v) => std::mem::replace(&mut s.hover, v) != v,
-            MenuChoice::SetIconSize(v) => std::mem::replace(&mut s.icon_size, v) != v,
-            MenuChoice::SetPosition(v) => std::mem::replace(&mut s.position, v) != v,
+        match choice {
+            MenuChoice::OpenSettings => self.open_settings(),
             MenuChoice::ToggleStartWithWindows => {
-                s.start_with_windows = !s.start_with_windows;
-                apply_autostart(s.start_with_windows);
-                self.save_settings();
-                return;
+                let on = usize::from(!self.settings.start_with_windows);
+                self.apply_setting(ControlId::StartWithWindows, on, dirty);
             }
             MenuChoice::Exit => {
                 // The normal way out: the loop ends and the stock taskbar comes back.
                 // SAFETY: plain call.
                 unsafe { PostQuitMessage(0) };
-                return;
+            }
+            _ => {}
+        }
+    }
+
+    // -----------------------------------------------------------------------------------
+    // The settings window (`settings_window.rs`)
+    // -----------------------------------------------------------------------------------
+
+    /// Opens the settings window centred on the monitor under the cursor; if it is open
+    /// already, brings it to the front.
+    fn open_settings(&mut self) {
+        if let Some(sw) = &self.settings_win {
+            if !sw.focus() {
+                eprintln!("vitrobar: the settings window could not take the foreground");
+            }
+            return;
+        }
+        let mut pt = windows::Win32::Foundation::POINT::default();
+        // SAFETY: out-pointer to a local.
+        let cursor = if unsafe { GetCursorPos(&mut pt) }.is_ok() {
+            (pt.x, pt.y)
+        } else {
+            self.msg_pt
+        };
+        let inside = |m: &MonitorBar| {
+            let (l, t, r, b) = m.info.rect_px;
+            cursor.0 >= l && cursor.0 < r && cursor.1 >= t && cursor.1 < b
+        };
+        let Some(mb) = self
+            .monitors
+            .iter()
+            .find(|m| inside(m))
+            .or_else(|| self.tray_monitor())
+            .or(self.monitors.first())
+        else {
+            return;
+        };
+        let s = mb.scale();
+        let dpi = mb.info.dpi;
+        let (l, t, r, b) = work_area_px(mb.info.rect_px);
+        let w = ((WINDOW_W_DIP * s).round() as i32).min(r - l);
+        let h = ((WINDOW_H_DIP * s).round() as i32).min(b - t);
+        let (x, y) = (l + (r - l - w) / 2, t + (b - t - h) / 2);
+        let lang = ui_lang(&self.settings);
+        match SettingsWindow::open(
+            &self.comp,
+            (x, y, x + w, y + h),
+            dpi,
+            &self.style,
+            tr(lang, Key::VitrobarSettings),
+            &self.settings,
+        ) {
+            Ok(sw) => {
+                self.settings_win = Some(sw);
+                self.settings_render();
+                if let Some(sw) = &self.settings_win {
+                    if !sw.focus() {
+                        eprintln!("vitrobar: the settings window could not take the foreground");
+                    }
+                }
+            }
+            Err(e) => eprintln!("vitrobar: the settings window could not open: {e}"),
+        }
+        if self.opts.debug_state {
+            self.dump_state();
+        }
+    }
+
+    /// Closes the settings window: its visuals, surfaces and window go.
+    fn close_settings(&mut self) {
+        if self.settings_win.take().is_some() && self.opts.debug_state {
+            self.dump_state();
+        }
+    }
+
+    /// The note under the stock-taskbar row when its setting waits for the next start.
+    fn settings_hint(&self) -> Option<(usize, &'static str)> {
+        let sw = self.settings_win.as_ref()?;
+        if self.settings.stock_taskbar == self.stock.mode() {
+            return None;
+        }
+        let i = sw
+            .ctl
+            .model
+            .controls
+            .iter()
+            .position(|c| c.id == ControlId::StockTaskbar)?;
+        Some((i, tr(ui_lang(&self.settings), Key::AppliesNextStart)))
+    }
+
+    /// Redraws the open settings window (only what changed is drawn again).
+    fn settings_render(&mut self) {
+        let hint = self.settings_hint();
+        let lang = ui_lang(&self.settings);
+        let accent = rgb(self.settings.accent.unwrap_or(self.sys.accent));
+        let Some(sw) = self.settings_win.as_mut() else {
+            return;
+        };
+        let look = SettingsLook {
+            style: &self.style,
+            accent,
+            system_accent: rgb(self.sys.accent),
+            lang,
+            title: tr(lang, Key::VitrobarSettings),
+            version: env!("CARGO_PKG_VERSION"),
+            hint,
+        };
+        if let Err(e) = sw.render(&self.painter, &look) {
+            eprintln!("vitrobar: the settings window could not be drawn: {e}");
+            self.close_settings();
+        }
+    }
+
+    /// The settings changed (here or from the bar menu): the open window shows them.
+    fn settings_sync(&mut self) {
+        let Some(sw) = self.settings_win.as_mut() else {
+            return;
+        };
+        sw.ctl.rebuild(&self.settings);
+        self.settings_render();
+    }
+
+    /// Redraws the window's glass for the current style (material, theme).
+    fn settings_restyle(&mut self) {
+        let Some(sw) = self.settings_win.as_mut() else {
+            return;
+        };
+        let (rect, dpi) = (sw.rect_px(), sw.dpi);
+        if let Err(e) = sw.reshape(&self.comp, rect, dpi, &self.style) {
+            eprintln!("vitrobar: the settings window could not be restyled: {e}");
+        }
+    }
+
+    /// Sets control `id` to `choice` and carries the change out at once, as the bar menu
+    /// did: the bars follow (the live preview), the hook, autostart; then saves.
+    fn apply_setting(&mut self, id: ControlId, choice: usize, dirty: &mut Dirty) {
+        let Some(effect) = apply_choice(&mut self.settings, id, choice) else {
+            self.settings_render();
+            return;
+        };
+        self.save_settings();
+        if self.opts.debug_state {
+            eprintln!("vitrobar-setting {id:?} {choice} {effect:?}");
+        }
+        match effect {
+            Effect::Relayout => {
+                self.relayout(dirty);
+                if matches!(id, ControlId::Material | ControlId::Theme) {
+                    self.settings_restyle();
+                }
+            }
+            Effect::WinKey(on) => self.set_win_key(on, dirty),
+            Effect::Autostart(on) => apply_autostart(on),
+            Effect::Language => {
+                let title = tr(ui_lang(&self.settings), Key::VitrobarSettings);
+                if let Some(sw) = &self.settings_win {
+                    sw.set_title(title);
+                }
+            }
+            // The stock taskbar's mode is fixed while it is taken over: the row says so.
+            Effect::NextStart | Effect::Saved => {}
+        }
+        self.settings_sync();
+        if self.opts.debug_state {
+            self.dump_state();
+        }
+    }
+
+    fn settings_input(&mut self, input: SettingsInput, dirty: &mut Dirty) {
+        let Some(sw) = self.settings_win.as_mut() else {
+            return;
+        };
+        match sw.ctl.handle(input) {
+            SettingsAction::None => {}
+            SettingsAction::Redraw => {
+                self.settings_render();
+                if self.opts.debug_state {
+                    self.dump_state();
+                }
+            }
+            SettingsAction::Close => self.close_settings(),
+            SettingsAction::Apply(id, choice) => self.apply_setting(id, choice, dirty),
+            SettingsAction::OpenLink(url) => {
+                if self.opts.debug_state {
+                    eprintln!("vitrobar-settings-link {}", json_str(url));
+                }
+                self.launcher.launch(Job::Open(url.to_string()));
+                self.settings_render();
+            }
+        }
+    }
+
+    fn is_settings(&self, hwnd: HWND) -> bool {
+        self.settings_win.as_ref().is_some_and(|s| s.hwnd() == hwnd)
+    }
+
+    /// Mouse input on the settings window (client px).
+    fn on_settings_mouse(&mut self, msg: &MSG, dirty: &mut Dirty) -> bool {
+        let pt = mouse_pos(msg.lParam);
+        let Some(sw) = self.settings_win.as_mut() else {
+            return false;
+        };
+        let input = match msg.message {
+            WM_MOUSEMOVE => {
+                if !sw.tracking {
+                    track_leave(msg.hwnd);
+                    sw.tracking = true;
+                }
+                SettingsInput::Move(pt)
+            }
+            WM_MOUSELEAVE => {
+                sw.tracking = false;
+                SettingsInput::Leave
+            }
+            WM_LBUTTONDOWN => SettingsInput::Down(pt),
+            WM_LBUTTONUP => SettingsInput::Up(pt),
+            WM_RBUTTONDOWN | WM_RBUTTONUP => return true,
+            _ => return false,
+        };
+        self.settings_input(input, dirty);
+        true
+    }
+
+    /// A key on the settings window.
+    fn on_settings_key(&mut self, msg: &MSG, dirty: &mut Dirty) {
+        // SAFETY: plain query of this thread's keyboard state.
+        let shift = unsafe { GetKeyState(i32::from(VK_SHIFT.0)) } < 0;
+        let vk = msg.wParam.0 as u32;
+        self.settings_input(SettingsInput::Key { vk, shift }, dirty);
+    }
+
+    /// `WM_MOUSEWHEEL` and Alt+F4 on the settings window; false for anything else.
+    fn on_settings_msg(&mut self, msg: &MSG, dirty: &mut Dirty) -> bool {
+        if !self.is_settings(msg.hwnd) {
+            return false;
+        }
+        match msg.message {
+            WM_MOUSEWHEEL => {
+                let delta = ((msg.wParam.0 >> 16) & 0xFFFF) as u16 as i16;
+                self.settings_input(SettingsInput::Wheel(i32::from(delta)), dirty);
+                true
+            }
+            WM_SYSKEYDOWN if msg.wParam.0 == usize::from(VK_F4.0) => {
+                self.close_settings();
+                true
             }
             _ => false,
-        };
-        if changed {
-            self.save_settings();
-            self.relayout(dirty);
         }
+    }
+
+    /// The window moved to a monitor of another DPI: resize it as Windows suggests.
+    fn settings_dpi_changed(&mut self, dpi: u32, rect: PxRect) {
+        let Some(sw) = self.settings_win.as_mut() else {
+            return;
+        };
+        if let Err(e) = sw.reshape(&self.comp, rect, dpi, &self.style) {
+            eprintln!("vitrobar: the settings window could not follow the DPI: {e}");
+        }
+        self.settings_render();
+    }
+
+    /// The `"settings_window"` object of the state dump.
+    fn dump_settings_window(&self) -> String {
+        let Some(sw) = &self.settings_win else {
+            return "null".to_string();
+        };
+        let c = &sw.ctl;
+        format!(
+            "{{\"hwnd\":{},\"rect\":{},\"dpi\":{},\"focus\":\"{:?}\",\"ring\":{},\"scroll\":{},\"hover\":{}}}",
+            sw.hwnd().0 as usize,
+            json_rect(sw.rect_px()),
+            sw.dpi,
+            c.model.controls.get(c.model.focus).map(|x| x.id).unwrap_or(ControlId::Shape),
+            c.keyboard,
+            c.scroll,
+            json_str(&format!("{:?}", c.hover)),
+        )
     }
 
     /// Settings that change how the bar looks took effect: new styles, then the next flush
@@ -3458,6 +3748,7 @@ impl App {
     fn on_device_removed(&mut self, dirty: &mut Dirty) {
         // Its surfaces belonged to the lost device.
         self.close_start();
+        self.close_settings();
         // GPU device removed (TDR, driver update): recreate, then redraw everything.
         self.gpu_lost = true;
         if self.recover_gpu() {
@@ -3515,6 +3806,19 @@ impl App {
         {
             // A click elsewhere or a switch to another app.
             self.close_start();
+        }
+        for h in take_panel_close_requests() {
+            // Alt+F4 through the system menu, or "Close window" on a bar's app menu.
+            if self.is_settings(h) {
+                self.close_settings();
+            } else if self.start.as_ref().is_some_and(|s| s.hwnd() == h) {
+                self.close_start();
+            }
+        }
+        for (h, dpi, rect) in take_panel_dpi_changes() {
+            if self.is_settings(h) {
+                self.settings_dpi_changed(dpi, rect);
+            }
         }
         let deactivated = take_deactivated();
         if self
@@ -3601,6 +3905,8 @@ impl App {
                 redraw = true;
                 // Its glass was made for the old style.
                 self.close_start();
+                self.settings_restyle();
+                self.settings_render();
             }
         }
         if d.clock {
@@ -3661,7 +3967,7 @@ impl Drop for ComGuard {
 }
 
 /// Writes (or removes) the `Run\Vitrobar` value to match the setting.
-/// Used by the menu toggle and the first run only.
+/// Used by the "Start with Windows" switch (window and menu) and the first run only.
 fn apply_autostart(enabled: bool) {
     if let Err(e) = vitro_win::autostart::set_autostart(enabled) {
         eprintln!("vitrobar: could not update \"Start with Windows\": {e}");
@@ -3805,6 +4111,7 @@ pub fn run(opts: Options) -> Result<()> {
                     let _ = TranslateMessage(&msg);
                 },
                 WM_CHAR | WM_SYSKEYDOWN | WM_MOUSEWHEEL if app.on_start_msg(&msg, &mut dirty) => {}
+                WM_SYSKEYDOWN | WM_MOUSEWHEEL if app.on_settings_msg(&msg, &mut dirty) => {}
                 _ => unsafe {
                     let _ = TranslateMessage(&msg);
                     DispatchMessageW(&msg);

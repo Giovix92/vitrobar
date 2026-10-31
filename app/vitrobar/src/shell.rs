@@ -170,6 +170,11 @@ impl StockGuard {
         }
     }
 
+    /// The mode the stock taskbar was (or will be) taken over in; fixed for this run.
+    pub fn mode(&self) -> StockTaskbar {
+        self.mode
+    }
+
     /// The stock taskbar is currently taken over.
     pub fn active(&self) -> bool {
         self.active && !RESTORED.load(Ordering::SeqCst)

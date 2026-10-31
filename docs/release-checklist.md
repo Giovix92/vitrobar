@@ -147,37 +147,55 @@ Automated where safe:
   clicks) driven against `vitrobar.exe --debug-state` (the `tray`, `overflow` and `tooltip`
   fields). Only ever click the test app's own icon: clicks are forwarded to real apps.
 
-## Pins and menus
+## Pins, menus and settings
 
-Introduced by stage 1, Task 13. On the first run (`first-run-done` false) Vitrobar copies the
-stock taskbar's pinned apps (in its order) and its promoted tray icons into `settings.toml`;
-afterwards the right-click menus change settings and pins, saved at once and applied without a
-restart. `VITROBAR_SETTINGS=<file>` makes Vitrobar use another settings file: use it for trial
-runs so the real `%APPDATA%\Vitrobar\settings.toml` stays as it is.
+Introduced by stage 1, Task 13; the settings window by stage 2, Task 9. On the first run
+(`first-run-done` false) Vitrobar copies the stock taskbar's pinned apps (in its order) and its
+promoted tray icons into `settings.toml`; afterwards the settings window, the right-click menus
+and pinning change settings and pins, saved at once and applied without a restart.
+`VITROBAR_SETTINGS=<file>` makes Vitrobar use another settings file: use it for trial runs so
+the real `%APPDATA%\Vitrobar\settings.toml` stays as it is.
 
 1. Delete `%APPDATA%\Vitrobar\settings.toml` and start Vitrobar: the bar shows the same pinned
    apps as the stock taskbar, in the same order (shortcuts in `User Pinned\TaskBar`, shortcuts
    pinned from the Start menu, and packaged apps such as Terminal or Teams). Tray icons shown
    outside the stock overflow are in the bar; the rest are in the overflow.
-2. Right-click the bar outside the apps and tray icons: Shape, Material (Frosted, Smoked,
-   Black, White), Hover effect, Icon size and Position each show a radio check on the current
-   value. Pick each value in turn: the bar changes at once (Islands = three glass windows,
-   Top = the bar and the reserved strip move to the top edge), and the choice is still there
-   after Exit and a new start.
-3. Right-click an app: New window, Pin or Unpin (whichever applies), and Close all windows
+2. Right-click the bar outside the apps and tray icons: "Settings…", a separator, "Start with
+   Windows" (checked when on) and "Exit Vitrobar".
+3. Settings…: a glass window "Vitrobar settings" opens centred on the monitor under the
+   cursor, with the Vitrobar icon and its own button on the bar (and in Alt+Tab). Sections
+   Appearance, Behaviour, Language, About; the page scrolls with the wheel. Drag it by its top
+   band; it minimises from its bar button like any window.
+4. Change Shape, Material, Hover effect, Icon size, Position, Theme and Accent colour one at a
+   time: the bar follows at once (within a frame or two; Islands = three glass windows, Top =
+   the bar and the reserved strip move to the top edge, the accent colours the active-app dot
+   and the focus ring), the window's own glass follows Material and Theme, and every change
+   is in `settings.toml` immediately (no OK / Cancel) and still there after a restart.
+5. Start menu = Full screen: the next Start opens as the full-screen grid. "Windows key opens
+   Vitrobar Start" off: the Windows key opens the stock Start. "Windows taskbar while
+   Vitrobar runs" shows "Applies the next time Vitrobar starts" when changed; restart to see it.
+6. Language = Italiano: the window, its title and the right-click menus switch to Italian at
+   once; "Same as Windows" follows the Windows display language.
+7. Keyboard: Tab / Shift+Tab move a focus ring (the page scrolls to it), Left / Right change a
+   choice or a colour, Space flips a switch, Enter opens License / Source code in the browser,
+   Esc and Alt+F4 close. Settings… again while open brings the open window to the front (one
+   window only).
+8. Right-click an app: New window, Pin or Unpin (whichever applies), and Close all windows
    when it has windows. Pin keeps it on the bar after its windows close; Unpin removes a pinned
    app without windows; New window starts another instance; Close all closes that app's
    windows and no others (try it with Character Map, not with an app holding unsaved work).
-4. Start with Windows toggles its check (the Run entry itself comes with the installer stage).
-5. Exit Vitrobar: the stock taskbar and its tray come back, as with any other clean exit.
-6. With the Windows display language set to Italian the menus are in Italian; `language = "en"`
-   in `settings.toml` overrides it.
+9. Start with Windows (menu or window) toggles `HKCU\...\Run\Vitrobar`; the menu check and
+   the switch agree.
+10. Exit Vitrobar: the stock taskbar and its tray come back, as with any other clean exit.
 
 Automated where safe: `cargo test -p vitro-win --test pins_import -- --nocapture` prints what
-the import would read on this machine (read-only). The menus and their effects were driven
-with keyboard input to Vitrobar's own menu, against `vitrobar.exe --debug-state` with
-`VITROBAR_SETTINGS` pointing at a temporary file (`settings`, `pins`, `bars` and `appbar` in
-the `vitrobar-state` lines; `vitrobar-menu` lines name each choice).
+the import would read on this machine (read-only); the window's controller (clicks, keys,
+effects) is unit-tested in `settings_window.rs` and its view in
+`crates/render/tests/settings_view.rs`. The window was driven with input posted to its own
+handle, against `vitrobar.exe --debug-state` with `VITROBAR_SETTINGS` pointing at a temporary
+file (`settings` and `settings_window` in the `vitrobar-state` lines; `vitrobar-setting` lines
+name each change, `vitrobar-menu` lines each menu choice). "Start with Windows" and the stock
+taskbar mode are verified by unit tests only (a live toggle writes the real Run key).
 
 ## Monitors and desktops
 

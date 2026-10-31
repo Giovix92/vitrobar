@@ -1,2 +1,4 @@
 // 1 = CREATEPROCESS_MANIFEST_RESOURCE_ID, 24 = RT_MANIFEST
 1 24 "vitrobar.exe.manifest"
+// The app icon (the exe, the settings window): LoadIconW(hinstance, MAKEINTRESOURCE(1)).
+1 ICON "vitrobar.ico"

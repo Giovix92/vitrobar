@@ -112,6 +112,7 @@ pub enum Key {
     SourceCode,
     LangEnglish,
     LangItalian,
+    AppliesNextStart,
 }
 
 pub const ALL_KEYS: &[Key] = &[
@@ -209,6 +210,7 @@ pub const ALL_KEYS: &[Key] = &[
     Key::SourceCode,
     Key::LangEnglish,
     Key::LangItalian,
+    Key::AppliesNextStart,
 ];
 
 pub fn tr(lang: Lang, key: Key) -> &'static str {
@@ -401,6 +403,8 @@ pub fn tr(lang: Lang, key: Key) -> &'static str {
         (Lang::It, Key::LangEnglish) => "English",
         (Lang::En, Key::LangItalian) => "Italiano",
         (Lang::It, Key::LangItalian) => "Italiano",
+        (Lang::En, Key::AppliesNextStart) => "Applies the next time Vitrobar starts",
+        (Lang::It, Key::AppliesNextStart) => "Si applica al prossimo avvio di Vitrobar",
     }
 }
 
@@ -421,7 +425,7 @@ mod tests {
             assert!(!tr(Lang::En, k).is_empty());
             assert!(!tr(Lang::It, k).is_empty());
         }
-        assert_eq!(ALL_KEYS.len(), 94);
+        assert_eq!(ALL_KEYS.len(), 95);
     }
     #[test]
     fn italian_differs_from_english() {

@@ -17,11 +17,12 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetForegroundWindow, GetWindowLongPtrW,
-    GetWindowRect, IsWindow, LoadCursorW, RegisterClassExW, SetForegroundWindow, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, GWLP_USERDATA, HTCAPTION, HTCLIENT, HWND_TOPMOST, IDC_ARROW,
-    MA_ACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW, WA_INACTIVE, WM_ACTIVATE, WM_MOUSEACTIVATE,
-    WM_NCHITTEST, WNDCLASSEXW, WS_EX_APPWINDOW, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP,
+    GetWindowRect, IsIconic, IsWindow, LoadCursorW, LoadIconW, RegisterClassExW,
+    SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
+    GWLP_USERDATA, HTCAPTION, HTCLIENT, HWND_TOPMOST, IDC_ARROW, MA_ACTIVATE, SWP_NOACTIVATE,
+    SWP_NOZORDER, SW_RESTORE, SW_SHOW, WA_INACTIVE, WM_ACTIVATE, WM_CLOSE, WM_DPICHANGED,
+    WM_MOUSEACTIVATE, WM_NCHITTEST, WNDCLASSEXW, WS_EX_APPWINDOW, WS_EX_NOREDIRECTIONBITMAP,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::UI::Composition::Desktop::DesktopWindowTarget;
 use windows::UI::Composition::{ContainerVisual, Visual};
@@ -45,10 +46,16 @@ fn register_class() -> Result<()> {
     let registered = (|| -> Result<()> {
         unsafe {
             // SAFETY: plain class registration with a static window procedure.
+            let instance = GetModuleHandleW(None)?;
+            // The exe's icon (resource 1) for the settings window's taskbar button and
+            // Alt+Tab; none (the default) when the exe has no icon (tests).
+            let icon = LoadIconW(Some(instance.into()), PCWSTR(1 as _)).unwrap_or_default();
             let wc = WNDCLASSEXW {
                 cbSize: size_of::<WNDCLASSEXW>() as u32,
                 lpfnWndProc: Some(wndproc),
-                hInstance: GetModuleHandleW(None)?.into(),
+                hInstance: instance.into(),
+                hIcon: icon,
+                hIconSm: icon,
                 hCursor: LoadCursorW(None, IDC_ARROW)?,
                 lpszClassName: w!("VitrobarPanel"),
                 ..Default::default()
@@ -68,12 +75,43 @@ fn register_class() -> Result<()> {
 thread_local! {
     /// Panels that lost activation since the last [`take_panel_deactivated`] (this thread's).
     static PANEL_DEACTIVATED: RefCell<Vec<HWND>> = const { RefCell::new(Vec::new()) };
+    /// Panels asked to close (`WM_CLOSE`: Alt+F4, a taskbar's "Close window") since the last
+    /// [`take_panel_close_requests`].
+    static PANEL_CLOSE: RefCell<Vec<HWND>> = const { RefCell::new(Vec::new()) };
+    /// Panels moved to a monitor of another DPI: (window, new DPI, suggested rect).
+    static PANEL_DPI: RefCell<Vec<(HWND, u32, PxRect)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Drag-band packing in `GWLP_USERDATA`: the band height in px in the low 16 bits, the width
+/// of the band's right end that stays client area (a close button) in the next 16.
+fn pack_drag(height_px: isize, right_px: isize) -> isize {
+    height_px.clamp(0, 0xFFFF) | (right_px.clamp(0, 0xFFFF) << 16)
+}
+
+/// Whether a point `(x, y)` px from the window's top-left corner is in the drag band of a
+/// window `width` px wide, with `packed` from [`pack_drag`].
+fn in_drag_band(packed: isize, width: i32, x: i32, y: i32) -> bool {
+    let height = (packed & 0xFFFF) as i32;
+    let right = ((packed >> 16) & 0xFFFF) as i32;
+    height > 0 && y >= 0 && y < height && x < width - right
 }
 
 /// Panels that were deactivated since the last call: the user clicked elsewhere or
 /// switched apps.
 pub fn take_panel_deactivated() -> Vec<HWND> {
     PANEL_DEACTIVATED.with(|d| std::mem::take(&mut *d.borrow_mut()))
+}
+
+/// Panels that were asked to close since the last call. A panel never destroys itself on
+/// `WM_CLOSE`: its owner drops it (and its visuals) instead.
+pub fn take_panel_close_requests() -> Vec<HWND> {
+    PANEL_CLOSE.with(|d| std::mem::take(&mut *d.borrow_mut()))
+}
+
+/// Panels that moved to a monitor of another DPI since the last call: the window, its new
+/// DPI and the rectangle Windows suggests for it (`WM_DPICHANGED`). The owner resizes it.
+pub fn take_panel_dpi_changes() -> Vec<(HWND, u32, PxRect)> {
+    PANEL_DPI.with(|d| std::mem::take(&mut *d.borrow_mut()))
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -88,16 +126,33 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_NCHITTEST => {
-            // SAFETY: the user data is the drag band height in px, set by `set_drag_height`
-            // (0 when never set); GetWindowRect writes into a local.
-            let drag = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as i32;
+            // SAFETY: the user data is the packed drag band, set by `set_drag_height` /
+            // `set_drag_exclude_right` (0 when never set); GetWindowRect writes into a local.
+            let drag = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) };
             let mut r = RECT::default();
+            let x = (lparam.0 & 0xFFFF) as i16 as i32;
             let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-            if drag > 0 && unsafe { GetWindowRect(hwnd, &mut r) }.is_ok() && y - r.top < drag {
+            if drag != 0
+                && unsafe { GetWindowRect(hwnd, &mut r) }.is_ok()
+                && in_drag_band(drag, r.right - r.left, x - r.left, y - r.top)
+            {
                 LRESULT(HTCAPTION as isize)
             } else {
                 LRESULT(HTCLIENT as isize)
             }
+        }
+        // Never destroyed behind its owner's back: the owner drops the panel.
+        WM_CLOSE => {
+            PANEL_CLOSE.with(|d| d.borrow_mut().push(hwnd));
+            LRESULT(0)
+        }
+        WM_DPICHANGED => {
+            // SAFETY: for WM_DPICHANGED, lParam points to the suggested RECT (documented).
+            let r = unsafe { *(lparam.0 as *const RECT) };
+            let dpi = (wparam.0 & 0xFFFF) as u32;
+            let rect = (r.left, r.top, r.right, r.bottom);
+            PANEL_DPI.with(|d| d.borrow_mut().push((hwnd, dpi, rect)));
+            LRESULT(0)
         }
         // SAFETY: default handling with the arguments we were given.
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
@@ -115,6 +170,8 @@ pub struct Panel {
     scale: f32,
     radius_dip: f32,
     topmost: bool,
+    /// Drag band height and its excluded right end, in DIP (re-applied after a DPI change).
+    drag_dip: (f32, f32),
 }
 
 impl Panel {
@@ -194,6 +251,7 @@ impl Panel {
                 scale,
                 radius_dip,
                 topmost: !app_window,
+                drag_dip: (0.0, 0.0),
             })
         };
         // SAFETY: destroying the window we just created.
@@ -246,12 +304,45 @@ impl Panel {
     }
 
     /// Makes the top `dip` band of the panel a window caption (drag to move). Default 0.
-    pub fn set_drag_height(&self, dip: f32) {
-        let px = (dip.max(0.0) * self.scale).round() as isize;
+    pub fn set_drag_height(&mut self, dip: f32) {
+        self.drag_dip.0 = dip.max(0.0);
+        self.store_drag();
+    }
+
+    /// Keeps the right `dip` of the drag band client area (a close button there hears
+    /// clicks). Default 0.
+    pub fn set_drag_exclude_right(&mut self, dip: f32) {
+        self.drag_dip.1 = dip.max(0.0);
+        self.store_drag();
+    }
+
+    fn store_drag(&self) {
+        let px = |dip: f32| (dip * self.scale).round() as isize;
+        let packed = pack_drag(px(self.drag_dip.0), px(self.drag_dip.1));
         // SAFETY: plain call on our own window; the value is read back by `wndproc`.
         unsafe {
-            SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, px);
+            SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, packed);
         }
+    }
+
+    /// Changes the window text (the taskbar button and Alt+Tab show it).
+    pub fn set_title(&self, title: &str) {
+        let title = HSTRING::from(title);
+        // SAFETY: plain call on our own window; the text is copied.
+        unsafe {
+            let _ = SetWindowTextW(self.hwnd, PCWSTR(title.as_ptr()));
+        }
+    }
+
+    /// Brings a minimised panel back, then [`Panel::activate`]s it.
+    pub fn restore_and_activate(&self) -> bool {
+        // SAFETY: plain call on our own window.
+        unsafe {
+            if IsIconic(self.hwnd).as_bool() {
+                let _ = ShowWindow(self.hwnd, SW_RESTORE);
+            }
+        }
+        self.activate()
     }
 
     /// Shows the panel and makes it the foreground, focused window (it then hears keys, and
@@ -303,6 +394,7 @@ impl Panel {
         self.glass = glass;
         self.rect_px = rect_px;
         self.scale = scale;
+        self.store_drag();
         Ok(())
     }
 }
@@ -315,5 +407,25 @@ impl Drop for Panel {
                 let _ = DestroyWindow(self.hwnd);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drag_band_leaves_the_close_button_to_the_client() {
+        let packed = pack_drag(40, 46);
+        // Inside the band, left of the button.
+        assert!(in_drag_band(packed, 720, 10, 10));
+        assert!(in_drag_band(packed, 720, 673, 39));
+        // The button, and below the band.
+        assert!(!in_drag_band(packed, 720, 674, 10));
+        assert!(!in_drag_band(packed, 720, 10, 40));
+        assert!(!in_drag_band(packed, 720, 10, -1));
+        // No band at all.
+        assert!(!in_drag_band(0, 720, 10, 10));
+        assert!(in_drag_band(pack_drag(40, 0), 720, 719, 0));
     }
 }
