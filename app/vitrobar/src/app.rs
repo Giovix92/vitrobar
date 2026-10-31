@@ -95,11 +95,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetCursorPos, GetForegroundWindow, GetMessagePos, GetWindowLongPtrW,
-    GetWindowThreadProcessId, IsWindow, IsWindowVisible, KillTimer, MsgWaitForMultipleObjectsEx,
-    PeekMessageW, PostMessageW, PostQuitMessage, PostThreadMessageW, SetForegroundWindow, SetTimer,
-    TranslateMessage, GWL_EXSTYLE, MSG, MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT, WM_CHAR,
-    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_NULL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WS_EX_TOPMOST,
+    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, KillTimer,
+    MsgWaitForMultipleObjectsEx, PeekMessageW, PostMessageW, PostQuitMessage, PostThreadMessageW,
+    SetForegroundWindow, SetTimer, TranslateMessage, GWL_EXSTYLE, MSG, MWMO_INPUTAVAILABLE,
+    PM_REMOVE, QS_ALLINPUT, WM_CHAR, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+    WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NULL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    WM_SYSKEYDOWN, WS_EX_TOPMOST,
 };
 
 use crate::bar_window::{
@@ -372,7 +373,12 @@ fn foreground() -> Option<Hwnd> {
 fn can_take_foreground(h: HWND) -> bool {
     // SAFETY: plain queries; the attribute value is a local whose size is passed alongside.
     unsafe {
-        if h.0.is_null() || !IsWindow(Some(h)).as_bool() || !IsWindowVisible(h).as_bool() {
+        if h.0.is_null()
+            || !IsWindow(Some(h)).as_bool()
+            || !IsWindowVisible(h).as_bool()
+            // A minimized window would take the keys without showing them.
+            || IsIconic(h).as_bool()
+        {
             return false;
         }
         let mut cloaked = 0u32;
