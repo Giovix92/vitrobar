@@ -759,7 +759,8 @@ impl App {
         // Explorer applies the auto-hide change of the takeover asynchronously and can show
         // a secondary taskbar again meanwhile: hide once more a little later.
         self.arm_reassert();
-        // The Windows key is ours from here on (disabled: installed, but every key passes).
+        // The Windows key is ours from here on (the hook is installed only while the setting
+        // is on).
         self.keys
             .start(self.notify.hwnd, self.settings.win_key_opens_start);
         // "Win, type, Enter" right after sign-in needs the catalog (a cold read takes many
@@ -2689,8 +2690,8 @@ impl App {
         }
     }
 
-    /// `Settings.win_key_opens_start` changed: off, the hook lets every key through and the
-    /// focus ring (if any) goes.
+    /// `Settings.win_key_opens_start` changed: off removes the hook and the focus ring (if
+    /// any); on installs the hook.
     fn set_win_key(&mut self, on: bool, dirty: &mut Dirty) {
         if let Some(m) = self.keys.set_enabled(on) {
             dirty.bars.insert(m);

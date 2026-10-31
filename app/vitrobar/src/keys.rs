@@ -151,40 +151,68 @@ pub fn launch_action(g: &AppGroup, foreground: Option<Hwnd>) -> ClickAction {
     }
 }
 
-/// The hook (when it could be installed) and the focus mode.
+/// What to do with the hook when the "Windows key opens Vitrobar Start" setting is `on`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookPlan {
+    Install,
+    Remove,
+    Keep,
+}
+
+/// The hook exists exactly while the bar runs (`started`) and the setting is on: nothing
+/// hooks the keyboard while it is not needed.
+pub fn hook_plan(started: bool, installed: bool, on: bool) -> HookPlan {
+    match (started && on, installed) {
+        (true, false) => HookPlan::Install,
+        (false, true) => HookPlan::Remove,
+        _ => HookPlan::Keep,
+    }
+}
+
+/// The hook (while the setting wants it and it could be installed) and the focus mode.
 #[derive(Default)]
 pub struct Keys {
     hook: Option<KeyHook>,
     focus: Option<Focus>,
+    /// Set by [`Keys::start`]: the window the hook wakes.
+    notify: Option<HWND>,
 }
 
 impl Keys {
-    /// Installs the hook; without it the Windows key simply stays stock.
+    /// The bar took over: installs the hook if the setting is on. Without a hook the Windows
+    /// key simply stays stock.
     pub fn start(&mut self, notify: HWND, enabled: bool) {
-        if self.hook.is_some() {
-            return;
-        }
-        self.hook = KeyHook::start(notify, enabled)
-            .inspect_err(|e| {
-                eprintln!("vitrobar: no keyboard hook, the Windows key stays stock: {e}")
-            })
-            .ok();
+        self.notify = Some(notify);
+        self.apply(enabled);
     }
 
-    /// `Settings.win_key_opens_start` changed (the settings window): off, the hook stays
-    /// installed but lets every key through. Returns the monitor whose bar showed the focus
-    /// ring (it must be redrawn without it).
-    #[allow(dead_code)] // Called by the settings window (Task 9) through `App::set_win_key`.
+    /// `Settings.win_key_opens_start` changed (the settings window): on installs the hook,
+    /// off removes it. Returns the monitor whose bar showed the focus ring (it must be
+    /// redrawn without it).
     pub fn set_enabled(&mut self, on: bool) -> Option<u64> {
         let ringed = if on {
             None
         } else {
             self.focus.take().map(|f| f.monitor)
         };
-        if let Some(h) = &self.hook {
-            h.set_enabled(on);
-        }
+        self.apply(on);
         ringed
+    }
+
+    fn apply(&mut self, on: bool) {
+        match hook_plan(self.notify.is_some(), self.hook.is_some(), on) {
+            HookPlan::Install => {
+                let Some(notify) = self.notify else { return };
+                self.hook = KeyHook::start(notify, true)
+                    .inspect_err(|e| {
+                        eprintln!("vitrobar: no keyboard hook, the Windows key stays stock: {e}")
+                    })
+                    .ok();
+            }
+            // Dropping unhooks (the hook thread ends).
+            HookPlan::Remove => self.hook = None,
+            HookPlan::Keep => {}
+        }
     }
 
     /// The session or the input desktop switched: key-ups may have been lost.
@@ -236,6 +264,19 @@ mod tests {
         tray: 2,
         chevron: true,
     };
+
+    #[test]
+    fn the_hook_exists_only_while_the_setting_wants_it() {
+        // Before the takeover nothing is installed, whatever the setting.
+        assert_eq!(hook_plan(false, false, true), HookPlan::Keep);
+        assert_eq!(hook_plan(false, false, false), HookPlan::Keep);
+        // Started: on installs, off does not.
+        assert_eq!(hook_plan(true, false, true), HookPlan::Install);
+        assert_eq!(hook_plan(true, false, false), HookPlan::Keep);
+        // Installed: off removes, on keeps.
+        assert_eq!(hook_plan(true, true, false), HookPlan::Remove);
+        assert_eq!(hook_plan(true, true, true), HookPlan::Keep);
+    }
 
     #[test]
     fn tray_zone_is_chevron_then_icons() {
