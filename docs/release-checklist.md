@@ -27,6 +27,8 @@ Also check while you are here:
 
 - Start opens Vitrobar's Start panel (see "Start menu"), the quick-settings button opens
   Quick Settings, the clock opens the notification centre and calendar.
+- Click the Quick Settings button twice: it opens then closes; same for the clock; Quick
+  Settings then the clock switches to the notification centre.
 - An icon that takes long to load shows a soft rounded placeholder first; the bar never
   freezes while icons load.
 - An app asking for attention (e.g. a chat app flashing) gets an accent plate that pulses

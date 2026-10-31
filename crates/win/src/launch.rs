@@ -177,6 +177,16 @@ pub fn open_stock_start() {
     }
 }
 
+/// Closes the stock flyout in front (Esc). The caller has checked that the foreground window
+/// is the flyout, otherwise the key would go to the user's app.
+pub fn dismiss_foreground_flyout() {
+    let inputs = [key(VK_ESCAPE, false), key(VK_ESCAPE, true)];
+    // SAFETY: the slice and the element size describe the array above.
+    unsafe {
+        SendInput(&inputs, size_of::<INPUT>() as i32);
+    }
+}
+
 /// Quick Settings (Wi-Fi, volume, battery). Blocking.
 pub fn open_stock_quick_settings() -> Result<()> {
     shell_open(&HSTRING::from("ms-actioncenter:controlcenter/"))

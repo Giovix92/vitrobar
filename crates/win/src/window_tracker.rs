@@ -23,7 +23,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DeregisterShellHookWindow, EnumWindows, KillTimer, PostMessageW, RegisterShellHookWindow,
     RegisterWindowMessageW, SetTimer, CHILDID_SELF, EVENT_OBJECT_CLOAKED,
     EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_UNCLOAKED,
-    EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, HSHELL_MONITORCHANGED, HSHELL_REDRAW,
+    EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, HSHELL_MONITORCHANGED, HSHELL_REDRAW,
     HSHELL_WINDOWACTIVATED, HSHELL_WINDOWCREATED, HSHELL_WINDOWDESTROYED, OBJID_WINDOW,
     WINEVENT_OUTOFCONTEXT, WM_APP,
 };
@@ -51,6 +51,9 @@ pub enum WindowEvent {
     Destroyed(Hwnd),
     Changed(Hwnd),
     Activated(Option<Hwnd>),
+    /// `EVENT_SYSTEM_FOREGROUND`: also fires for shell windows (the stock flyouts) that the
+    /// shell hook never reports. Separate from `Activated` so its consumers do no extra work.
+    Foreground(Hwnd),
     Flash(Hwnd),
     FullscreenChanged,
     DesktopSwitched,
@@ -191,6 +194,7 @@ unsafe extern "system" fn win_event_proc(
     let id = hwnd.0 as usize as u64;
     match event {
         EVENT_OBJECT_LOCATIONCHANGE => changed_coalesced(hwnd.0 as isize),
+        EVENT_SYSTEM_FOREGROUND => post(WindowEvent::Foreground(id)),
         EVENT_OBJECT_CLOAKED | EVENT_OBJECT_UNCLOAKED => {
             post(WindowEvent::Changed(id));
             // Restarts the countdown: DesktopSwitched fires once the burst has been quiet.
@@ -229,6 +233,7 @@ impl WindowTracker {
         let ranges = [
             (EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_NAMECHANGE),
             (EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED),
+            (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND),
             (EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND),
             (EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE),
         ];

@@ -3,6 +3,7 @@
 pub mod appbar_wire;
 pub mod calc;
 pub mod clock;
+pub mod flyout_toggle;
 pub mod i18n;
 pub mod image;
 pub mod key_hook;

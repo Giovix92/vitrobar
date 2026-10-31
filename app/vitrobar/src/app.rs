@@ -36,6 +36,7 @@ use std::time::{Duration, Instant};
 
 use vitro_core::clock::ms_until_next_minute;
 use vitro_core::i18n::{lang_from_tag, tr, Key, Lang};
+use vitro_core::flyout_toggle::{FlyoutToggle, StockFlyout, ToggleAction};
 use vitro_core::image::BgraImage;
 use vitro_core::key_hook::HookOutput;
 use vitro_core::layout::{compute_layout, diff_monitors, metrics, BarLayout, LayoutInput, Rect};
@@ -66,7 +67,9 @@ use vitro_win::appbar::{is_fullscreen_on_rect, reserved_rect, AppBar};
 use vitro_win::catalog::{bar_pin, file_location};
 use vitro_win::desktops::Desktops;
 use vitro_win::key_hook::inject_mask_key;
-use vitro_win::launch::{activate_window, close_window, minimize_window, open_stock_start};
+use vitro_win::launch::{
+    activate_window, close_window, dismiss_foreground_flyout, minimize_window, open_stock_start,
+};
 use vitro_win::monitors::{
     list_monitors, parse_monitor_spec, window_monitor, work_area_px, MonitorInfo,
 };
@@ -583,6 +586,10 @@ struct App {
     tracker: WindowTracker,
     icons: IconLoader,
     launcher: Launcher,
+    /// Which stock flyout is open, so the same button closes it (Task 3).
+    flyout_toggle: FlyoutToggle,
+    /// Monotonic base for `flyout_toggle`'s clock.
+    clock_base: Instant,
     notify: NotifyWindow,
     desktops: Desktops,
     painter: Painter,
@@ -699,6 +706,8 @@ impl App {
             tracker,
             icons,
             launcher,
+            flyout_toggle: FlyoutToggle::new(),
+            clock_base: Instant::now(),
             notify,
             desktops,
             painter,
@@ -1672,6 +1681,10 @@ impl App {
                 }
                 self.foreground = fg;
                 self.foreground_ours = is_own_window(fg);
+                if let Some(h) = fg {
+                    let now = self.now_ms();
+                    self.flyout_toggle.foreground_changed(h, now);
+                }
                 dirty.fullscreen = true;
                 self.start_foreground_changed(fg);
                 // A foreground change is when the shell reorders the topmost band: keep our
@@ -1679,6 +1692,11 @@ impl App {
                 if let Some(t) = &self.tray {
                     t.reassert_topmost();
                 }
+            }
+            WindowEvent::Foreground(h) => {
+                // Only the flyout toggle cares: the shell hook misses the stock flyouts.
+                let now = self.now_ms();
+                self.flyout_toggle.foreground_changed(h, now);
             }
             WindowEvent::Flash(h) => {
                 // Carry 7: read_window_info never reports flashing; the event does.
@@ -2625,8 +2643,8 @@ impl App {
                     self.toggle_start(k, dirty);
                 }
             }
-            Hit::Quick => self.launcher.launch(Job::QuickSettings),
-            Hit::Clock => self.launcher.launch(Job::Notifications),
+            Hit::Quick => self.toggle_stock_flyout(StockFlyout::QuickSettings),
+            Hit::Clock => self.toggle_stock_flyout(StockFlyout::Notifications),
             Hit::App(i) => {
                 let Some(g) = self.cur_groups().get(i) else {
                     return;
@@ -3435,6 +3453,32 @@ impl App {
     /// refused), it cannot hear its deactivation: it closes as soon as the foreground moves
     /// away from the window that had it at open (fallback for carry 12). Getting the
     /// foreground itself (a click on it) makes it a normal activated panel.
+    fn now_ms(&self) -> u64 {
+        self.clock_base.elapsed().as_millis() as u64
+    }
+
+    /// Quick Settings / clock button: a second click on the open flyout closes it (Esc, only
+    /// while that flyout really is in front); anything else opens the one clicked.
+    fn toggle_stock_flyout(&mut self, which: StockFlyout) {
+        let now = self.now_ms();
+        let fg = foreground().unwrap_or(0);
+        match self.flyout_toggle.on_click(which, fg, now) {
+            ToggleAction::Close => {
+                // Re-checked right before the key goes out: it must reach the flyout.
+                if foreground() == Some(fg) {
+                    dismiss_foreground_flyout();
+                }
+            }
+            ToggleAction::Open => {
+                self.launcher.launch(match which {
+                    StockFlyout::QuickSettings => Job::QuickSettings,
+                    StockFlyout::Notifications => Job::Notifications,
+                });
+                self.flyout_toggle.launched(which, now);
+            }
+        }
+    }
+
     fn start_foreground_changed(&mut self, fg: Option<Hwnd>) {
         let Some(sp) = self.start.as_mut() else {
             return;
