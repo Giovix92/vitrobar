@@ -22,6 +22,11 @@ impl TextInput {
         self.caret
     }
 
+    /// Length in chars.
+    pub fn len(&self) -> usize {
+        self.text.len()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.text.is_empty()
     }

@@ -13,6 +13,7 @@ mod keys;
 mod launcher;
 mod menus;
 mod notify;
+mod quick;
 mod settings_window;
 mod shell;
 mod start;

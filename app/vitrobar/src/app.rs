@@ -39,7 +39,9 @@ use vitro_core::flyout_toggle::{FlyoutToggle, StockFlyout, ToggleAction};
 use vitro_core::i18n::{lang_from_tag, tr, Key, Lang};
 use vitro_core::image::BgraImage;
 use vitro_core::key_hook::HookOutput;
-use vitro_core::layout::{compute_layout, diff_monitors, metrics, BarLayout, LayoutInput, Rect};
+use vitro_core::layout::{
+    anchor_for, compute_layout, diff_monitors, metrics, AnchorTarget, BarLayout, LayoutInput, Rect,
+};
 use vitro_core::search::ResultKind;
 use vitro_core::settings::{self, Pin, Position, Settings, StartStyle, ThemeChoice};
 use vitro_core::settings_ui::ControlId;
@@ -115,9 +117,10 @@ use crate::launcher::{Job, Launcher};
 use crate::menus::{app_menu, bar_menu, power_menu, start_item_menu, MenuChoice, MenuCtx};
 use crate::notify::{
     inbox_pending, take_inbox, Inbox, NotifyWindow, TIMER_CLOCK, TIMER_GPU_RETRY, TIMER_HOVER_HIDE,
-    TIMER_HOVER_SHOW, TIMER_MARGIN_COLLAPSE, TIMER_REASSERT, TIMER_START_CLOSED,
-    TIMER_START_PREFETCH, TIMER_TRAY_TIP, WM_APP_TAKE_OVER,
+    TIMER_HOVER_SHOW, TIMER_MARGIN_COLLAPSE, TIMER_QUICK_BT, TIMER_QUICK_SCAN, TIMER_REASSERT,
+    TIMER_START_CLOSED, TIMER_START_PREFETCH, TIMER_TRAY_TIP, WM_APP_TAKE_OVER,
 };
+use crate::quick::{Gfx, Outcome as QuickOutcome, QuickPanel};
 use crate::settings_window::{apply_choice, Effect, SettingsAction, SettingsInput, SettingsWindow};
 use crate::shell::{self, StockGuard};
 use crate::start::{
@@ -360,6 +363,26 @@ fn to_px(r: Rect, scale: f32) -> PxRect {
     (p(r.x), p(r.y), p(r.right()), p(r.bottom()))
 }
 
+/// The quick button's rectangle with the full height of the bar surface it sits on, in
+/// screen px; `None` when the bar shows no quick button.
+fn quick_anchor(l: &BarLayout, scale: f32) -> Option<PxRect> {
+    let r = anchor_for(l, AnchorTarget::Quick);
+    if r.w <= 0.0 {
+        return None;
+    }
+    let mid = r.x + r.w / 2.0;
+    let s = l.surfaces.iter().find(|s| mid >= s.x && mid < s.right())?;
+    Some(to_px(
+        Rect {
+            x: r.x,
+            y: s.y,
+            w: r.w,
+            h: s.h,
+        },
+        scale,
+    ))
+}
+
 fn hwnd_of(h: Hwnd) -> HWND {
     HWND(h as usize as *mut _)
 }
@@ -591,6 +614,9 @@ struct App {
     start_closing_until: Instant,
     /// What the Start panel shows, cached across opens, and its worker threads.
     start_data: StartData,
+    /// The open quick panel (its window goes before the compositor and GPU; the system
+    /// services it opened go with it, P4).
+    quick: Option<QuickPanel>,
     /// The open settings window (its visuals and window go before the compositor and GPU).
     settings_win: Option<SettingsWindow>,
     /// One per monitor, in [`current_monitors`] order: the first carries the tray area.
@@ -717,6 +743,7 @@ impl App {
             start_closing: None,
             start_closing_until: Instant::now(),
             start_data: StartData::new(),
+            quick: None,
             settings_win: None,
             monitors,
             tracker,
@@ -1281,6 +1308,7 @@ impl App {
     /// reconnect to its virtual desktop manager.
     fn on_taskbar_created(&mut self, dirty: &mut Dirty) {
         self.close_start_now();
+        self.close_quick();
         self.stock.on_taskbar_created();
         // The old manager is a proxy into the Explorer that just ended: every query on it
         // would fail open (every window "on the current desktop") until the next restart.
@@ -1324,6 +1352,7 @@ impl App {
             }
             if tray {
                 self.close_overflow();
+                self.close_quick();
                 self.set_tip_target(None);
             }
             if self.start.as_ref().is_some_and(|s| s.monitor == id) {
@@ -1705,6 +1734,7 @@ impl App {
                 }
                 dirty.fullscreen = true;
                 self.start_foreground_changed(fg);
+                self.quick_foreground_changed(fg);
                 // A foreground change is when the shell reorders the topmost band: keep our
                 // Shell_TrayWnd above Explorer's (async, never waits).
                 if let Some(t) = &self.tray {
@@ -1802,6 +1832,7 @@ impl App {
                     self.close_strip();
                 }
             }
+            TIMER_QUICK_SCAN | TIMER_QUICK_BT => self.quick_timer(id),
             other => self.tracker.on_timer(other),
         }
     }
@@ -1859,6 +1890,10 @@ impl App {
         self.input_time = msg.time;
         if self.start.as_ref().is_some_and(|s| s.hwnd() == msg.hwnd) {
             return self.on_start_mouse(msg, dirty);
+        }
+        if self.quick.as_ref().is_some_and(|q| q.hwnd() == msg.hwnd) {
+            self.on_quick_mouse(msg);
+            return true;
         }
         if self.is_settings(msg.hwnd) {
             return self.on_settings_mouse(msg, dirty);
@@ -2316,6 +2351,10 @@ impl App {
     /// Keys reach us only while the overflow or the Start panel is the foreground window:
     /// Esc closes the overflow; the Start panel gets every key.
     fn on_key(&mut self, msg: &MSG, dirty: &mut Dirty) -> bool {
+        if self.quick.as_ref().is_some_and(|q| q.hwnd() == msg.hwnd) {
+            self.on_quick_key(msg);
+            return true;
+        }
         if self.start.as_ref().is_some_and(|s| s.hwnd() == msg.hwnd) {
             self.on_start_key(msg, dirty);
             return true;
@@ -2686,6 +2725,9 @@ impl App {
         if !matches!(hit, Hit::App(_)) {
             self.close_strip();
         }
+        if hit != Hit::Quick {
+            self.close_quick();
+        }
         if hit != Hit::Chevron {
             self.close_overflow();
         }
@@ -2704,7 +2746,8 @@ impl App {
                     self.toggle_start(k, dirty);
                 }
             }
-            Hit::Quick => self.toggle_stock_flyout(StockFlyout::QuickSettings),
+            // Vitrobar's own panel; a second click closes it.
+            Hit::Quick => self.toggle_quick(dirty),
             Hit::Clock => self.toggle_stock_flyout(StockFlyout::Notifications),
             Hit::App(i) => {
                 let Some(g) = self.cur_groups().get(i) else {
@@ -2748,6 +2791,7 @@ impl App {
         // Every caller but `open_start` redraws all bars (which drops the ring).
         self.keys.set_focus(None);
         self.close_start();
+        self.close_quick();
         self.close_strip();
         self.close_overflow();
         self.set_tip_target(None);
@@ -3576,6 +3620,204 @@ impl App {
         }
     }
 
+    // -----------------------------------------------------------------------------------
+    // The quick panel (controller in `quick.rs`)
+    // -----------------------------------------------------------------------------------
+
+    fn toggle_quick(&mut self, dirty: &mut Dirty) {
+        if !self.close_quick() {
+            self.open_quick(dirty);
+        }
+    }
+
+    /// Opens the quick panel above the tray bar's quick button (below it with the bar at the
+    /// top) and gives it the foreground. If it cannot open, the stock Quick Settings do.
+    fn open_quick(&mut self, dirty: &mut Dirty) {
+        if let Some(f) = self.keys.focus() {
+            dirty.bars.insert(f.monitor);
+        }
+        // Start, strip, overflow, tooltip and the keyboard focus mode close.
+        self.reset_interaction();
+        let Some(mb) = self.monitors.iter().find(|m| m.tray) else {
+            return;
+        };
+        dirty.bars.insert(mb.id());
+        let anchor = quick_anchor(&mb.layout, mb.scale());
+        let (accent, lang) = self.start_look();
+        let fg = foreground().unwrap_or(0) as usize;
+        let opened = match anchor {
+            Some(anchor) => QuickPanel::open(
+                &Gfx {
+                    comp: &self.comp,
+                    painter: &self.painter,
+                },
+                &self.style,
+                mb.info.dpi,
+                anchor,
+                self.settings.position,
+                accent,
+                lang,
+                self.notify.hwnd,
+            ),
+            None => Err(Error::new(E_FAIL, "no quick button on the bar")),
+        };
+        match opened {
+            Ok(mut q) => {
+                q.fg_at_open = fg;
+                if !q.activate() {
+                    eprintln!("vitrobar: the quick panel could not take the foreground");
+                }
+                if self.opts.debug_state {
+                    eprintln!(
+                        "vitrobar-quick-open rect={:?} anchor={:?} activated={}",
+                        q.rect_px(),
+                        anchor,
+                        q.activated
+                    );
+                }
+                self.quick = Some(q);
+            }
+            Err(e) => {
+                eprintln!("vitrobar: the quick panel failed ({e}); opening the stock one");
+                self.launcher.launch(Job::QuickSettings);
+            }
+        }
+    }
+
+    /// True if it was open. Its services and timers go with it.
+    fn close_quick(&mut self) -> bool {
+        if self.quick.take().is_none() {
+            return false;
+        }
+        if self.opts.debug_state {
+            eprintln!("vitrobar-quick-closed");
+        }
+        true
+    }
+
+    fn quick_outcome(&mut self, o: QuickOutcome) {
+        match o {
+            QuickOutcome::None => {}
+            QuickOutcome::Close => {
+                self.close_quick();
+            }
+            QuickOutcome::Open(uri) => {
+                self.close_quick();
+                self.launcher.launch(Job::Open(uri));
+            }
+        }
+    }
+
+    /// Runs `f` on the open quick panel and acts on what it asks for.
+    fn quick_event(&mut self, f: impl FnOnce(&mut QuickPanel, &Gfx) -> QuickOutcome) {
+        let Some(q) = self.quick.as_mut() else {
+            return;
+        };
+        let g = Gfx {
+            comp: &self.comp,
+            painter: &self.painter,
+        };
+        let o = f(q, &g);
+        self.quick_outcome(o);
+    }
+
+    fn on_quick_mouse(&mut self, msg: &MSG) {
+        self.quick_event(|q, g| q.on_mouse(msg, g));
+    }
+
+    fn on_quick_key(&mut self, msg: &MSG) {
+        let vk = msg.wParam.0 as u16;
+        // SAFETY: plain queries of this thread's keyboard state.
+        let (ctrl, alt, shift) = unsafe {
+            (
+                GetKeyState(i32::from(VK_CONTROL.0)) < 0,
+                GetKeyState(i32::from(VK_MENU.0)) < 0,
+                GetKeyState(i32::from(VK_SHIFT.0)) < 0,
+            )
+        };
+        // AltGr (Ctrl+Alt) types characters: it is not Ctrl.
+        let ctrl = ctrl && !alt;
+        if ctrl && vk == u16::from(b'V') {
+            let text = self
+                .quick
+                .as_ref()
+                .and_then(|q| vitro_win::clipboard::get_text(q.hwnd(), 256));
+            if let Some(text) = text {
+                self.quick_event(|q, g| q.paste(text, g));
+            }
+            return;
+        }
+        self.quick_event(|q, g| q.on_key(vk, ctrl, shift, g));
+    }
+
+    /// `WM_CHAR`, `WM_MOUSEWHEEL` and Alt+F4 on the quick panel; false for anything else.
+    fn on_quick_msg(&mut self, msg: &MSG) -> bool {
+        if !self.quick.as_ref().is_some_and(|q| q.hwnd() == msg.hwnd) {
+            return false;
+        }
+        match msg.message {
+            WM_CHAR => {
+                // A password is ASCII: surrogate halves are dropped.
+                if let Some(c) = char::from_u32(msg.wParam.0 as u32 & 0xFFFF) {
+                    self.quick_event(|q, g| q.on_char(c, g));
+                }
+                true
+            }
+            WM_MOUSEWHEEL => {
+                let delta = ((msg.wParam.0 >> 16) & 0xFFFF) as u16 as i16;
+                let pt = mouse_pos(msg.lParam);
+                self.quick_event(|q, g| q.on_wheel(delta, pt, g));
+                true
+            }
+            WM_SYSKEYDOWN if msg.wParam.0 == usize::from(VK_F4.0) => {
+                self.close_quick();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn quick_timer(&mut self, id: usize) {
+        if self.quick.is_none() {
+            // Queued before the panel closed.
+            self.kill_timer(id);
+            return;
+        }
+        self.quick_event(|q, g| q.on_timer(id, g).unwrap_or(QuickOutcome::None));
+    }
+
+    /// Like [`Self::start_foreground_changed`]: a panel that never got the foreground closes
+    /// once the foreground moves away from the window that had it at open.
+    fn quick_foreground_changed(&mut self, fg: Option<Hwnd>) {
+        let Some(q) = self.quick.as_mut() else {
+            return;
+        };
+        if q.activated {
+            return;
+        }
+        let fg = fg.unwrap_or(0) as usize;
+        if fg == q.hwnd().0 as usize {
+            q.activated = true;
+        } else if fg != q.fg_at_open {
+            self.close_quick();
+        }
+    }
+
+    fn quick_restyle(&mut self) {
+        let (accent, _) = self.start_look();
+        let Some(q) = self.quick.as_mut() else {
+            return;
+        };
+        let g = Gfx {
+            comp: &self.comp,
+            painter: &self.painter,
+        };
+        if let Err(e) = q.restyle(&g, &self.style, accent) {
+            eprintln!("vitrobar: the quick panel could not be restyled: {e}");
+            self.close_quick();
+        }
+    }
+
     /// The foreground window changed. When the panel never got the foreground (activation
     /// refused), it cannot hear its deactivation: it closes as soon as the foreground moves
     /// away from the window that had it at open (fallback for carry 12). Getting the
@@ -4045,6 +4287,7 @@ impl App {
     fn on_device_removed(&mut self, dirty: &mut Dirty) {
         // Its surfaces belonged to the lost device.
         self.close_start_now();
+        self.close_quick();
         self.close_settings();
         // GPU device removed (TDR, driver update): recreate, then redraw everything.
         self.gpu_lost = true;
@@ -4070,6 +4313,16 @@ impl App {
         if inbox.debug_open_start && self.opts.debug_state {
             // Debug hook (perf check): toggles Start on the primary monitor's bar.
             self.toggle_start(0, dirty);
+        }
+        if inbox.debug_open_quick && self.opts.debug_state {
+            // Debug hook (live checks): toggles the quick panel.
+            self.toggle_quick(dirty);
+        }
+        if inbox.quick {
+            self.quick_event(|q, g| q.on_wake(g));
+        }
+        if inbox.power {
+            self.quick_event(|q, g| q.on_power(g));
         }
         dirty.theme |= inbox.theme;
         dirty.clock |= inbox.clock;
@@ -4147,6 +4400,14 @@ impl App {
             self.close_overflow();
             dirty.visuals = true;
         }
+        if self
+            .quick
+            .as_ref()
+            .is_some_and(|q| deactivated.contains(&q.hwnd()))
+        {
+            // A click elsewhere or a switch to another app.
+            self.close_quick();
+        }
         if inbox.fullscreen {
             // Explorer may have raised its own Shell_TrayWnd for the full-screen change: go
             // back above it. (Restarts, settings and display changes reach the tray host's
@@ -4184,6 +4445,8 @@ impl App {
     /// Applies everything collected from one drain of the queue.
     fn flush(&mut self, mut d: Dirty) -> Result<()> {
         if d.monitors && self.reconcile_monitors(current_monitors(self.opts.debug_state)) {
+            // Its anchor moved or went away.
+            self.close_quick();
             // New bars, new geometry: everything is laid out and drawn again, and every
             // window's monitor is read again (windows on a removed monitor were moved).
             d.visuals = true;
@@ -4223,6 +4486,7 @@ impl App {
                 redraw = true;
                 // Its glass was made for the old style.
                 self.close_start_now();
+                self.quick_restyle();
                 self.settings_restyle();
                 self.settings_render();
             }
@@ -4444,6 +4708,7 @@ pub fn run(opts: Options) -> Result<()> {
                 WM_KEYDOWN if app.on_key(&msg, &mut dirty) => unsafe {
                     let _ = TranslateMessage(&msg);
                 },
+                WM_CHAR | WM_SYSKEYDOWN | WM_MOUSEWHEEL if app.on_quick_msg(&msg) => {}
                 WM_CHAR | WM_SYSKEYDOWN | WM_MOUSEWHEEL if app.on_start_msg(&msg, &mut dirty) => {}
                 WM_SYSKEYDOWN | WM_MOUSEWHEEL if app.on_settings_msg(&msg, &mut dirty) => {}
                 _ => unsafe {

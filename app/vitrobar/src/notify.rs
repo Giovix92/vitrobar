@@ -33,10 +33,11 @@ use windows::Win32::System::RemoteDesktop::{
 use windows::Win32::UI::Shell::{ABN_FULLSCREENAPP, ABN_POSCHANGED};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, PostQuitMessage, RegisterClassExW,
-    SPI_SETCLIENTAREAANIMATION, SPI_SETWORKAREA, WM_APP, WM_CLOSE, WM_DISPLAYCHANGE, WM_DPICHANGED,
-    WM_DWMCOLORIZATIONCOLORCHANGED, WM_ENDSESSION, WM_SETTINGCHANGE, WM_THEMECHANGED,
-    WM_TIMECHANGE, WM_TIMER, WM_WTSSESSION_CHANGE, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
-    WTS_CONSOLE_CONNECT, WTS_REMOTE_CONNECT, WTS_SESSION_UNLOCK,
+    PBT_APMPOWERSTATUSCHANGE, PBT_POWERSETTINGCHANGE, SPI_SETCLIENTAREAANIMATION, SPI_SETWORKAREA,
+    WM_APP, WM_CLOSE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_DWMCOLORIZATIONCOLORCHANGED,
+    WM_ENDSESSION, WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_THEMECHANGED, WM_TIMECHANGE, WM_TIMER,
+    WM_WTSSESSION_CHANGE, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP, WTS_CONSOLE_CONNECT,
+    WTS_REMOTE_CONNECT, WTS_SESSION_UNLOCK,
 };
 
 /// An icon finished loading on the icon thread (posted by the worker).
@@ -49,6 +50,9 @@ pub const WM_APP_TAKE_OVER: u32 = WM_APP + 0x23;
 pub const WM_APP_FILE_SEARCH: u32 = WM_APP + 0x25;
 /// The Start panel's app catalog or recent files were read (payload-free wake-up).
 pub const WM_APP_START_DATA: u32 = WM_APP + 0x26;
+/// A quick-panel service (audio, brightness, Wi-Fi, Bluetooth) has changes queued
+/// (payload-free wake-up shared by all of them).
+pub const WM_APP_QUICK: u32 = WM_APP + 0x27;
 
 /// The registered window message that toggles the Start panel on the primary monitor. The
 /// app honours it only when it runs with `--debug-state` (the perf check posts it).
@@ -58,6 +62,18 @@ pub fn open_start_msg() -> u32 {
     *ID.get_or_init(|| unsafe {
         windows::Win32::UI::WindowsAndMessaging::RegisterWindowMessageW(windows::core::w!(
             "Vitrobar.Debug.OpenStart"
+        ))
+    })
+}
+
+/// The registered window message that toggles the quick panel; honoured only with
+/// `--debug-state`, like [`open_start_msg`].
+pub fn open_quick_msg() -> u32 {
+    static ID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    // SAFETY: plain registration call with a static string.
+    *ID.get_or_init(|| unsafe {
+        windows::Win32::UI::WindowsAndMessaging::RegisterWindowMessageW(windows::core::w!(
+            "Vitrobar.Debug.OpenQuick"
         ))
     })
 }
@@ -78,6 +94,10 @@ pub const TIMER_TRAY_TIP: usize = 0x5707;
 pub const TIMER_START_PREFETCH: usize = 0x5708;
 /// One-shot after the Start panel's close animation: the fading panel can be destroyed.
 pub const TIMER_START_CLOSED: usize = 0x5709;
+/// One-shot: a Wi-Fi scan's deadline passed (the quick panel re-reads the list).
+pub const TIMER_QUICK_SCAN: usize = 0x570A;
+/// One-shot: a Bluetooth connect / disconnect may have expired unconfirmed.
+pub const TIMER_QUICK_BT: usize = 0x570B;
 
 /// Everything the notify window received since the last [`take_inbox`].
 #[derive(Debug, Default, PartialEq)]
@@ -122,6 +142,12 @@ pub struct Inbox {
     pub keys: bool,
     /// The debug message [`open_start_msg`] arrived (only acted on with `--debug-state`).
     pub debug_open_start: bool,
+    /// [`WM_APP_QUICK`]: drain the quick panel's services.
+    pub quick: bool,
+    /// `WM_POWERBROADCAST`: battery, power source or saver status may have changed.
+    pub power: bool,
+    /// The debug message [`open_quick_msg`] arrived (only acted on with `--debug-state`).
+    pub debug_open_quick: bool,
 }
 
 thread_local! {
@@ -220,6 +246,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             with_inbox(|i| i.start_data = true);
             return LRESULT(0);
         }
+        WM_APP_QUICK => {
+            // A wake-up: wParam / lParam are ignored (anyone may post this id).
+            with_inbox(|i| i.quick = true);
+            return LRESULT(0);
+        }
+        WM_POWERBROADCAST => {
+            if matches!(
+                wparam.0 as u32,
+                PBT_POWERSETTINGCHANGE | PBT_APMPOWERSTATUSCHANGE
+            ) {
+                with_inbox(|i| i.power = true);
+            }
+            return LRESULT(1);
+        }
         WM_VITRO_KEY => {
             // A wake-up: wParam / lParam are ignored (anyone may post this id); the outputs
             // are in the hook's own queue.
@@ -276,6 +316,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // Payload-free; ignored by the app unless it runs with --debug-state.
             // A --debug-state build accepts it from any same-integrity process (by design).
             with_inbox(|i| i.debug_open_start = true);
+            return LRESULT(0);
+        }
+        m if m == open_quick_msg() => {
+            // Payload-free; ignored by the app unless it runs with --debug-state.
+            with_inbox(|i| i.debug_open_quick = true);
             return LRESULT(0);
         }
         m if m == taskbar_created_msg() => {
@@ -553,6 +598,32 @@ mod tests {
         assert_eq!(inbox.tray[0].id.uid, 2);
         assert!(!inbox_pending());
         assert_eq!(take_inbox(), Inbox::default());
+    }
+
+    #[test]
+    fn quick_panel_wakes_and_power_changes_land_in_the_inbox() {
+        let n = NotifyWindow::create().unwrap();
+        let _ = take_inbox();
+        // SAFETY: plain messages to our own window.
+        unsafe {
+            PostMessageW(Some(n.hwnd), WM_APP_QUICK, WPARAM(5), LPARAM(0x55)).unwrap();
+            SendMessageW(
+                n.hwnd,
+                WM_POWERBROADCAST,
+                Some(WPARAM(PBT_POWERSETTINGCHANGE as usize)),
+                None,
+            );
+            SendMessageW(n.hwnd, open_quick_msg(), None, None);
+        }
+        pump(n.hwnd);
+        let inbox = take_inbox();
+        assert!(inbox.quick && inbox.power && inbox.debug_open_quick);
+        // Other power broadcasts (suspend, resume) are not the panel's business.
+        // SAFETY: as above.
+        unsafe {
+            SendMessageW(n.hwnd, WM_POWERBROADCAST, Some(WPARAM(4)), None);
+        }
+        assert!(!take_inbox().power);
     }
 
     #[test]
