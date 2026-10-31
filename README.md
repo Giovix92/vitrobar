@@ -26,3 +26,7 @@ pwsh scripts/perf-check.ps1 -Exe target/release/vitrobar.exe -StartPanel
 ```
 
 The manual checks to run before a release are in `docs/release-checklist.md`.
+
+## Artwork
+
+`app/vitrobar/vitrobar.ico` (the app icon: a glass bar on a blue tile, in 16, 20, 24, 32, 40, 48, 64, 128 and 256 px) is original artwork made for this project: it was drawn programmatically with a short Pillow script, from plain shapes and colours, with no third-party images, fonts or logos. It is a placeholder until the project has a real logo, and like the rest of the project it is licensed under GPL-3.0.
