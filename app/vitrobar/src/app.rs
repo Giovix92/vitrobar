@@ -35,7 +35,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use vitro_core::clock::ms_until_next_minute;
-use vitro_core::flyout_toggle::{FlyoutToggle, StockFlyout, ToggleAction};
 use vitro_core::i18n::{lang_from_tag, tr, Key, Lang};
 use vitro_core::image::BgraImage;
 use vitro_core::key_hook::HookOutput;
@@ -70,8 +69,7 @@ use vitro_win::catalog::{bar_pin, file_location};
 use vitro_win::desktops::Desktops;
 use vitro_win::key_hook::inject_mask_key;
 use vitro_win::launch::{
-    activate_window, close_window, dismiss_foreground_flyout, minimize_window, open_stock_start,
-    request_close,
+    activate_window, close_window, minimize_window, open_stock_start, request_close,
 };
 use vitro_win::monitors::{
     list_monitors, parse_monitor_spec, window_monitor, work_area_px, MonitorInfo,
@@ -96,13 +94,13 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetKeyState, VK_CONTROL, VK_ESCAPE, VK_F4, VK_MENU, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetCursorPos, GetForegroundWindow, GetMessagePos, GetWindowLongPtrW,
+    DispatchMessageW, GetCursorPos, GetForegroundWindow, GetMessagePos,
     GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, KillTimer,
     MsgWaitForMultipleObjectsEx, PeekMessageW, PostMessageW, PostQuitMessage, PostThreadMessageW,
-    SetForegroundWindow, SetTimer, TranslateMessage, GWL_EXSTYLE, MSG, MWMO_INPUTAVAILABLE,
+    SetForegroundWindow, SetTimer, TranslateMessage, MSG, MWMO_INPUTAVAILABLE,
     PM_REMOVE, QS_ALLINPUT, WM_CHAR, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
     WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NULL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SYSKEYDOWN, WS_EX_TOPMOST,
+    WM_SYSKEYDOWN,
 };
 
 use crate::bar_window::{
@@ -116,10 +114,11 @@ use crate::keys::{
 use crate::launcher::{Job, Launcher};
 use crate::menus::{app_menu, bar_menu, power_menu, start_item_menu, MenuChoice, MenuCtx};
 use crate::notify::{
-    inbox_pending, take_inbox, Inbox, NotifyWindow, TIMER_CLOCK, TIMER_GPU_RETRY, TIMER_HOVER_HIDE,
+    inbox_pending, take_inbox, Inbox, NotifyWindow, TIMER_CALENDAR_MIDNIGHT, TIMER_CLOCK, TIMER_GPU_RETRY, TIMER_HOVER_HIDE,
     TIMER_HOVER_SHOW, TIMER_MARGIN_COLLAPSE, TIMER_QUICK_BT, TIMER_QUICK_SCAN, TIMER_REASSERT,
     TIMER_START_CLOSED, TIMER_START_PREFETCH, TIMER_TRAY_TIP, WM_APP_TAKE_OVER,
 };
+use crate::calendar_panel::{CalendarPanel, Outcome as CalOutcome};
 use crate::quick::{Gfx, Outcome as QuickOutcome, QuickPanel};
 use crate::settings_window::{apply_choice, Effect, SettingsAction, SettingsInput, SettingsWindow};
 use crate::shell::{self, StockGuard};
@@ -617,6 +616,8 @@ struct App {
     /// The open quick panel (its window goes before the compositor and GPU; the system
     /// services it opened go with it, P4).
     quick: Option<QuickPanel>,
+    /// The open calendar panel (same rules as `quick`, no services).
+    calendar: Option<CalendarPanel>,
     /// The open settings window (its visuals and window go before the compositor and GPU).
     settings_win: Option<SettingsWindow>,
     /// One per monitor, in [`current_monitors`] order: the first carries the tray area.
@@ -624,10 +625,6 @@ struct App {
     tracker: WindowTracker,
     icons: IconLoader,
     launcher: Launcher,
-    /// Which stock flyout is open, so the same button closes it (Task 3).
-    flyout_toggle: FlyoutToggle,
-    /// Monotonic base for `flyout_toggle`'s clock.
-    clock_base: Instant,
     notify: NotifyWindow,
     desktops: Desktops,
     painter: Painter,
@@ -744,13 +741,12 @@ impl App {
             start_closing_until: Instant::now(),
             start_data: StartData::new(),
             quick: None,
+            calendar: None,
             settings_win: None,
             monitors,
             tracker,
             icons,
             launcher,
-            flyout_toggle: FlyoutToggle::new(),
-            clock_base: Instant::now(),
             notify,
             desktops,
             painter,
@@ -1274,6 +1270,7 @@ impl App {
             // The pill grows and shrinks as apps come and go: the panel follows its button.
             self.quick_reanchor();
         }
+        self.calendar_reanchor(k);
         Ok(raised)
     }
 
@@ -1314,6 +1311,7 @@ impl App {
     fn on_taskbar_created(&mut self, dirty: &mut Dirty) {
         self.close_start_now();
         self.close_quick_now();
+        self.close_calendar_now();
         self.stock.on_taskbar_created();
         // The old manager is a proxy into the Explorer that just ended: every query on it
         // would fail open (every window "on the current desktop") until the next restart.
@@ -1359,6 +1357,9 @@ impl App {
                 self.close_overflow();
                 self.close_quick();
                 self.set_tip_target(None);
+            }
+            if self.calendar.as_ref().is_some_and(|c| c.monitor == id) {
+                self.close_calendar();
             }
             if self.start.as_ref().is_some_and(|s| s.monitor == id) {
                 self.close_start_now();
@@ -1734,22 +1735,17 @@ impl App {
                 }
                 self.foreground = fg;
                 self.foreground_ours = is_own_window(fg);
-                if let Some(h) = fg {
-                    self.flyout_foreground(h);
-                }
                 dirty.fullscreen = true;
                 self.start_foreground_changed(fg);
                 self.quick_foreground_changed(fg);
+                self.calendar_foreground_changed(fg);
                 // A foreground change is when the shell reorders the topmost band: keep our
                 // Shell_TrayWnd above Explorer's (async, never waits).
                 if let Some(t) = &self.tray {
                     t.reassert_topmost();
                 }
             }
-            WindowEvent::Foreground(h) => {
-                // Only the flyout toggle cares: the shell hook misses the stock flyouts.
-                self.flyout_foreground(h);
-            }
+            WindowEvent::Foreground(_) => {}
             WindowEvent::Flash(h) => {
                 // Carry 7: read_window_info never reports flashing; the event does.
                 if self.foreground != Some(h) {
@@ -1838,6 +1834,7 @@ impl App {
                 }
             }
             TIMER_QUICK_SCAN | TIMER_QUICK_BT => self.quick_timer(id),
+            TIMER_CALENDAR_MIDNIGHT => self.calendar_timer(id),
             other => self.tracker.on_timer(other),
         }
     }
@@ -1898,6 +1895,10 @@ impl App {
         }
         if self.quick.as_ref().is_some_and(|q| q.hwnd() == msg.hwnd) {
             self.on_quick_mouse(msg);
+            return true;
+        }
+        if self.calendar.as_ref().is_some_and(|c| c.hwnd() == msg.hwnd) {
+            self.calendar_event(|c, g| c.on_mouse(msg, g));
             return true;
         }
         if self.is_settings(msg.hwnd) {
@@ -2360,6 +2361,10 @@ impl App {
             self.on_quick_key(msg);
             return true;
         }
+        if self.calendar.as_ref().is_some_and(|c| c.hwnd() == msg.hwnd) {
+            self.on_calendar_key(msg);
+            return true;
+        }
         if self.start.as_ref().is_some_and(|s| s.hwnd() == msg.hwnd) {
             self.on_start_key(msg, dirty);
             return true;
@@ -2733,6 +2738,9 @@ impl App {
         if hit != Hit::Quick {
             self.close_quick();
         }
+        if hit != Hit::Clock {
+            self.close_calendar();
+        }
         if hit != Hit::Chevron {
             self.close_overflow();
         }
@@ -2753,7 +2761,7 @@ impl App {
             }
             // Vitrobar's own panel; a second click closes it.
             Hit::Quick => self.toggle_quick(dirty),
-            Hit::Clock => self.toggle_stock_flyout(StockFlyout::Notifications),
+            Hit::Clock => self.toggle_calendar(dirty),
             Hit::App(i) => {
                 let Some(g) = self.cur_groups().get(i) else {
                     return;
@@ -2797,6 +2805,7 @@ impl App {
         self.keys.set_focus(None);
         self.close_start();
         self.close_quick();
+        self.close_calendar();
         self.close_strip();
         self.close_overflow();
         self.set_tip_target(None);
@@ -3585,43 +3594,209 @@ impl App {
         }
     }
 
-    fn now_ms(&self) -> u64 {
-        self.clock_base.elapsed().as_millis() as u64
-    }
-
-    /// Tells the flyout toggle the foreground is now `h`. Only a topmost window of another
-    /// process can be a stock flyout; any other change just ends an open flyout's state.
-    fn flyout_foreground(&mut self, h: Hwnd) {
-        let now = self.now_ms();
-        // SAFETY: plain query; a stale handle gives 0.
-        let topmost =
-            unsafe { GetWindowLongPtrW(hwnd_of(h), GWL_EXSTYLE) } as u32 & WS_EX_TOPMOST.0 != 0;
-        if topmost && !is_own_window(Some(h)) {
-            self.flyout_toggle.foreground_changed(h, now);
-        } else {
-            self.flyout_toggle.unclaimable_foreground(h);
+    // -----------------------------------------------------------------------------------
+    // The calendar panel (controller in `calendar_panel.rs`)
+    // -----------------------------------------------------------------------------------
+    /// A second click on the clock of the monitor the panel is on closes it; a click on
+    /// another monitor's clock moves it there.
+    fn toggle_calendar(&mut self, dirty: &mut Dirty) {
+        let here = self.cur;
+        let was = self.calendar.as_ref().map(|c| c.monitor);
+        self.close_calendar();
+        if was != Some(here) {
+            self.open_calendar(here, dirty);
         }
     }
 
-    /// Quick Settings / clock button: a second click on the open flyout closes it (Esc, only
-    /// while that flyout really is in front); anything else opens the one clicked.
-    fn toggle_stock_flyout(&mut self, which: StockFlyout) {
-        let now = self.now_ms();
-        let fg = foreground().unwrap_or(0);
-        match self.flyout_toggle.on_click(which, fg, now) {
-            ToggleAction::Close => {
-                // Re-checked right before the key goes out: it must reach the flyout.
-                if foreground() == Some(fg) {
-                    dismiss_foreground_flyout();
+    /// Opens the calendar above the clock of the bar of monitor `id` (below it with the bar
+    /// at the top) and gives it the foreground. If it cannot open, the stock notification
+    /// centre does.
+    fn open_calendar(&mut self, id: u64, dirty: &mut Dirty) {
+        if let Some(f) = self.keys.focus() {
+            dirty.bars.insert(f.monitor);
+        }
+        // Start, quick, strip, overflow, tooltip and the keyboard focus mode close.
+        self.reset_interaction();
+        let Some(mb) = self.monitors.iter().find(|m| m.id() == id) else {
+            return;
+        };
+        dirty.bars.insert(id);
+        let anchor = clock_anchor(&mb.layout, mb.scale());
+        let (accent, lang) = self.start_look();
+        let fg = foreground().unwrap_or(0) as usize;
+        let opened = match anchor {
+            Some(anchor) => CalendarPanel::open(
+                &Gfx {
+                    comp: &self.comp,
+                    painter: &self.painter,
+                },
+                &self.style,
+                mb.info.dpi,
+                anchor,
+                self.settings.position,
+                accent,
+                lang,
+                self.notify.hwnd,
+                id,
+            ),
+            None => Err(Error::new(E_FAIL, "no clock on the bar")),
+        };
+        match opened {
+            Ok(mut c) => {
+                c.fg_at_open = fg;
+                if !c.activate() {
+                    eprintln!("vitrobar: the calendar panel could not take the foreground");
                 }
+                if self.opts.debug_state {
+                    eprintln!(
+                        "vitrobar-calendar-open rect={:?} anchor={:?} activated={}",
+                        c.rect_px(),
+                        anchor,
+                        c.activated
+                    );
+                }
+                self.calendar = Some(c);
             }
-            ToggleAction::Open => {
-                self.launcher.launch(match which {
-                    StockFlyout::QuickSettings => Job::QuickSettings,
-                    StockFlyout::Notifications => Job::Notifications,
-                });
-                self.flyout_toggle.launched(which, now);
+            Err(e) => {
+                eprintln!("vitrobar: the calendar panel failed ({e}); opening the stock one");
+                self.launcher.launch(Job::Notifications);
             }
+        }
+    }
+
+    /// True if it was open. Its timer goes with it. The foreground goes back to the window
+    /// that had it before the panel opened (same rules as Start and the quick panel).
+    fn close_calendar(&mut self) -> bool {
+        self.close_calendar_as(true)
+    }
+
+    /// [`Self::close_calendar`] for when the panel cannot be kept (Explorer restart, GPU
+    /// loss, monitor change): no foreground hand-back.
+    fn close_calendar_now(&mut self) -> bool {
+        self.close_calendar_as(false)
+    }
+
+    fn close_calendar_as(&mut self, hand_back: bool) -> bool {
+        let Some(c) = self.calendar.take() else {
+            return false;
+        };
+        if hand_back {
+            let _ = self.hand_back_foreground(c.hwnd(), c.fg_at_open);
+        }
+        drop(c);
+        if self.opts.debug_state {
+            eprintln!("vitrobar-calendar-closed");
+        }
+        true
+    }
+
+    /// Runs `f` on the open calendar and acts on what it asks for.
+    fn calendar_event(&mut self, f: impl FnOnce(&mut CalendarPanel, &Gfx) -> CalOutcome) {
+        let Some(c) = self.calendar.as_mut() else {
+            return;
+        };
+        let g = Gfx {
+            comp: &self.comp,
+            painter: &self.painter,
+        };
+        match f(c, &g) {
+            CalOutcome::None => {}
+            CalOutcome::Close => {
+                self.close_calendar();
+            }
+            CalOutcome::Notifications => {
+                self.close_calendar();
+                self.launcher.launch(Job::Notifications);
+            }
+            CalOutcome::Open(uri) => {
+                self.close_calendar();
+                self.launcher.launch(Job::Open(uri));
+            }
+        }
+    }
+
+    fn on_calendar_key(&mut self, msg: &MSG) {
+        let vk = msg.wParam.0 as u16;
+        // SAFETY: plain query of this thread's keyboard state.
+        let shift = unsafe { GetKeyState(i32::from(VK_SHIFT.0)) < 0 };
+        self.calendar_event(|c, g| c.on_key(vk, shift, g));
+    }
+
+    /// `WM_MOUSEWHEEL` and Alt+F4 on the calendar; false for anything else.
+    fn on_calendar_msg(&mut self, msg: &MSG) -> bool {
+        if !self.calendar.as_ref().is_some_and(|c| c.hwnd() == msg.hwnd) {
+            return false;
+        }
+        match msg.message {
+            WM_MOUSEWHEEL => {
+                let delta = ((msg.wParam.0 >> 16) & 0xFFFF) as u16 as i16;
+                let pt = mouse_pos(msg.lParam);
+                self.calendar_event(|c, g| c.on_wheel(delta, pt, g));
+                true
+            }
+            WM_SYSKEYDOWN if msg.wParam.0 == usize::from(VK_F4.0) => {
+                self.close_calendar();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn calendar_timer(&mut self, id: usize) {
+        if self.calendar.is_none() {
+            // Queued before the panel closed.
+            self.kill_timer(id);
+            return;
+        }
+        self.calendar_event(|c, g| c.on_timer(id, g).unwrap_or(CalOutcome::None));
+    }
+
+    /// Like [`Self::quick_foreground_changed`].
+    fn calendar_foreground_changed(&mut self, fg: Option<Hwnd>) {
+        let Some(c) = self.calendar.as_mut() else {
+            return;
+        };
+        if c.activated {
+            return;
+        }
+        let fg = fg.unwrap_or(0) as usize;
+        if fg == c.hwnd().0 as usize {
+            c.activated = true;
+        } else if fg != c.fg_at_open {
+            self.close_calendar();
+        }
+    }
+
+    /// Moves the open calendar to where the clock of bar `k` is now (when it is that bar's).
+    fn calendar_reanchor(&mut self, k: usize) {
+        let mb = &self.monitors[k];
+        if !self.calendar.as_ref().is_some_and(|c| c.monitor == mb.id()) {
+            return;
+        }
+        let Some(anchor) = clock_anchor(&mb.layout, mb.scale()) else {
+            self.close_calendar();
+            return;
+        };
+        if let Some(c) = self.calendar.as_mut() {
+            if let Err(e) = c.reanchor(&self.comp, anchor) {
+                eprintln!("vitrobar: the calendar panel could not follow the clock: {e}");
+                self.close_calendar();
+            }
+        }
+    }
+
+    fn calendar_restyle(&mut self) {
+        let (accent, _) = self.start_look();
+        let Some(c) = self.calendar.as_mut() else {
+            return;
+        };
+        let g = Gfx {
+            comp: &self.comp,
+            painter: &self.painter,
+        };
+        if let Err(e) = c.restyle(&g, &self.style, accent) {
+            eprintln!("vitrobar: the calendar panel could not be restyled: {e}");
+            self.close_calendar();
         }
     }
 
@@ -4329,6 +4504,7 @@ impl App {
         // Its surfaces belonged to the lost device.
         self.close_start_now();
         self.close_quick_now();
+        self.close_calendar_now();
         self.close_settings();
         // GPU device removed (TDR, driver update): recreate, then redraw everything.
         self.gpu_lost = true;
@@ -4358,6 +4534,14 @@ impl App {
         if inbox.debug_open_quick && self.opts.debug_state {
             // Debug hook (live checks): toggles the quick panel.
             self.toggle_quick(dirty);
+        }
+        if inbox.debug_open_calendar && self.opts.debug_state {
+            // Debug hook (live checks): toggles the calendar on the current bar's clock.
+            self.toggle_calendar(dirty);
+        }
+        if inbox.clock {
+            // The system clock or time zone changed: today may have moved.
+            self.calendar_event(|c, g| c.refresh_today(g));
         }
         if inbox.quick {
             self.quick_event(|q, g| q.on_wake(g));
@@ -4449,6 +4633,13 @@ impl App {
             // A click elsewhere or a switch to another app.
             self.close_quick();
         }
+        if self
+            .calendar
+            .as_ref()
+            .is_some_and(|c| deactivated.contains(&c.hwnd()))
+        {
+            self.close_calendar();
+        }
         if inbox.fullscreen {
             // Explorer may have raised its own Shell_TrayWnd for the full-screen change: go
             // back above it. (Restarts, settings and display changes reach the tray host's
@@ -4488,6 +4679,7 @@ impl App {
         if d.monitors && self.reconcile_monitors(current_monitors(self.opts.debug_state)) {
             // Its anchor moved or went away.
             self.close_quick_now();
+            self.close_calendar_now();
             // New bars, new geometry: everything is laid out and drawn again, and every
             // window's monitor is read again (windows on a removed monitor were moved).
             d.visuals = true;
@@ -4528,6 +4720,7 @@ impl App {
                 // Its glass was made for the old style.
                 self.close_start_now();
                 self.quick_restyle();
+                self.calendar_restyle();
                 self.settings_restyle();
                 self.settings_render();
             }
@@ -4750,6 +4943,7 @@ pub fn run(opts: Options) -> Result<()> {
                     let _ = TranslateMessage(&msg);
                 },
                 WM_CHAR | WM_SYSKEYDOWN | WM_MOUSEWHEEL if app.on_quick_msg(&msg) => {}
+                WM_SYSKEYDOWN | WM_MOUSEWHEEL if app.on_calendar_msg(&msg) => {}
                 WM_CHAR | WM_SYSKEYDOWN | WM_MOUSEWHEEL if app.on_start_msg(&msg, &mut dirty) => {}
                 WM_SYSKEYDOWN | WM_MOUSEWHEEL if app.on_settings_msg(&msg, &mut dirty) => {}
                 _ => unsafe {

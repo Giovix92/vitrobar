@@ -3,7 +3,8 @@
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::SYSTEMTIME;
 use windows::Win32::Globalization::{
-    GetDateFormatEx, GetTimeFormatEx, DATE_SHORTDATE, TIME_NOSECONDS,
+    GetDateFormatEx, GetLocaleInfoEx, GetTimeFormatEx, DATE_SHORTDATE, LOCALE_IFIRSTDAYOFWEEK,
+    TIME_NOSECONDS,
 };
 use windows::Win32::System::SystemInformation::GetLocalTime;
 
@@ -49,6 +50,43 @@ pub fn clock_now() -> (String, u32) {
     (format!("{time}\n{date}"), into_minute)
 }
 
+/// The user's first day of the week: 0 = Monday ... 6 = Sunday (`LOCALE_IFIRSTDAYOFWEEK`);
+/// Monday if the locale does not say.
+pub fn first_day_of_week() -> u32 {
+    let mut b = [0u16; 8];
+    // SAFETY: the buffer is passed as a slice with its length; a null locale name selects
+    // the user default.
+    let n = unsafe { GetLocaleInfoEx(PCWSTR::null(), LOCALE_IFIRSTDAYOFWEEK, Some(&mut b)) };
+    if n <= 0 {
+        return 0;
+    }
+    parse_first_day(&b[..(n as usize - 1).min(b.len())])
+}
+
+fn parse_first_day(s: &[u16]) -> u32 {
+    String::from_utf16_lossy(s)
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|d| *d < 7)
+        .unwrap_or(0)
+}
+
+/// Today's local date and the milliseconds left until the next local midnight.
+pub fn today_and_midnight_ms() -> ((i32, u8, u8), u64) {
+    // SAFETY: plain query.
+    let t = unsafe { GetLocalTime() };
+    (
+        (i32::from(t.wYear), t.wMonth as u8, t.wDay as u8),
+        vitro_core::calendar::ms_until_midnight(
+            u32::from(t.wHour),
+            u32::from(t.wMinute),
+            u32::from(t.wSecond),
+            u32::from(t.wMilliseconds),
+        ),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,6 +105,22 @@ mod tests {
         assert!(time.contains("07"), "{time:?}");
         assert!(date.contains("26"), "{date:?}");
         assert!(!time.contains('\0') && !date.contains('\0'));
+    }
+
+    #[test]
+    fn first_day_parses_the_locale_string() {
+        assert_eq!(parse_first_day(&[b'6' as u16]), 6);
+        assert_eq!(parse_first_day(&[b'0' as u16]), 0);
+        assert_eq!(parse_first_day(&[b'x' as u16]), 0);
+        assert_eq!(parse_first_day(&[]), 0);
+        assert!(first_day_of_week() < 7);
+    }
+
+    #[test]
+    fn today_is_plausible() {
+        let ((y, m, d), left) = today_and_midnight_ms();
+        assert!(y >= 2024 && (1..=12).contains(&m) && (1..=31).contains(&d));
+        assert!((1..=86_400_000).contains(&left));
     }
 
     #[test]

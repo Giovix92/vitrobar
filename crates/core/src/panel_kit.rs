@@ -29,12 +29,17 @@ pub const SLIDER_TRAILING_W_DIP: f32 = 32.0;
 pub const THUMB_DIP: f32 = 16.0;
 /// Share of a `more` tile's width taken by the chevron half.
 pub const MORE_SHARE: f32 = 0.4;
+/// Width of a header action button.
+pub const HEADER_ACTION_W_DIP: f32 = 32.0;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Row {
     Header {
         text: String,
         trailing: Option<String>,
+        /// Glyph buttons at the right end of the header (a month's chevrons), in reading
+        /// order; each is a [`Part::HeaderAction`]. `trailing` text moves left of them.
+        actions: Vec<(u32, char)>,
     },
     Tiles(Vec<Tile>),
     Slider {
@@ -86,6 +91,7 @@ pub enum Part {
     TileMore(u32),
     Slider(u32),
     SliderTrailing(u32),
+    HeaderAction(u32),
     Item(u32),
     Button(u32),
     Custom(u32),
@@ -142,6 +148,20 @@ pub fn layout(rows: &[Row]) -> PanelLayout {
             h,
         });
         match r {
+            Row::Header { actions, .. } => {
+                let n = actions.len() as f32;
+                for (i, (id, _)) in actions.iter().enumerate() {
+                    parts.push((
+                        Part::HeaderAction(*id),
+                        Rect {
+                            x: WIDTH_DIP - PAD_DIP - (n - i as f32) * HEADER_ACTION_W_DIP,
+                            y,
+                            w: HEADER_ACTION_W_DIP,
+                            h,
+                        },
+                    ));
+                }
+            }
             Row::Tiles(tiles) => {
                 let w = (inner - (TILES_PER_ROW - 1) as f32 * GAP_DIP) / TILES_PER_ROW as f32;
                 for (i, t) in tiles.iter().enumerate() {
@@ -423,6 +443,31 @@ mod tests {
     }
 
     #[test]
+    fn header_actions_sit_at_the_right_end_in_reading_order() {
+        let l = layout(&[Row::Header {
+            text: "h".into(),
+            trailing: None,
+            actions: vec![(1, 'a'), (2, 'b')],
+        }]);
+        let (a, b) = (
+            rect_of(&l, Part::HeaderAction(1)),
+            rect_of(&l, Part::HeaderAction(2)),
+        );
+        assert_eq!(b.right(), 360.0 - 12.0);
+        assert_eq!(a.right(), b.x);
+        assert_eq!((a.w, a.y, a.h), (32.0, 12.0, 36.0));
+        assert_eq!(hit(&l, (b.x + 1.0, 20.0), 0.0), Some(Part::HeaderAction(2)));
+        assert_eq!(hit(&l, (20.0, 20.0), 0.0), None);
+        // A header without actions adds no part.
+        let l = layout(&[Row::Header {
+            text: "h".into(),
+            trailing: None,
+            actions: Vec::new(),
+        }]);
+        assert!(l.parts.is_empty());
+    }
+
+    #[test]
     fn empty_panel_has_padding_only() {
         assert_eq!(layout(&[]).size, (360.0, 24.0));
     }
@@ -433,6 +478,7 @@ mod tests {
             Row::Header {
                 text: "h".into(),
                 trailing: None,
+                actions: Vec::new(),
             },
             Row::Custom { id: 1, h: 100.0 },
             Row::Separator,

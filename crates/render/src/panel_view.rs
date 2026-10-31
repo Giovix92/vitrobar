@@ -182,15 +182,28 @@ fn build_row(ctx: &Ctx, l: &PanelLayout, index: usize, row: &Row) -> Result<RowV
     let text = ctx.text;
     let inner = (WIDTH_DIP - 2.0 * PAD_DIP) * s;
     match row {
-        Row::Header { text: t, trailing } => {
+        Row::Header {
+            text: t,
+            trailing,
+            actions,
+        } => {
             let mut room = inner;
+            let mut right = (WIDTH_DIP - PAD_DIP) * s;
+            for (id, g) in actions {
+                if let Some(r) = part_rect(l, Part::HeaderAction(*id)) {
+                    let g = g.to_string();
+                    texts.add(16.0, text, &g, FontKind::Glyph, boxf(local(&r, band.y, s)));
+                    right = right.min(round(r.x * s) as f32);
+                }
+            }
+            room -= (WIDTH_DIP - PAD_DIP) * s - right;
             if let Some(tr) = trailing {
                 let tw = ctx
                     .painter
                     .measure(tr, FontKind::Text, SMALL_FONT_DIP * s)
                     .map(|(tw, _)| tw.ceil() + 2.0)
                     .unwrap_or(60.0 * s);
-                let x = (WIDTH_DIP - PAD_DIP) * s - tw;
+                let x = right - tw;
                 texts.add(
                     SMALL_FONT_DIP,
                     dim(text),

@@ -25,6 +25,7 @@ fn rows(volume: f32, custom_h: f32) -> Vec<Row> {
         Row::Header {
             text: "Quick".into(),
             trailing: Some("85 %".into()),
+            actions: vec![(30, 'x')],
         },
         Row::Tiles(vec![tile(1, true, true), tile(2, false, false)]),
         Row::Slider {

@@ -452,6 +452,7 @@ fn wifi_rows(i: &QuickInputs, lang: Lang) -> Vec<Row> {
         trailing: w
             .is_some_and(|w| w.scanning && w.radio_on != Some(false))
             .then(|| tr(lang, Key::Scanning).to_string()),
+        actions: Vec::new(),
     });
     let Some(w) = w else {
         notice(&mut rows, i, lang);
@@ -513,6 +514,7 @@ fn bt_rows(i: &QuickInputs, lang: Lang) -> Vec<Row> {
     let mut rows = vec![Row::Header {
         text: tr(lang, Key::QuickBluetooth).to_string(),
         trailing: None,
+        actions: Vec::new(),
     }];
     let b = bt_present(i);
     if let Some(b) = b {
@@ -555,6 +557,7 @@ fn output_rows(i: &QuickInputs, lang: Lang) -> Vec<Row> {
     let mut rows = vec![Row::Header {
         text: tr(lang, Key::SoundOutput).to_string(),
         trailing: None,
+        actions: Vec::new(),
     }];
     notice(&mut rows, i, lang);
     let devices = i.audio.as_ref().map_or(&[][..], |a| &a.devices[..]);

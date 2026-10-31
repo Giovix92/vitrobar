@@ -152,6 +152,7 @@ pub enum Key {
     NoticeBadPassword,
     NoticeConnectFailed,
     NoticeFailed,
+    DateTimeSettings,
 }
 
 pub const ALL_KEYS: &[Key] = &[
@@ -289,6 +290,7 @@ pub const ALL_KEYS: &[Key] = &[
     Key::NoticeBadPassword,
     Key::NoticeConnectFailed,
     Key::NoticeFailed,
+    Key::DateTimeSettings,
 ];
 
 pub fn tr(lang: Lang, key: Key) -> &'static str {
@@ -567,6 +569,8 @@ pub fn tr(lang: Lang, key: Key) -> &'static str {
         (Lang::It, Key::NoticeConnectFailed) => "Impossibile connettersi",
         (Lang::En, Key::NoticeFailed) => "Something went wrong",
         (Lang::It, Key::NoticeFailed) => "Qualcosa non ha funzionato",
+        (Lang::En, Key::DateTimeSettings) => "Date & time settings",
+        (Lang::It, Key::DateTimeSettings) => "Impostazioni data e ora",
     }
 }
 
@@ -587,7 +591,7 @@ mod tests {
             assert!(!tr(Lang::En, k).is_empty());
             assert!(!tr(Lang::It, k).is_empty());
         }
-        assert_eq!(ALL_KEYS.len(), 134);
+        assert_eq!(ALL_KEYS.len(), 135);
     }
     #[test]
     fn italian_differs_from_english() {
