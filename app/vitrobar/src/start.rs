@@ -350,8 +350,10 @@ impl Geom {
 }
 
 /// Makes sure the first screenful of results shows some files when there are any: if fewer
-/// than `min(2, files)` file results fall within the first `rows`, app results are dropped
-/// from the end of the apps until they do (the rest stays reachable by scrolling).
+/// than `min(2, files)` file results fall within the first `rows`, app results are removed
+/// from the end of the apps until they do. Removed apps are not listed at all (the best
+/// matches stay; typing more of the name brings a removed one back); everything else is
+/// kept and stays reachable by scrolling.
 pub fn fit_results(mut items: Vec<ResultKind>, rows: usize) -> Vec<ResultKind> {
     let files = items
         .iter()
@@ -2531,6 +2533,10 @@ mod tests {
             2
         );
         assert_eq!(fitted.len(), 12);
+        // The apps that made room are removed, not moved after the files.
+        for a in 2..6 {
+            assert!(!fitted.contains(&ResultKind::App(a)), "app {a} is removed");
+        }
         assert!(fitted.contains(&ResultKind::Setting(2)));
         assert!(fitted.contains(&ResultKind::File(5)));
         // Room enough, or no files: unchanged.
