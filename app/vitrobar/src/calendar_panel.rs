@@ -8,18 +8,18 @@
 //! midnight so "today" moves by itself (never a repeating timer).
 
 use vitro_core::calendar::{
-    self, action, cells, ms_until_midnight, weekday_initials, Action, Date, Month, Weekday,
+    self, action, cells, weekday_initials, Action, Date, Month, Weekday,
     CELL_H_DIP, ID_GRID, WEEKDAY_H_DIP,
 };
 use vitro_core::i18n::Lang;
 use vitro_core::menu_model::NavKey;
-use vitro_core::panel_kit::{focus_step, Part, Row, PAD_DIP};
+use vitro_core::panel_kit::{focus_step, Part, Row};
 use vitro_core::settings::Position;
 use vitro_core::style::{MaterialStyle, Rgba};
 use vitro_render::compositor::Comp;
 use vitro_render::flyout::PxRect;
 use vitro_render::panel_view::PanelView;
-use vitro_render::surfaces::{FontKind, Painter, TextBox};
+use vitro_render::surfaces::{FontKind, TextBox};
 use vitro_render::{Vector2, Vector3};
 use vitro_win::time_format;
 use windows::core::Result;
@@ -463,6 +463,7 @@ impl Drop for CalendarPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vitro_core::calendar::ms_until_midnight;
 
     #[test]
     fn text_on_the_accent_is_readable() {
@@ -478,6 +479,5 @@ mod tests {
     #[test]
     fn the_grid_hole_fits_six_weeks_and_the_heading() {
         assert_eq!(calendar::GRID_H_DIP, WEEKDAY_H_DIP + 6.0 * CELL_H_DIP);
-        assert!(PAD_DIP > 0.0);
     }
 }

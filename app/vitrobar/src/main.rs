@@ -8,6 +8,7 @@
 
 mod app;
 mod bar_window;
+mod calendar_panel;
 mod icon_loader;
 mod keys;
 mod launcher;

@@ -365,7 +365,17 @@ fn to_px(r: Rect, scale: f32) -> PxRect {
 /// The quick button's rectangle with the full height of the bar surface it sits on, in
 /// screen px; `None` when the bar shows no quick button.
 fn quick_anchor(l: &BarLayout, scale: f32) -> Option<PxRect> {
-    let r = anchor_for(l, AnchorTarget::Quick);
+    surface_anchor(l, AnchorTarget::Quick, scale)
+}
+
+/// The clock's rectangle with the full height of its bar surface, in screen px; `None` when
+/// the bar shows no clock.
+fn clock_anchor(l: &BarLayout, scale: f32) -> Option<PxRect> {
+    surface_anchor(l, AnchorTarget::Clock, scale)
+}
+
+fn surface_anchor(l: &BarLayout, target: AnchorTarget, scale: f32) -> Option<PxRect> {
+    let r = anchor_for(l, target);
     if r.w <= 0.0 {
         return None;
     }

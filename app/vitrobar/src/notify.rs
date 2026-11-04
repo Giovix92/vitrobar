@@ -78,6 +78,18 @@ pub fn open_quick_msg() -> u32 {
     })
 }
 
+/// The registered window message that toggles the calendar panel; honoured only with
+/// `--debug-state`, like [`open_start_msg`].
+pub fn open_calendar_msg() -> u32 {
+    static ID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    // SAFETY: plain registration call with a static string.
+    *ID.get_or_init(|| unsafe {
+        windows::Win32::UI::WindowsAndMessaging::RegisterWindowMessageW(windows::core::w!(
+            "Vitrobar.Debug.OpenCalendar"
+        ))
+    })
+}
+
 /// Timers on the notify window (ids distinct from the tracker's 0x5601/0x5602).
 pub const TIMER_CLOCK: usize = 0x5701;
 pub const TIMER_GPU_RETRY: usize = 0x5702;
@@ -98,6 +110,8 @@ pub const TIMER_START_CLOSED: usize = 0x5709;
 pub const TIMER_QUICK_SCAN: usize = 0x570A;
 /// One-shot: a Bluetooth connect / disconnect may have expired unconfirmed.
 pub const TIMER_QUICK_BT: usize = 0x570B;
+/// One-shot at the next local midnight while the calendar is open: today moves.
+pub const TIMER_CALENDAR_MIDNIGHT: usize = 0x570C;
 
 /// Everything the notify window received since the last [`take_inbox`].
 #[derive(Debug, Default, PartialEq)]
@@ -148,6 +162,8 @@ pub struct Inbox {
     pub power: bool,
     /// The debug message [`open_quick_msg`] arrived (only acted on with `--debug-state`).
     pub debug_open_quick: bool,
+    /// The debug message [`open_calendar_msg`] arrived (only acted on with `--debug-state`).
+    pub debug_open_calendar: bool,
 }
 
 thread_local! {
@@ -321,6 +337,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         m if m == open_quick_msg() => {
             // Payload-free; ignored by the app unless it runs with --debug-state.
             with_inbox(|i| i.debug_open_quick = true);
+            return LRESULT(0);
+        }
+        m if m == open_calendar_msg() => {
+            // Payload-free; ignored by the app unless it runs with --debug-state.
+            with_inbox(|i| i.debug_open_calendar = true);
             return LRESULT(0);
         }
         m if m == taskbar_created_msg() => {
@@ -614,10 +635,11 @@ mod tests {
                 None,
             );
             SendMessageW(n.hwnd, open_quick_msg(), None, None);
+            SendMessageW(n.hwnd, open_calendar_msg(), None, None);
         }
         pump(n.hwnd);
         let inbox = take_inbox();
-        assert!(inbox.quick && inbox.power && inbox.debug_open_quick);
+        assert!(inbox.quick && inbox.power && inbox.debug_open_quick && inbox.debug_open_calendar);
         // Other power broadcasts (suspend, resume) are not the panel's business.
         // SAFETY: as above.
         unsafe {
