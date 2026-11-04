@@ -75,8 +75,9 @@ fn baseline(dir: &Path) -> Duration {
     bridge(&settings, &own, "powershell", SAMPLE).2
 }
 
-/// The bridge's 950 ms budget plus some slack for the cut and the exit.
-const OVER_BASELINE: Duration = Duration::from_millis(1200);
+/// The bridge's 950 ms budget plus slack for the cut and the exit on a loaded
+/// machine; the slow commands below sleep 8 s, far past it.
+const OVER_BASELINE: Duration = Duration::from_millis(2500);
 
 fn slash(p: &Path) -> String {
     p.display().to_string().replace('\\', "/")
@@ -149,21 +150,35 @@ fn git_bash_runs_the_previous_status_line_with_the_same_input() {
 #[test]
 fn powershell_runs_the_previous_status_line_without_git_bash() {
     let dir = tempfile::tempdir().unwrap();
-    let settings = settings_with(dir.path(), Some("Write-Output ps-hi"));
-    let (out, ok, _) = bridge(&settings, dir.path(), "powershell", SAMPLE);
-    assert!(ok);
+    // A cold powershell.exe can take longer than the bridge's budget (CI
+    // runners), and a cut run prints nothing when nothing is cached yet. A cut
+    // run caches nothing either, so a later attempt can only pass on output
+    // PowerShell really produced.
+    let run = |cmd: &str| {
+        let settings = settings_with(dir.path(), Some(cmd));
+        let mut out = String::new();
+        for _ in 0..3 {
+            let (o, ok, _) = bridge(&settings, dir.path(), "powershell", SAMPLE);
+            assert!(ok);
+            out = o;
+            if !out.is_empty() {
+                break;
+            }
+        }
+        out
+    };
+    let out = run("Write-Output ps-hi");
     assert!(out.contains("ps-hi"), "{out:?}");
-    let settings = settings_with(dir.path(), Some("$input | Out-String"));
-    let (out, _, _) = bridge(&settings, dir.path(), "powershell", SAMPLE);
+    let out = run("$input | Out-String");
     assert!(out.contains("rate_limits"), "{out:?}");
 }
 
 #[test]
 fn a_hanging_previous_command_is_cut_off_after_a_second() {
     let dir = tempfile::tempdir().unwrap();
-    let mut cases = vec![("powershell".to_string(), "Start-Sleep 5")];
+    let mut cases = vec![("powershell".to_string(), "Start-Sleep 8")];
     if let Some(bash) = git_bash() {
-        cases.push((bash.display().to_string(), "sleep 5"));
+        cases.push((bash.display().to_string(), "sleep 8"));
     }
     for (shell, cmd) in cases {
         let base = baseline(dir.path());
@@ -189,7 +204,7 @@ fn a_slow_previous_status_line_prints_its_last_complete_output() {
     let flag = dir.path().join("slow");
     // Fast while the flag file is missing, slower than the bridge's budget once it exists;
     // it prints only at the end either way.
-    let cmd = format!("[ -e \"{}\" ] && sleep 3; echo hello-cache", slash(&flag));
+    let cmd = format!("[ -e \"{}\" ] && sleep 8; echo hello-cache", slash(&flag));
     let settings = settings_with(dir.path(), Some(&cmd));
     let (out, _, _) = bridge(&settings, dir.path(), &bash, SAMPLE);
     assert!(out.contains("hello-cache"), "{out:?}");
@@ -210,7 +225,7 @@ fn a_slow_status_line_with_nothing_cached_prints_what_it_wrote_so_far() {
     let bash = bash.display().to_string();
     let dir = tempfile::tempdir().unwrap();
     let base = baseline(dir.path());
-    let settings = settings_with(dir.path(), Some("echo partial-line; sleep 3"));
+    let settings = settings_with(dir.path(), Some("echo partial-line; sleep 8"));
     let (out, ok, took) = bridge(&settings, dir.path(), &bash, SAMPLE);
     assert!(ok);
     assert!(took < base + OVER_BASELINE, "{took:?} (baseline {base:?})");
