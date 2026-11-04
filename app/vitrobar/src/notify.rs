@@ -55,6 +55,8 @@ pub const WM_APP_START_DATA: u32 = WM_APP + 0x26;
 pub const WM_APP_QUICK: u32 = WM_APP + 0x27;
 /// The music widget's media session changed (payload-free wake-up from its worker).
 pub const WM_APP_MEDIA: u32 = WM_APP + 0x28;
+/// The Claude widget's data file changed (payload-free wake-up from its folder watch).
+pub const WM_APP_CLAUDE: u32 = WM_APP + 0x29;
 
 /// The registered window message that toggles the Start panel on the primary monitor. The
 /// app honours it only when it runs with `--debug-state` (the perf check posts it).
@@ -114,6 +116,10 @@ pub const TIMER_QUICK_SCAN: usize = 0x570A;
 pub const TIMER_QUICK_BT: usize = 0x570B;
 /// One-shot at the next local midnight while the calendar is open: today moves.
 pub const TIMER_CALENDAR_MIDNIGHT: usize = 0x570C;
+/// One-shot: the Claude widget's data turns "old" on the pill.
+pub const TIMER_CLAUDE_STALE: usize = 0x570D;
+/// One-shot while the Claude panel is open: a minute passed ("resets in" counts down).
+pub const TIMER_CLAUDE_MINUTE: usize = 0x570E;
 
 /// Everything the notify window received since the last [`take_inbox`].
 #[derive(Debug, Default, PartialEq)]
@@ -168,6 +174,8 @@ pub struct Inbox {
     pub debug_open_calendar: bool,
     /// [`WM_APP_MEDIA`]: drain the music widget's media service.
     pub media: bool,
+    /// [`WM_APP_CLAUDE`]: read the Claude widget's data again.
+    pub claude: bool,
 }
 
 thread_local! {
@@ -274,6 +282,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_APP_MEDIA => {
             // A wake-up: wParam / lParam are ignored (anyone may post this id).
             with_inbox(|i| i.media = true);
+            return LRESULT(0);
+        }
+        WM_APP_CLAUDE => {
+            // A wake-up: wParam / lParam are ignored (anyone may post this id).
+            with_inbox(|i| i.claude = true);
             return LRESULT(0);
         }
         WM_POWERBROADCAST => {
@@ -646,11 +659,12 @@ mod tests {
             SendMessageW(n.hwnd, open_quick_msg(), None, None);
             SendMessageW(n.hwnd, open_calendar_msg(), None, None);
             PostMessageW(Some(n.hwnd), WM_APP_MEDIA, WPARAM(0), LPARAM(0)).unwrap();
+            PostMessageW(Some(n.hwnd), WM_APP_CLAUDE, WPARAM(0), LPARAM(0)).unwrap();
         }
         pump(n.hwnd);
         let inbox = take_inbox();
         assert!(inbox.quick && inbox.power && inbox.debug_open_quick && inbox.debug_open_calendar);
-        assert!(inbox.media);
+        assert!(inbox.media && inbox.claude);
         // Other power broadcasts (suspend, resume) are not the panel's business.
         // SAFETY: as above.
         unsafe {

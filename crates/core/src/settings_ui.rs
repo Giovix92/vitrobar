@@ -411,6 +411,22 @@ fn step_focus(m: &mut SettingsModel, forward: bool) {
     }
 }
 
+/// The Claude widget's hint line: what it does, or why turning it on failed.
+pub fn set_claude_hint(m: &mut SettingsModel, failed: bool) {
+    let key = if failed {
+        Key::ClaudeSetupFailed
+    } else {
+        Key::ClaudeWidgetHint
+    };
+    if let Some(c) = m
+        .controls
+        .iter_mut()
+        .find(|c| c.id == ControlId::ClaudeWidgetHint)
+    {
+        c.kind = ControlKind::Text(key);
+    }
+}
+
 /// Moves focus to the next focusable control (links are focusable, plain text is not),
 /// wrapping at the end.
 pub fn focus_next(m: &mut SettingsModel) {
@@ -606,5 +622,20 @@ mod tests {
             assert!(ALL_KEYS.contains(&c.label));
             assert!(!tr(Lang::It, c.label).is_empty());
         }
+    }
+
+    #[test]
+    fn the_claude_hint_says_when_setup_failed() {
+        let mut m = build_model(&Settings::default(), 600.0);
+        set_claude_hint(&mut m, true);
+        assert_eq!(
+            find(&m, ControlId::ClaudeWidgetHint).kind,
+            ControlKind::Text(Key::ClaudeSetupFailed)
+        );
+        set_claude_hint(&mut m, false);
+        assert_eq!(
+            find(&m, ControlId::ClaudeWidgetHint).kind,
+            ControlKind::Text(Key::ClaudeWidgetHint)
+        );
     }
 }

@@ -7,6 +7,7 @@ pub mod autostart;
 pub mod bluetooth;
 pub mod brightness;
 pub mod catalog;
+pub mod claude_usage;
 pub mod clipboard;
 pub mod desktops;
 pub mod event_queue;

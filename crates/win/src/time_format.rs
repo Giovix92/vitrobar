@@ -1,7 +1,8 @@
 //! Clock text in the user's locale format.
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::SYSTEMTIME;
+use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
+use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 use windows::Win32::Globalization::{
     GetDateFormatEx, GetLocaleInfoEx, GetTimeFormatEx, DATE_SHORTDATE, LOCALE_IFIRSTDAYOFWEEK,
     TIME_NOSECONDS,
@@ -87,6 +88,35 @@ pub fn today_and_midnight_ms() -> ((i32, u8, u8), u64) {
     )
 }
 
+/// The local short time (no seconds) of `epoch_secs`, in the user's format; empty if it cannot
+/// be converted.
+pub fn local_short_time(epoch_secs: i64) -> String {
+    // FILETIME: 100 ns ticks since 1601-01-01.
+    const EPOCH_DIFF_S: i64 = 11_644_473_600;
+    let Some(ticks) = epoch_secs
+        .checked_add(EPOCH_DIFF_S)
+        .and_then(|s| s.checked_mul(10_000_000))
+        .filter(|t| *t >= 0)
+    else {
+        return String::new();
+    };
+    let ft = FILETIME {
+        dwLowDateTime: ticks as u32,
+        dwHighDateTime: (ticks >> 32) as u32,
+    };
+    let mut utc = SYSTEMTIME::default();
+    let mut local = SYSTEMTIME::default();
+    // SAFETY: locals passed by reference; a null time zone means the current one.
+    let ok = unsafe {
+        FileTimeToSystemTime(&ft, &mut utc).is_ok()
+            && SystemTimeToTzSpecificLocalTime(None, &utc, &mut local).is_ok()
+    };
+    if !ok {
+        return String::new();
+    }
+    clock_lines_at(&local).0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,5 +158,14 @@ mod tests {
         let (text, ms) = clock_now();
         assert_eq!(text.lines().count(), 2, "{text:?}");
         assert!(ms < 61_000);
+    }
+
+    #[test]
+    fn epoch_times_read_as_local_short_times() {
+        let a = local_short_time(1_793_469_600);
+        let b = local_short_time(1_793_469_600 + 3600);
+        assert!(!a.is_empty() && !b.is_empty());
+        assert_ne!(a, b);
+        assert_eq!(a, local_short_time(1_793_469_600 + 20), "seconds are not shown");
     }
 }

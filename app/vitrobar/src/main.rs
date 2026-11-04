@@ -9,6 +9,7 @@
 mod app;
 mod bar_window;
 mod calendar_panel;
+mod claude_bridge;
 mod icon_loader;
 mod keys;
 mod launcher;
@@ -32,7 +33,8 @@ const USAGE: &str =
     "usage: vitrobar [--debug-state] [--console]   (the watchdog, which starts the bar)\n\
        vitrobar --bar [--parent <pid>] [--debug-state] [--console]\n\
        vitrobar --adopt <bar pid> [--debug-state] [--console]\n\
-       vitrobar --restore";
+       vitrobar --restore
+       vitrobar --claude-statusline   (Claude Code's status line, for the Claude widget)";
 
 /// `--restore` (the RunOnce safety net, run at sign-in): Explorer may still be starting, so
 /// wait a little for its taskbar before putting it back.
@@ -151,6 +153,10 @@ fn main() -> ExitCode {
     // Only one of --bar, --adopt, --restore.
     let mut mode_flag: Option<String> = None;
     let mut opts = app::Options::default();
+    if std::env::args().nth(1).as_deref() == Some(vitro_win::claude_usage::BRIDGE_ARG) {
+        // Before anything else: Claude Code is waiting for the status line.
+        return claude_bridge::run();
+    }
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         if matches!(arg.as_str(), "--bar" | "--adopt" | "--restore") {

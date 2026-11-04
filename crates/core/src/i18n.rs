@@ -153,6 +153,13 @@ pub enum Key {
     NoticeConnectFailed,
     NoticeFailed,
     DateTimeSettings,
+    ClaudeNoData,
+    Stale,
+    ClaudeSetupFailed,
+    ClaudeUpdatedHint,
+    ClaudeFiveHour,
+    ClaudeWeekly,
+    ResetsNow,
 }
 
 pub const ALL_KEYS: &[Key] = &[
@@ -291,6 +298,13 @@ pub const ALL_KEYS: &[Key] = &[
     Key::NoticeConnectFailed,
     Key::NoticeFailed,
     Key::DateTimeSettings,
+    Key::ClaudeNoData,
+    Key::Stale,
+    Key::ClaudeSetupFailed,
+    Key::ClaudeUpdatedHint,
+    Key::ClaudeFiveHour,
+    Key::ClaudeWeekly,
+    Key::ResetsNow,
 ];
 
 pub fn tr(lang: Lang, key: Key) -> &'static str {
@@ -571,6 +585,20 @@ pub fn tr(lang: Lang, key: Key) -> &'static str {
         (Lang::It, Key::NoticeFailed) => "Qualcosa non ha funzionato",
         (Lang::En, Key::DateTimeSettings) => "Date & time settings",
         (Lang::It, Key::DateTimeSettings) => "Impostazioni data e ora",
+        (Lang::En, Key::ClaudeNoData) => "Claude: no data",
+        (Lang::It, Key::ClaudeNoData) => "Claude: nessun dato",
+        (Lang::En, Key::Stale) => "old",
+        (Lang::It, Key::Stale) => "vecchio",
+        (Lang::En, Key::ClaudeSetupFailed) => "Couldn't set up Claude Code's status line.",
+        (Lang::It, Key::ClaudeSetupFailed) => "Impossibile configurare la riga di stato di Claude Code.",
+        (Lang::En, Key::ClaudeUpdatedHint) => "Updated while you use Claude Code.",
+        (Lang::It, Key::ClaudeUpdatedHint) => "Si aggiorna mentre usi Claude Code.",
+        (Lang::En, Key::ClaudeFiveHour) => "5-hour limit",
+        (Lang::It, Key::ClaudeFiveHour) => "Limite di 5 ore",
+        (Lang::En, Key::ClaudeWeekly) => "Weekly limit",
+        (Lang::It, Key::ClaudeWeekly) => "Limite settimanale",
+        (Lang::En, Key::ResetsNow) => "resets now",
+        (Lang::It, Key::ResetsNow) => "si azzera ora",
     }
 }
 
@@ -591,7 +619,7 @@ mod tests {
             assert!(!tr(Lang::En, k).is_empty());
             assert!(!tr(Lang::It, k).is_empty());
         }
-        assert_eq!(ALL_KEYS.len(), 135);
+        assert_eq!(ALL_KEYS.len(), 142);
     }
     #[test]
     fn italian_differs_from_english() {

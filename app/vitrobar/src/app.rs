@@ -115,12 +115,14 @@ use crate::keys::{
 use crate::launcher::{Job, Launcher};
 use crate::menus::{app_menu, bar_menu, power_menu, start_item_menu, MenuChoice, MenuCtx};
 use crate::notify::{
-    inbox_pending, take_inbox, Inbox, NotifyWindow, TIMER_CALENDAR_MIDNIGHT, TIMER_CLOCK, TIMER_GPU_RETRY, TIMER_HOVER_HIDE,
+    inbox_pending, take_inbox, Inbox, NotifyWindow, TIMER_CALENDAR_MIDNIGHT, TIMER_CLAUDE_MINUTE, TIMER_CLAUDE_STALE, TIMER_CLOCK, TIMER_GPU_RETRY, TIMER_HOVER_HIDE,
     TIMER_HOVER_SHOW, TIMER_MARGIN_COLLAPSE, TIMER_QUICK_BT, TIMER_QUICK_SCAN, TIMER_REASSERT,
     TIMER_START_CLOSED, TIMER_START_PREFETCH, TIMER_TRAY_TIP, WM_APP_TAKE_OVER,
 };
 use crate::calendar_panel::{CalendarPanel, Outcome as CalOutcome};
-use crate::widgets::{Music, MusicPanel, Outcome as MusicOutcome};
+use crate::widgets::{Claude, ClaudePanel, Music, MusicPanel, Outcome as MusicOutcome};
+use vitro_core::settings_ui::set_claude_hint;
+use vitro_win::claude_usage::{self, Wrap};
 use crate::quick::{Gfx, Outcome as QuickOutcome, QuickPanel};
 use crate::settings_window::{apply_choice, Effect, SettingsAction, SettingsInput, SettingsWindow};
 use crate::shell::{self, StockGuard};
@@ -289,7 +291,7 @@ unsafe extern "system" fn on_console_ctrl(ctrl_type: u32) -> BOOL {
 const SETTINGS_ENV: &str = "VITROBAR_SETTINGS";
 
 /// `%APPDATA%\Vitrobar\settings.toml`, or the file named by `VITROBAR_SETTINGS`.
-fn settings_path() -> Option<PathBuf> {
+pub(crate) fn settings_path() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os(SETTINGS_ENV).filter(|p| !p.is_empty()) {
         return Some(PathBuf::from(p));
     }
@@ -634,6 +636,11 @@ struct App {
     music: Option<Music>,
     /// The music widget's open detail panel (same rules as `quick`).
     music_panel: Option<MusicPanel>,
+    /// The Claude limits widget while it is enabled (it owns the folder watch, P4).
+    claude: Option<Claude>,
+    claude_panel: Option<ClaudePanel>,
+    /// Turning the Claude widget on failed: the settings say so under its toggle.
+    claude_failed: bool,
     /// The open settings window (its visuals and window go before the compositor and GPU).
     settings_win: Option<SettingsWindow>,
     /// One per monitor, in [`current_monitors`] order: the first carries the tray area.
@@ -760,6 +767,9 @@ impl App {
             calendar: None,
             music: None,
             music_panel: None,
+            claude: None,
+            claude_panel: None,
+            claude_failed: false,
             settings_win: None,
             monitors,
             tracker,
@@ -811,6 +821,7 @@ impl App {
         };
         app.tick_clock();
         app.sync_music();
+        app.sync_claude();
         // Show the bars before the (slower) first window enumeration.
         app.refresh()?;
         let all = app.tracker.enumerate();
@@ -907,7 +918,10 @@ impl App {
             clock_w: self.clock_w,
             reserve_floating: self.settings.reserve_space_floating,
             tray_area: mb.tray,
-            widgets: [self.music.as_ref().map_or(0.0, |m| m.width), 0.0],
+            widgets: [
+                self.music.as_ref().map_or(0.0, |m| m.width),
+                self.claude.as_ref().map_or(0.0, |c| c.width),
+            ],
         })
     }
 
@@ -1245,7 +1259,10 @@ impl App {
             .focus()
             .filter(|f| f.monitor == self.monitors[k].id())
             .map(|f| f.item);
-        let pills = [self.music.as_ref().and_then(|m| m.pill.clone()), None];
+        let pills = [
+            self.music.as_ref().and_then(|m| m.pill.clone()),
+            self.claude.as_ref().and_then(|c| c.pill.clone()),
+        ];
         let pill_hover = match self.hover {
             Some(Hit::Widget(w)) if self.monitors[k].id() == self.cur => Some(w),
             _ => None,
@@ -1298,6 +1315,7 @@ impl App {
         self.calendar_reanchor(k);
         if tray {
             self.music_reanchor();
+            self.claude_reanchor();
         }
         Ok(raised)
     }
@@ -1341,6 +1359,7 @@ impl App {
         self.close_quick_now();
         self.close_calendar_now();
         self.close_music_panel_now();
+        self.close_claude_panel_now();
         self.stock.on_taskbar_created();
         // The old manager is a proxy into the Explorer that just ended: every query on it
         // would fail open (every window "on the current desktop") until the next restart.
@@ -1386,6 +1405,7 @@ impl App {
                 self.close_overflow();
                 self.close_quick();
                 self.close_music_panel();
+                self.close_claude_panel();
                 self.set_tip_target(None);
             }
             if self.calendar.as_ref().is_some_and(|c| c.monitor == id) {
@@ -1770,6 +1790,7 @@ impl App {
                 self.quick_foreground_changed(fg);
                 self.calendar_foreground_changed(fg);
                 self.music_foreground_changed(fg);
+                self.claude_foreground_changed(fg);
                 // A foreground change is when the shell reorders the topmost band: keep our
                 // Shell_TrayWnd above Explorer's (async, never waits).
                 if let Some(t) = &self.tray {
@@ -1866,6 +1887,7 @@ impl App {
             }
             TIMER_QUICK_SCAN | TIMER_QUICK_BT => self.quick_timer(id),
             TIMER_CALENDAR_MIDNIGHT => self.calendar_timer(id),
+            TIMER_CLAUDE_STALE | TIMER_CLAUDE_MINUTE => self.claude_timer(id, dirty),
             other => self.tracker.on_timer(other),
         }
     }
@@ -1934,6 +1956,10 @@ impl App {
         }
         if self.music_panel.as_ref().is_some_and(|p| p.hwnd() == msg.hwnd) {
             self.music_event(|p, _| p.on_mouse(msg));
+            return true;
+        }
+        if self.claude_panel.as_ref().is_some_and(|p| p.hwnd() == msg.hwnd) {
+            self.claude_event(|p, _| p.on_mouse(msg));
             return true;
         }
         if self.is_settings(msg.hwnd) {
@@ -2407,6 +2433,11 @@ impl App {
             self.music_event(|p, _| p.on_key(vk, shift));
             return true;
         }
+        if self.claude_panel.as_ref().is_some_and(|p| p.hwnd() == msg.hwnd) {
+            let vk = msg.wParam.0 as u16;
+            self.claude_event(|p, _| p.on_key(vk));
+            return true;
+        }
         if self.start.as_ref().is_some_and(|s| s.hwnd() == msg.hwnd) {
             self.on_start_key(msg, dirty);
             return true;
@@ -2786,6 +2817,9 @@ impl App {
         if hit != Hit::Widget(0) {
             self.close_music_panel();
         }
+        if hit != Hit::Widget(1) {
+            self.close_claude_panel();
+        }
         if hit != Hit::Chevron {
             self.close_overflow();
         }
@@ -2847,7 +2881,7 @@ impl App {
                     self.toggle_music_panel(dirty);
                 }
             }
-            // The Claude-limits pill opens its panel in the next widget task.
+            Hit::Widget(1) => self.toggle_claude_panel(dirty),
             Hit::Widget(_) => {}
             Hit::More | Hit::ShowDesktop => {}
         }
@@ -2862,6 +2896,7 @@ impl App {
         self.close_quick();
         self.close_calendar();
         self.close_music_panel();
+        self.close_claude_panel();
         self.close_strip();
         self.close_overflow();
         self.set_tip_target(None);
@@ -4110,6 +4145,274 @@ impl App {
     }
 
     // -----------------------------------------------------------------------------------
+    // The Claude limits widget (controller in `widgets.rs`, bridge in `claude_bridge.rs`)
+    // -----------------------------------------------------------------------------------
+
+    /// The widget was turned on or off in the settings: wrap Claude Code's status line in the
+    /// bridge (storing the user's command) or put it back. A failed wrap leaves the widget
+    /// off and says so under the toggle.
+    fn claude_toggled(&mut self) {
+        if self.settings.widget_claude {
+            let wrapped = std::env::current_exe()
+                .map_err(|e| e.to_string())
+                .and_then(|exe| claude_usage::wrap_statusline(&exe).map_err(|e| e.to_string()));
+            match wrapped {
+                Ok(Wrap::Wrapped(prev)) => {
+                    self.settings.claude_prev_statusline = prev;
+                    self.claude_failed = false;
+                }
+                Ok(Wrap::AlreadyOurs) => self.claude_failed = false,
+                Err(e) => {
+                    eprintln!("vitrobar: could not set up Claude Code's status line: {e}");
+                    self.settings.widget_claude = false;
+                    self.claude_failed = true;
+                }
+            }
+        } else {
+            self.claude_failed = false;
+            match claude_usage::unwrap_statusline(self.settings.claude_prev_statusline.as_deref()) {
+                Ok(()) => self.settings.claude_prev_statusline = None,
+                // The stored command stays, so turning the widget off again can still restore it.
+                Err(e) => eprintln!("vitrobar: could not restore Claude Code's status line: {e}"),
+            }
+        }
+        self.save_settings();
+        self.sync_claude();
+    }
+
+    /// Opens the folder watch when the widget is on and drops it when it is off (P4).
+    fn sync_claude(&mut self) {
+        match (self.settings.widget_claude, self.claude.is_some()) {
+            (true, false) => match Claude::open(self.notify.hwnd) {
+                Ok(mut c) => {
+                    c.remeasure(&self.painter, ui_lang(&self.settings));
+                    self.claude = Some(c);
+                    self.arm_claude_stale();
+                }
+                Err(e) => eprintln!("vitrobar: the Claude widget could not start: {e}"),
+            },
+            (false, true) => {
+                self.close_claude_panel();
+                self.claude = None;
+                self.kill_timer(TIMER_CLAUDE_STALE);
+            }
+            _ => {}
+        }
+    }
+
+    /// One one-shot timer for when the saved data turns "old" on the pill.
+    fn arm_claude_stale(&mut self) {
+        match self.claude.as_ref().and_then(|c| c.ms_until_stale()) {
+            // SAFETY: timer on our own window; setting the id again replaces it.
+            Some(ms) => unsafe {
+                SetTimer(Some(self.notify.hwnd), TIMER_CLAUDE_STALE, ms, None);
+            },
+            None => self.kill_timer(TIMER_CLAUDE_STALE),
+        }
+    }
+
+    /// [`WM_APP_CLAUDE`](crate::notify::WM_APP_CLAUDE): the bridge saved new data.
+    fn on_claude_data(&mut self, dirty: &mut Dirty) {
+        let lang = ui_lang(&self.settings);
+        let Some(c) = self.claude.as_mut() else {
+            return;
+        };
+        if c.reload(&self.painter, lang) {
+            dirty.visuals = true;
+        }
+        let usage = c.usage;
+        self.arm_claude_stale();
+        self.claude_event(|p, g| p.refresh(g, usage));
+    }
+
+    fn claude_timer(&mut self, id: usize, dirty: &mut Dirty) {
+        self.kill_timer(id);
+        let lang = ui_lang(&self.settings);
+        let Some(c) = self.claude.as_mut() else {
+            return;
+        };
+        if id == TIMER_CLAUDE_STALE {
+            if c.remeasure(&self.painter, lang) {
+                dirty.visuals = true;
+            }
+            return;
+        }
+        // The minute timer: "resets in" moves on while the panel is open.
+        let usage = c.usage;
+        if self.claude_panel.is_some() {
+            self.claude_event(|p, g| p.refresh(g, usage));
+            self.arm_claude_minute();
+        }
+    }
+
+    fn arm_claude_minute(&mut self) {
+        // SAFETY: timer on our own window; setting the id again replaces it.
+        unsafe {
+            SetTimer(Some(self.notify.hwnd), TIMER_CLAUDE_MINUTE, 60_000, None);
+        }
+    }
+
+    fn toggle_claude_panel(&mut self, dirty: &mut Dirty) {
+        if !self.close_claude_panel() {
+            self.open_claude_panel(dirty);
+        }
+    }
+
+    fn open_claude_panel(&mut self, dirty: &mut Dirty) {
+        if let Some(f) = self.keys.focus() {
+            dirty.bars.insert(f.monitor);
+        }
+        self.reset_interaction();
+        let Some(usage) = self.claude.as_ref().map(|c| c.usage) else {
+            return;
+        };
+        let Some(mb) = self.tray_monitor() else {
+            return;
+        };
+        if mb.layout.widgets[1].is_none() {
+            return;
+        }
+        let Some(anchor) = surface_anchor(&mb.layout, AnchorTarget::Widget(1), mb.scale()) else {
+            return;
+        };
+        let (id, dpi) = (mb.id(), mb.info.dpi);
+        dirty.bars.insert(id);
+        let (accent, lang) = self.start_look();
+        let fg = foreground().unwrap_or(0) as usize;
+        let opened = ClaudePanel::open(
+            &Gfx {
+                comp: &self.comp,
+                painter: &self.painter,
+            },
+            &self.style,
+            dpi,
+            anchor,
+            self.settings.position,
+            accent,
+            lang,
+            usage,
+        );
+        match opened {
+            Ok(mut p) => {
+                p.fg_at_open = fg;
+                if !p.activate() {
+                    eprintln!("vitrobar: the Claude panel could not take the foreground");
+                }
+                if self.opts.debug_state {
+                    eprintln!(
+                        "vitrobar-claude-open rect={:?} anchor={:?} activated={}",
+                        p.rect_px(),
+                        anchor,
+                        p.activated
+                    );
+                }
+                self.claude_panel = Some(p);
+                self.arm_claude_minute();
+            }
+            Err(e) => eprintln!("vitrobar: the Claude panel failed: {e}"),
+        }
+    }
+
+    fn close_claude_panel(&mut self) -> bool {
+        self.close_claude_panel_as(true)
+    }
+
+    fn close_claude_panel_now(&mut self) -> bool {
+        self.close_claude_panel_as(false)
+    }
+
+    fn close_claude_panel_as(&mut self, hand_back: bool) -> bool {
+        let Some(p) = self.claude_panel.take() else {
+            return false;
+        };
+        if hand_back {
+            let _ = self.hand_back_foreground(p.hwnd(), p.fg_at_open);
+        }
+        drop(p);
+        self.kill_timer(TIMER_CLAUDE_MINUTE);
+        if self.opts.debug_state {
+            eprintln!("vitrobar-claude-closed");
+        }
+        true
+    }
+
+    fn claude_event(&mut self, f: impl FnOnce(&mut ClaudePanel, &Gfx) -> MusicOutcome) {
+        let Some(p) = self.claude_panel.as_mut() else {
+            return;
+        };
+        let g = Gfx {
+            comp: &self.comp,
+            painter: &self.painter,
+        };
+        if f(p, &g) == MusicOutcome::Close {
+            self.close_claude_panel();
+        }
+    }
+
+    /// Alt+F4 on the Claude panel; false for anything else.
+    fn on_claude_msg(&mut self, msg: &MSG) -> bool {
+        if !self.claude_panel.as_ref().is_some_and(|p| p.hwnd() == msg.hwnd) {
+            return false;
+        }
+        if msg.message == WM_SYSKEYDOWN && msg.wParam.0 == usize::from(VK_F4.0) {
+            self.close_claude_panel();
+            return true;
+        }
+        false
+    }
+
+    /// Like [`Self::quick_foreground_changed`].
+    fn claude_foreground_changed(&mut self, fg: Option<Hwnd>) {
+        let Some(p) = self.claude_panel.as_mut() else {
+            return;
+        };
+        if p.activated {
+            return;
+        }
+        let fg = fg.unwrap_or(0) as usize;
+        if fg == p.hwnd().0 as usize {
+            p.activated = true;
+        } else if fg != p.fg_at_open {
+            self.close_claude_panel();
+        }
+    }
+
+    fn claude_reanchor(&mut self) {
+        if self.claude_panel.is_none() {
+            return;
+        }
+        let anchor = self.tray_monitor().and_then(|mb| {
+            mb.layout.widgets[1]?;
+            surface_anchor(&mb.layout, AnchorTarget::Widget(1), mb.scale())
+        });
+        let Some(anchor) = anchor else {
+            self.close_claude_panel();
+            return;
+        };
+        if let Some(p) = self.claude_panel.as_mut() {
+            if let Err(e) = p.reanchor(&self.comp, anchor) {
+                eprintln!("vitrobar: the Claude panel could not follow its pill: {e}");
+                self.close_claude_panel();
+            }
+        }
+    }
+
+    fn claude_restyle(&mut self) {
+        let (accent, _) = self.start_look();
+        let Some(p) = self.claude_panel.as_mut() else {
+            return;
+        };
+        let g = Gfx {
+            comp: &self.comp,
+            painter: &self.painter,
+        };
+        if let Err(e) = p.restyle(&g, &self.style, accent) {
+            eprintln!("vitrobar: the Claude panel could not be restyled: {e}");
+            self.close_claude_panel();
+        }
+    }
+
+    // -----------------------------------------------------------------------------------
     // The quick panel (controller in `quick.rs`)
     // -----------------------------------------------------------------------------------
 
@@ -4633,6 +4936,7 @@ impl App {
             return;
         };
         sw.ctl.rebuild(&self.settings);
+        set_claude_hint(&mut sw.ctl.model, self.claude_failed);
         self.settings_render();
     }
 
@@ -4663,6 +4967,9 @@ impl App {
                 if id == ControlId::WidgetMusic {
                     self.sync_music();
                 }
+                if id == ControlId::WidgetClaude {
+                    self.claude_toggled();
+                }
                 self.relayout(dirty);
                 if matches!(id, ControlId::Material | ControlId::Theme) {
                     self.settings_restyle();
@@ -4671,6 +4978,13 @@ impl App {
             Effect::WinKey(on) => self.set_win_key(on, dirty),
             Effect::Autostart(on) => apply_autostart(on),
             Effect::Language => {
+                // The Claude pill's words change language.
+                let lang = ui_lang(&self.settings);
+                if let Some(c) = self.claude.as_mut() {
+                    if c.remeasure(&self.painter, lang) {
+                        dirty.visuals = true;
+                    }
+                }
                 let title = tr(ui_lang(&self.settings), Key::VitrobarSettings);
                 if let Some(sw) = &self.settings_win {
                     sw.set_title(title);
@@ -4818,6 +5132,7 @@ impl App {
         self.close_quick_now();
         self.close_calendar_now();
         self.close_music_panel_now();
+        self.close_claude_panel_now();
         self.close_settings();
         // GPU device removed (TDR, driver update): recreate, then redraw everything.
         self.gpu_lost = true;
@@ -4854,6 +5169,9 @@ impl App {
         }
         if inbox.media {
             self.on_media(dirty);
+        }
+        if inbox.claude {
+            self.on_claude_data(dirty);
         }
         if inbox.clock {
             // The system clock or time zone changed: today may have moved.
@@ -4963,6 +5281,13 @@ impl App {
         {
             self.close_music_panel();
         }
+        if self
+            .claude_panel
+            .as_ref()
+            .is_some_and(|p| deactivated.contains(&p.hwnd()))
+        {
+            self.close_claude_panel();
+        }
         if inbox.fullscreen {
             // Explorer may have raised its own Shell_TrayWnd for the full-screen change: go
             // back above it. (Restarts, settings and display changes reach the tray host's
@@ -5004,6 +5329,7 @@ impl App {
             self.close_quick_now();
             self.close_calendar_now();
             self.close_music_panel_now();
+            self.close_claude_panel_now();
             // New bars, new geometry: everything is laid out and drawn again, and every
             // window's monitor is read again (windows on a removed monitor were moved).
             d.visuals = true;
@@ -5046,6 +5372,7 @@ impl App {
                 self.quick_restyle();
                 self.calendar_restyle();
                 self.music_restyle();
+                self.claude_restyle();
                 self.settings_restyle();
                 self.settings_render();
             }
@@ -5270,6 +5597,7 @@ pub fn run(opts: Options) -> Result<()> {
                 WM_CHAR | WM_SYSKEYDOWN | WM_MOUSEWHEEL if app.on_quick_msg(&msg) => {}
                 WM_SYSKEYDOWN | WM_MOUSEWHEEL if app.on_calendar_msg(&msg) => {}
                 WM_SYSKEYDOWN if app.on_music_msg(&msg) => {}
+                WM_SYSKEYDOWN if app.on_claude_msg(&msg) => {}
                 WM_CHAR | WM_SYSKEYDOWN | WM_MOUSEWHEEL if app.on_start_msg(&msg, &mut dirty) => {}
                 WM_SYSKEYDOWN | WM_MOUSEWHEEL if app.on_settings_msg(&msg, &mut dirty) => {}
                 _ => unsafe {

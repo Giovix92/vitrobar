@@ -1,4 +1,5 @@
-//! The bar's widgets (spec §5.7). Music: a pill with the current track (its glyph toggles
+//! The bar's widgets (spec §5.7). Claude limits: a pill with the 5-hour and weekly usage that
+//! Claude Code's status line saved (ruling P1) and a detail panel with a bar for each. Music: a pill with the current track (its glyph toggles
 //! play / pause, its text opens the detail panel) and a glass detail panel with the artwork,
 //! title, artist, the transport buttons and the player's name.
 //!
@@ -12,8 +13,10 @@ use vitro_core::panel_kit::{focus_step, Part, Row};
 use vitro_core::settings::Position;
 use vitro_core::style::{MaterialStyle, Rgba};
 use vitro_core::widgets::{
-    music_action, music_glyph, music_pill_text, music_rows, pill_width, MusicAction, MusicView,
-    ART_DIP, ID_ART, MUSIC_PILL_MAX_CHARS, MUSIC_PILL_MAX_DIP, PILL_FONT_DIP,
+    bar_fill, claude_pill_text, claude_rows, music_action, music_glyph, music_pill_text,
+    music_rows, pill_width, ClaudeUsage, MusicAction, MusicView, ART_DIP, CLAUDE_PILL_MAX_DIP,
+    G_CLAUDE, ID_ART, ID_BAR_5H, ID_BAR_7D, MUSIC_PILL_MAX_CHARS, MUSIC_PILL_MAX_DIP,
+    PILL_FONT_DIP, STALE_AFTER_S,
 };
 use vitro_render::bar_visual::WidgetPill;
 use vitro_render::compositor::Comp;
@@ -21,7 +24,9 @@ use vitro_render::flyout::PxRect;
 use vitro_render::panel_view::PanelView;
 use vitro_render::surfaces::{FontKind, Painter, TextBox};
 use vitro_render::{Vector2, Vector3};
+use vitro_win::claude_usage::{self, Watcher};
 use vitro_win::media::{Change, Media, MediaSnapshot};
+use vitro_win::time_format;
 use windows::core::Result;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -31,7 +36,7 @@ use windows::Win32::UI::WindowsAndMessaging::{MSG, WM_LBUTTONDOWN, WM_LBUTTONUP,
 use windows::UI::Color;
 
 use crate::bar_window::{mouse_pos, track_leave};
-use crate::notify::WM_APP_MEDIA;
+use crate::notify::{WM_APP_CLAUDE, WM_APP_MEDIA};
 use crate::quick::Gfx;
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -442,6 +447,225 @@ impl MusicPanel {
         self.view
             .restyle(g.comp, g.painter, style, accent, &self.rows)?;
         self.draw_art(g)
+    }
+}
+
+// ---- Claude limits ------------------------------------------------------------------------
+
+fn now_s() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+/// The Claude limits widget while it is enabled: the watch on the bridge's file (P4).
+pub struct Claude {
+    _watcher: Watcher,
+    pub usage: Option<ClaudeUsage>,
+    pub pill: Option<WidgetPill>,
+    /// DIP.
+    pub width: f32,
+}
+
+impl Claude {
+    pub fn open(notify: HWND) -> std::io::Result<Self> {
+        Ok(Self {
+            _watcher: claude_usage::watch(notify, WM_APP_CLAUDE)?,
+            usage: claude_usage::read(),
+            pill: None,
+            width: 0.0,
+        })
+    }
+
+    /// The bridge wrote the file: read it again. True if the pill changed.
+    pub fn reload(&mut self, painter: &Painter, lang: Lang) -> bool {
+        self.usage = claude_usage::read();
+        self.remeasure(painter, lang)
+    }
+
+    /// Recomputes the pill for now; true if it changed.
+    pub fn remeasure(&mut self, painter: &Painter, lang: Lang) -> bool {
+        let text = claude_pill_text(self.usage.as_ref(), now_s(), lang);
+        let text_w = painter
+            .measure(&text, FontKind::Text, PILL_FONT_DIP)
+            .map(|(w, _)| w.ceil())
+            .unwrap_or(text.chars().count() as f32 * PILL_FONT_DIP * 0.6);
+        let pill = Some(WidgetPill {
+            glyph: G_CLAUDE,
+            text: text.clone(),
+        });
+        let width = pill_width(&text, text_w, CLAUDE_PILL_MAX_DIP).round();
+        let changed = pill != self.pill || width != self.width;
+        self.pill = pill;
+        self.width = width;
+        changed
+    }
+
+    /// Milliseconds until the saved data turns "old" on the pill; `None` when there is none or
+    /// it already is.
+    pub fn ms_until_stale(&self) -> Option<u32> {
+        let left = self.usage?.at + STALE_AFTER_S - now_s();
+        (left >= 0).then(|| ((left as u64 + 1) * 1000).min(u64::from(u32::MAX)) as u32)
+    }
+}
+
+pub struct ClaudePanel {
+    // Declared first: the window goes before the rest.
+    view: PanelView,
+    pub fg_at_open: usize,
+    pub activated: bool,
+    usage: Option<ClaudeUsage>,
+    lang: Lang,
+    text: Rgba,
+    accent: Rgba,
+    rows: Vec<Row>,
+    tracking: bool,
+}
+
+const BAR_THICK_DIP: f32 = 6.0;
+const TRACK_ALPHA: u8 = 40;
+
+fn claude_rows_now(usage: Option<&ClaudeUsage>, lang: Lang) -> Vec<Row> {
+    let at = usage.map(|u| time_format::local_short_time(u.at)).unwrap_or_default();
+    claude_rows(usage, now_s(), &at, lang)
+}
+
+impl ClaudePanel {
+    #[allow(clippy::too_many_arguments)]
+    pub fn open(
+        g: &Gfx,
+        style: &MaterialStyle,
+        dpi: u32,
+        anchor_px: PxRect,
+        position: Position,
+        accent: Rgba,
+        lang: Lang,
+        usage: Option<ClaudeUsage>,
+    ) -> Result<Self> {
+        let rows = claude_rows_now(usage.as_ref(), lang);
+        let view = PanelView::show(
+            g.comp, g.painter, style, dpi, anchor_px, position, accent, &rows,
+        )?;
+        let mut p = Self {
+            view,
+            fg_at_open: 0,
+            activated: false,
+            usage,
+            lang,
+            text: style.text,
+            accent,
+            rows,
+            tracking: false,
+        };
+        p.draw_bars(g)?;
+        Ok(p)
+    }
+
+    pub fn hwnd(&self) -> HWND {
+        self.view.hwnd()
+    }
+
+    pub fn rect_px(&self) -> PxRect {
+        self.view.rect_px()
+    }
+
+    pub fn activate(&mut self) -> bool {
+        self.activated |= self.view.activate();
+        self.activated
+    }
+
+    /// New data, or a minute passed ("resets in" counts down): rows and bars anew.
+    pub fn refresh(&mut self, g: &Gfx, usage: Option<ClaudeUsage>) -> Outcome {
+        self.usage = usage;
+        let rows = claude_rows_now(self.usage.as_ref(), self.lang);
+        if rows != self.rows {
+            self.rows = rows;
+            if let Err(e) = self.view.update(g.comp, g.painter, &self.rows) {
+                return ok(Err(e));
+            }
+        }
+        ok(self.draw_bars(g))
+    }
+
+    /// A track and an accent fill for each window's progress bar hole.
+    fn draw_bars(&mut self, g: &Gfx) -> Result<()> {
+        let comp: &windows::UI::Composition::Compositor = g.comp;
+        let s = self.view.scale();
+        let now = now_s();
+        let windows = self
+            .usage
+            .map_or([None, None], |u| [u.five_hour.map(|w| (ID_BAR_5H, w)), u.seven_day.map(|w| (ID_BAR_7D, w))]);
+        for (id, w) in windows.into_iter().flatten() {
+            let (Some(slot), Some(r)) = (self.view.custom_slot(id), self.view.custom_rect_px(id))
+            else {
+                continue;
+            };
+            let kids = slot.Children()?;
+            kids.RemoveAll()?;
+            let (bw, bh) = ((r.2 - r.0).max(1) as f32, (r.3 - r.1).max(1) as f32);
+            let thick = (BAR_THICK_DIP * s).round().max(1.0);
+            let top = ((bh - thick) / 2.0).round();
+            let t = self.text;
+            let fill = (bw * bar_fill(&w, now)).round();
+            for (width, color) in [
+                (bw, Rgba(t.0, t.1, t.2, TRACK_ALPHA)),
+                (fill, self.accent),
+            ] {
+                if width < 1.0 {
+                    continue;
+                }
+                let geom = comp.CreateRoundedRectangleGeometry()?;
+                geom.SetSize(Vector2::new(width, thick))?;
+                geom.SetCornerRadius(Vector2::new(thick / 2.0, thick / 2.0))?;
+                let shape = comp.CreateSpriteShapeWithGeometry(&geom)?;
+                shape.SetFillBrush(&comp.CreateColorBrushWithColor(ui_color(color))?)?;
+                let v = comp.CreateShapeVisual()?;
+                v.SetSize(Vector2::new(width, thick))?;
+                v.Shapes()?.Append(&shape)?;
+                v.SetOffset(Vector3::new(0.0, top, 0.0))?;
+                kids.InsertAtTop(&v)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn on_mouse(&mut self, msg: &MSG) -> Outcome {
+        match msg.message {
+            WM_MOUSEMOVE if !self.tracking => {
+                track_leave(self.hwnd());
+                self.tracking = true;
+                Outcome::None
+            }
+            WM_MOUSELEAVE => {
+                self.tracking = false;
+                Outcome::None
+            }
+            WM_LBUTTONDOWN if !self.activated => {
+                self.activate();
+                Outcome::None
+            }
+            _ => Outcome::None,
+        }
+    }
+
+    pub fn on_key(&mut self, vk: u16) -> Outcome {
+        if windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(vk) == VK_ESCAPE {
+            Outcome::Close
+        } else {
+            Outcome::None
+        }
+    }
+
+    pub fn reanchor(&mut self, comp: &Comp, anchor_px: PxRect) -> Result<()> {
+        self.view.reanchor(comp, anchor_px)
+    }
+
+    pub fn restyle(&mut self, g: &Gfx, style: &MaterialStyle, accent: Rgba) -> Result<()> {
+        self.text = style.text;
+        self.accent = accent;
+        self.view
+            .restyle(g.comp, g.painter, style, accent, &self.rows)?;
+        self.draw_bars(g)
     }
 }
 

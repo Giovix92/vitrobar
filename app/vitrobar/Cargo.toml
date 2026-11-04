@@ -6,6 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+serde_json = "1"
 vitro-core = { path = "../../crates/core" }
 vitro-render = { path = "../../crates/render" }
 vitro-win = { path = "../../crates/win" }
@@ -17,6 +18,7 @@ windows = { version = "0.62.2", features = [
     "Win32_Graphics_Gdi",
     "Win32_System_Com",
     "Win32_System_Console",
+    "Win32_System_JobObjects",
     "Win32_System_LibraryLoader",
     "Win32_System_RemoteDesktop",
     "Win32_System_SystemInformation",
@@ -28,3 +30,6 @@ windows = { version = "0.62.2", features = [
 
 [build-dependencies]
 embed-resource = "3.0.12"
+
+[dev-dependencies]
+tempfile = "3"
