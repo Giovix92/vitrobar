@@ -6,6 +6,7 @@ pub mod calendar;
 pub mod clock;
 pub mod i18n;
 pub mod image;
+pub mod ime;
 pub mod key_hook;
 pub mod layout;
 pub mod menu_model;

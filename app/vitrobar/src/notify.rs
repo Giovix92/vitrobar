@@ -120,6 +120,8 @@ pub const TIMER_CALENDAR_MIDNIGHT: usize = 0x570C;
 pub const TIMER_CLAUDE_STALE: usize = 0x570D;
 /// One-shot while the Claude panel is open: a minute passed ("resets in" counts down).
 pub const TIMER_CLAUDE_MINUTE: usize = 0x570E;
+/// One-shot after a click on the input-language indicator: read the new layout.
+pub const TIMER_IME: usize = 0x570F;
 
 /// Everything the notify window received since the last [`take_inbox`].
 #[derive(Debug, Default, PartialEq)]

@@ -64,6 +64,9 @@ pub struct LayoutInput {
     /// DIP widths of the Music and Claude-limits pills (0 = hidden). Only the bar with the tray
     /// area shows them, just left of the tray.
     pub widgets: [f32; 2],
+    /// DIP width of the input-language indicator (0 = hidden); only with the tray area, just
+    /// left of the quick-settings button.
+    pub ime: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -80,6 +83,8 @@ pub struct BarLayout {
     pub clock: Rect,
     /// The Music and Claude pills, `None` when hidden or on a bar without the tray area.
     pub widgets: [Option<Rect>; 2],
+    /// The input-language indicator, `None` when hidden.
+    pub ime: Option<Rect>,
     pub show_desktop: Rect,
     /// DIPs to reserve at the screen edge.
     pub reserved: f32,
@@ -151,7 +156,8 @@ pub fn compute_layout(i: &LayoutInput) -> BarLayout {
         .filter(|&k| widget_w(k) > 0.0)
         .map(|k| widget_w(k) + GAP)
         .sum();
-    let right_w = widgets_w + m.slot * tray_count as f32 + 2.0 * tray_slot + i.clock_w;
+    let ime_w = if i.tray_area { i.ime.max(0.0) } else { 0.0 };
+    let right_w = widgets_w + m.slot * tray_count as f32 + ime_w + 2.0 * tray_slot + i.clock_w;
     // right group with its inner padding on both sides, then the show-desktop strip
     let right_surface_w = PAD + right_w + PAD + SHOW_DESKTOP_W;
 
@@ -244,7 +250,9 @@ pub fn compute_layout(i: &LayoutInput) -> BarLayout {
     let tray: Vec<Rect> = (0..tray_count)
         .map(|k| item(tray_x + tray_slot + k as f32 * m.slot, m.slot))
         .collect();
-    let quick_x = tray_x + tray_slot + tray_count as f32 * m.slot;
+    let ime_x = tray_x + tray_slot + tray_count as f32 * m.slot;
+    let ime = (ime_w > 0.0).then(|| item(ime_x, ime_w));
+    let quick_x = ime_x + ime_w;
     let quick = item(quick_x, tray_slot);
     let clock = item(quick_x + tray_slot, i.clock_w);
 
@@ -275,6 +283,7 @@ pub fn compute_layout(i: &LayoutInput) -> BarLayout {
         quick,
         clock,
         widgets,
+        ime,
         show_desktop,
         reserved,
     }
@@ -328,6 +337,7 @@ mod tests {
             reserve_floating: reserve,
             tray_area: true,
             widgets: [0.0; 2],
+            ime: 0.0,
         }
     }
     fn lay(shape: Shape, n: usize) -> BarLayout {
@@ -608,5 +618,25 @@ mod tests {
         // hidden widget: falls back to the quick button
         let l = lay(Shape::Pill, 5);
         assert_eq!(anchor_for(&l, AnchorTarget::Widget(0)), l.quick);
+    }
+
+    #[test]
+    fn the_ime_indicator_sits_between_the_tray_and_quick() {
+        let mut i = input(MON, Shape::Pill, Position::Bottom, 3, true);
+        i.tray_count = 2;
+        let before = compute_layout(&i);
+        assert!(before.ime.is_none());
+        i.ime = 30.0;
+        let l = compute_layout(&i);
+        let ime = l.ime.expect("shown");
+        assert_eq!(ime.x, l.tray[1].right());
+        assert_eq!(ime.w, 30.0);
+        assert_eq!(l.quick.x, ime.right());
+        assert_eq!(l.clock.x, l.quick.right());
+        // The pill grows by the indicator's width.
+        assert!((l.surfaces[0].w - before.surfaces[0].w - 30.0).abs() < 0.01);
+        // No tray area, no indicator.
+        i.tray_area = false;
+        assert!(compute_layout(&i).ime.is_none());
     }
 }

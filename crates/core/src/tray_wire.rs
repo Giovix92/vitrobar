@@ -144,6 +144,173 @@ pub fn parse_tray_copydata(bytes: &[u8]) -> Result<TrayMessage, TrayParseError> 
     })
 }
 
+// ---- Shell_NotifyIconGetRect ----------------------------------------------------------------
+
+/// `COPYDATASTRUCT.dwData` of the icon-rect query `Shell_NotifyIconGetRect` sends.
+pub const ICON_RECT_COPYDATA_ID: usize = 3;
+
+/// The query is made twice: once for the top-left corner, once for the bottom-right one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RectCorner {
+    TopLeft,
+    BottomRight,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IconRectQuery {
+    pub corner: RectCorner,
+    pub id: TrayIconId,
+}
+
+/// Screen px: (left, top, right, bottom).
+pub type IconRect = (i32, i32, i32, i32);
+
+/// Parses the payload (`dwMagic`, `dwMessage` 1 = top-left / 2 = bottom-right, `cbSize`,
+/// padding, 32-bit `hWnd`, `uID`, `guidItem`). Never panics on any input.
+pub fn parse_icon_rect_query(b: &[u8]) -> Option<IconRectQuery> {
+    if u32_at(b, 0)? != TRAY_SIGNATURE {
+        return None;
+    }
+    let corner = match u32_at(b, 4)? {
+        1 => RectCorner::TopLeft,
+        2 => RectCorner::BottomRight,
+        _ => return None,
+    };
+    let guid = <[u8; 16]>::try_from(b.get(24..40)?).ok()?;
+    Some(IconRectQuery {
+        corner,
+        id: TrayIconId {
+            hwnd: u32_at(b, 16)?,
+            uid: u32_at(b, 20)?,
+            guid: (guid != [0; 16]).then_some(guid),
+        },
+    })
+}
+
+/// The answer for one corner: x in the low word, y in the high word (signed 16-bit each).
+pub fn icon_rect_answer(corner: RectCorner, r: IconRect) -> isize {
+    let (x, y) = match corner {
+        RectCorner::TopLeft => (r.0, r.1),
+        RectCorner::BottomRight => (r.2, r.3),
+    };
+    let word = |v: i32| u32::from(v.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16 as u16);
+    ((word(y) << 16) | word(x)) as i32 as isize
+}
+
+/// Where icon `id` is drawn: its slot when it is in the bar, the overflow chevron when it is
+/// in the overflow, `None` when Vitrobar does not know it (Explorer answers then). A query
+/// with a GUID matches by GUID, else by owner window and id.
+pub fn icon_rect_for(
+    id: &TrayIconId,
+    promoted: &[(TrayIconId, IconRect)],
+    overflowed: &[TrayIconId],
+    chevron: Option<IconRect>,
+) -> Option<IconRect> {
+    let same = |other: &TrayIconId| match id.guid {
+        Some(g) => other.guid == Some(g),
+        None => other.hwnd == id.hwnd && other.uid == id.uid,
+    };
+    if let Some((_, r)) = promoted.iter().find(|(o, _)| same(o)) {
+        return Some(*r);
+    }
+    overflowed.iter().any(same).then_some(chevron).flatten()
+}
+
+#[cfg(test)]
+mod icon_rect_tests {
+    use super::*;
+
+    fn query(msg: u32, hwnd: u32, uid: u32, guid: [u8; 16]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend(TRAY_SIGNATURE.to_le_bytes());
+        b.extend(msg.to_le_bytes());
+        b.extend(40u32.to_le_bytes());
+        b.extend(0u32.to_le_bytes());
+        b.extend(hwnd.to_le_bytes());
+        b.extend(uid.to_le_bytes());
+        b.extend(guid);
+        b
+    }
+
+    #[test]
+    fn parses_both_corners_with_and_without_a_guid() {
+        let q = parse_icon_rect_query(&query(1, 0x1234, 7, [0; 16])).unwrap();
+        assert_eq!(q.corner, RectCorner::TopLeft);
+        assert_eq!(
+            q.id,
+            TrayIconId {
+                hwnd: 0x1234,
+                uid: 7,
+                guid: None
+            }
+        );
+        let g = [9u8; 16];
+        let q = parse_icon_rect_query(&query(2, 0, 0, g)).unwrap();
+        assert_eq!(q.corner, RectCorner::BottomRight);
+        assert_eq!(q.id.guid, Some(g));
+    }
+
+    #[test]
+    fn junk_is_not_a_query() {
+        assert_eq!(parse_icon_rect_query(&[]), None);
+        assert_eq!(parse_icon_rect_query(&query(1, 1, 1, [0; 16])[..30]), None);
+        assert_eq!(parse_icon_rect_query(&query(3, 1, 1, [0; 16])), None);
+        let mut bad = query(1, 1, 1, [0; 16]);
+        bad[0] = 0;
+        assert_eq!(parse_icon_rect_query(&bad), None);
+    }
+
+    #[test]
+    fn answers_pack_signed_words() {
+        let r = (-1920 + 10, 1040, -1920 + 34, 1072);
+        let tl = icon_rect_answer(RectCorner::TopLeft, r);
+        assert_eq!(tl as u32 & 0xFFFF, (-1910i16) as u16 as u32);
+        assert_eq!((tl as u32 >> 16) as i16, 1040);
+        let br = icon_rect_answer(RectCorner::BottomRight, r);
+        assert_eq!((br as u32 & 0xFFFF) as i16, -1886);
+        assert_eq!((br as u32 >> 16) as i16, 1072);
+    }
+
+    #[test]
+    fn promoted_icons_get_their_slot_and_overflowed_ones_the_chevron() {
+        let a = TrayIconId {
+            hwnd: 1,
+            uid: 1,
+            guid: None,
+        };
+        let g = [5u8; 16];
+        let b = TrayIconId {
+            hwnd: 2,
+            uid: 9,
+            guid: Some(g),
+        };
+        let c = TrayIconId {
+            hwnd: 3,
+            uid: 3,
+            guid: None,
+        };
+        let promoted = [(a, (10, 0, 30, 40)), (b, (30, 0, 50, 40))];
+        let chevron = Some((0, 0, 10, 40));
+        assert_eq!(icon_rect_for(&a, &promoted, &[c], chevron), Some((10, 0, 30, 40)));
+        // By GUID, whatever window the caller names.
+        let by_guid = TrayIconId {
+            hwnd: 0,
+            uid: 0,
+            guid: Some(g),
+        };
+        assert_eq!(icon_rect_for(&by_guid, &promoted, &[c], chevron), Some((30, 0, 50, 40)));
+        assert_eq!(icon_rect_for(&c, &promoted, &[c], chevron), chevron);
+        let unknown = TrayIconId {
+            hwnd: 4,
+            uid: 4,
+            guid: None,
+        };
+        assert_eq!(icon_rect_for(&unknown, &promoted, &[c], chevron), None);
+        // Overflowed but no chevron drawn (no tray bar): unknown to us.
+        assert_eq!(icon_rect_for(&c, &promoted, &[c], None), None);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

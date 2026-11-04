@@ -973,6 +973,10 @@ pub struct BarVisual {
     tray: Vec<Option<Cell>>,
     quick: Option<Cell>,
     clock: Option<Cell>,
+    /// The input-language indicator.
+    ime: Option<Cell>,
+    ime_text: Option<String>,
+    ime_hover: bool,
     /// Music and Claude pills.
     widget_cells: [Option<Cell>; 2],
     widget_pills: [Option<WidgetPill>; 2],
@@ -1016,6 +1020,9 @@ impl BarVisual {
             tray: Vec::new(),
             quick: None,
             clock: None,
+            ime: None,
+            ime_text: None,
+            ime_hover: false,
             widget_cells: [None, None],
             widget_pills: [None, None],
             widget_hover: None,
@@ -1087,6 +1094,18 @@ impl BarVisual {
         self.widget_hover = hovered;
     }
 
+    /// The input-language indicator's text (`None`: not shown) and whether the cursor is on
+    /// it; takes effect on the next [`BarVisual::update`] (it also needs `layout.ime`).
+    pub fn set_ime(&mut self, text: Option<String>, hovered: bool) {
+        self.ime_text = text;
+        self.ime_hover = hovered;
+    }
+
+    /// Whether the input-language indicator is in the tree (diagnostics and tests).
+    pub fn ime_shown(&self) -> bool {
+        self.ime.is_some()
+    }
+
     /// Number of widget pills currently in the tree (diagnostics and tests).
     pub fn widget_cells(&self) -> usize {
         self.widget_cells.iter().flatten().count()
@@ -1124,6 +1143,7 @@ impl BarVisual {
             &mut self.chevron,
             &mut self.quick,
             &mut self.clock,
+            &mut self.ime,
         ]
         .into_iter()
         .chain(self.widget_cells.iter_mut())
@@ -1286,6 +1306,35 @@ impl BarVisual {
             }
         });
 
+        // Like the clock, with the tray icons' quiet plate under the cursor.
+        let ime_spec = match (&self.ime_text, &layout.ime) {
+            (Some(t), Some(r)) if owns(&surface, r) => {
+                let rect = cell_rect(r);
+                Some(CellSpec {
+                    rect,
+                    content: Content::Text {
+                        text: t.clone(),
+                        kind: FontKind::Text,
+                        size_px: px(CLOCK_FONT_DIP),
+                        color: text,
+                        w: rect.w,
+                        h: rect.h,
+                    },
+                    plate: if self.ime_hover {
+                        rgba_alpha(text, PLATE_HOVER_ALPHA)
+                    } else {
+                        Rgba(0, 0, 0, 0)
+                    },
+                    plate_inset,
+                    plate_radius,
+                    attention: false,
+                    dots: None,
+                    fx: None,
+                })
+            }
+            _ => None,
+        };
+
         // A pill is drawn only when the app gave it text and the layout a rect.
         let widget_specs: [Option<CellSpec>; 2] = [0, 1].map(|k| {
             let (pill, r) = (self.widget_pills[k].as_ref()?, layout.widgets[k].as_ref()?);
@@ -1417,6 +1466,7 @@ impl BarVisual {
         }
         drawn += sync(&mut self.quick, quick, comp, painter, &parent, anim)?;
         drawn += sync(&mut self.clock, clock_spec, comp, painter, &parent, anim)?;
+        drawn += sync(&mut self.ime, ime_spec, comp, painter, &parent, anim)?;
         for (slot, spec) in self.widget_cells.iter_mut().zip(widget_specs) {
             drawn += sync(slot, spec, comp, painter, &parent, anim)?;
         }

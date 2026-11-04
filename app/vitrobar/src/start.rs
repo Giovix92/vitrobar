@@ -8,6 +8,7 @@
 
 use std::collections::HashSet;
 use std::sync::mpsc::{channel, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -49,6 +50,8 @@ pub const PANEL_RADIUS_DIP: f32 = 12.0;
 pub const ICON_DIP: f32 = 32.0;
 /// The catalog is read again on open when older than this.
 pub const CATALOG_MAX_AGE: Duration = Duration::from_secs(60);
+/// The pause before an empty catalog read is tried again.
+const CATALOG_RETRY_DELAY: Duration = Duration::from_secs(3);
 /// The account page the account button opens.
 pub const ACCOUNT_URI: &str = "ms-settings:yourinfo";
 /// Icons in the full-screen grid are drawn this big.
@@ -979,6 +982,8 @@ pub fn pin_icon(p: &Pin) -> Option<IconSrc> {
 
 enum Request {
     Apps,
+    /// The catalog came back empty right after sign-in: read it again after a pause.
+    RetryApps,
     /// The same read, ahead of the first open, at below-normal priority.
     PrefetchApps,
     Recent,
@@ -1001,6 +1006,8 @@ struct DataWorker {
     /// Kept (not joined) to raise the thread back to normal priority when a panel opens
     /// during the prefetch.
     thread: std::thread::JoinHandle<()>,
+    /// A panel asked for normal priority: a prefetch that starts later stays normal.
+    boosted: Arc<AtomicBool>,
 }
 
 impl DataWorker {
@@ -1009,6 +1016,8 @@ impl DataWorker {
         let answers = Arc::new(WakeQueue::new());
         let queue = Arc::clone(&answers);
         let notify = notify.0 as isize;
+        let boosted = Arc::new(AtomicBool::new(false));
+        let boost_seen = Arc::clone(&boosted);
         let thread = std::thread::Builder::new()
             .name("vitrobar-start".into())
             .spawn(move || {
@@ -1017,14 +1026,22 @@ impl DataWorker {
                 while let Ok(req) = rx.recv() {
                     let answer = match req {
                         Request::Apps => Answer::Apps(list_all_apps()),
+                        Request::RetryApps => {
+                            std::thread::sleep(CATALOG_RETRY_DELAY);
+                            Answer::Apps(list_all_apps())
+                        }
                         Request::PrefetchApps => {
-                            // SAFETY: plain calls on this worker thread's own pseudo-handle.
-                            unsafe {
-                                let _ = SetThreadPriority(
-                                    GetCurrentThread(),
-                                    THREAD_PRIORITY_BELOW_NORMAL,
-                                );
-                            }
+                            enter_prefetch(&boost_seen, |low| {
+                                let p = if low {
+                                    THREAD_PRIORITY_BELOW_NORMAL
+                                } else {
+                                    THREAD_PRIORITY_NORMAL
+                                };
+                                // SAFETY: plain call on this worker thread's own pseudo-handle.
+                                unsafe {
+                                    let _ = SetThreadPriority(GetCurrentThread(), p);
+                                }
+                            });
                             let apps = list_all_apps();
                             // SAFETY: as above.
                             unsafe {
@@ -1062,6 +1079,7 @@ impl DataWorker {
             tx,
             answers,
             thread,
+            boosted,
         })
     }
 
@@ -1069,11 +1087,29 @@ impl DataWorker {
     /// priority (a prefetch in progress is raised).
     fn boost(&self) {
         use std::os::windows::io::AsRawHandle;
+        // Before raising: a prefetch that lowers after this sees the flag (enter_prefetch).
+        self.boosted.store(true, Ordering::Release);
         // SAFETY: the handle belongs to the JoinHandle we hold, so it is valid; a thread
         // that already ended just makes the call fail.
         unsafe {
             let _ = SetThreadPriority(HANDLE(self.thread.as_raw_handle()), THREAD_PRIORITY_NORMAL);
         }
+    }
+}
+
+/// A catalog read that came back empty while there is nothing to show yet (the shell was
+/// not ready, right after sign-in) is tried once more; a second empty read is taken as is.
+fn retry_empty_read(empty: bool, have_apps: bool, retried: bool) -> bool {
+    empty && !have_apps && !retried
+}
+
+/// Enters the below-normal priority of a prefetch, unless a panel opening has already asked
+/// for normal priority (`boosted`). `set_low(true)` lowers, `set_low(false)` restores. The
+/// flag is read after lowering, so a boost that lands at any point wins.
+fn enter_prefetch(boosted: &AtomicBool, mut set_low: impl FnMut(bool)) {
+    set_low(true);
+    if boosted.load(Ordering::Acquire) {
+        set_low(false);
     }
 }
 
@@ -1086,6 +1122,8 @@ pub struct StartData {
     pub rows: Vec<ListRow>,
     apps_at: Option<Instant>,
     apps_pending: bool,
+    /// An empty catalog read was already tried again.
+    apps_retried: bool,
     pub recent: Vec<RecentFile>,
     /// Windows keeps recent files; false shows "No recent files".
     pub recent_enabled: bool,
@@ -1110,6 +1148,7 @@ impl StartData {
             rows: Vec::new(),
             apps_at: None,
             apps_pending: false,
+            apps_retried: false,
             recent: Vec::new(),
             recent_enabled: true,
             account: String::new(),
@@ -1179,6 +1218,13 @@ impl StartData {
             any = true;
             match a {
                 Answer::Apps(apps) => {
+                    if retry_empty_read(apps.is_empty(), !self.apps.is_empty(), self.apps_retried)
+                        && w.tx.send(Request::RetryApps).is_ok()
+                    {
+                        // Still loading: the "Loading apps…" row stays until real data.
+                        self.apps_retried = true;
+                        continue;
+                    }
                     self.apps_pending = false;
                     self.apps_at = Some(Instant::now());
                     // An empty read (the shell was not ready) keeps the old list.
@@ -2050,6 +2096,29 @@ impl StartPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_first_catalog_read_is_retried_once() {
+        assert!(retry_empty_read(true, false, false));
+        assert!(!retry_empty_read(true, false, true));
+        // An empty read with a list already shown keeps that list, no retry.
+        assert!(!retry_empty_read(true, true, false));
+        assert!(!retry_empty_read(false, false, false));
+    }
+
+    #[test]
+    fn a_boost_always_wins_over_the_prefetch_priority() {
+        // Boost before the prefetch starts: lowered for a moment at most, normal at the end.
+        let boosted = AtomicBool::new(true);
+        let mut calls = Vec::new();
+        enter_prefetch(&boosted, |low| calls.push(low));
+        assert_eq!(calls.last(), Some(&false));
+        // No boost: the prefetch runs low.
+        let boosted = AtomicBool::new(false);
+        let mut calls = Vec::new();
+        enter_prefetch(&boosted, |low| calls.push(low));
+        assert_eq!(calls, vec![true]);
+    }
     use vitro_core::start_layout::{panel_layout, PANEL_H_DIP, PANEL_W_DIP};
 
     fn geom() -> Geom {

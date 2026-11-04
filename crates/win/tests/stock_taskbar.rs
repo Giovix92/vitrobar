@@ -28,7 +28,9 @@ fn temp_missing() -> PathBuf {
 
 /// Waits (briefly) for the asynchronous show/hide of Explorer's windows to land.
 fn eventually(mut f: impl FnMut() -> bool) -> bool {
-    let end = Instant::now() + Duration::from_secs(2);
+    // Generous: right after a take-over or a restore Explorer can take several seconds to
+    // move its taskbar, more so in a full run of the ignored tests one after another.
+    let end = Instant::now() + Duration::from_secs(10);
     loop {
         if f() {
             return true;

@@ -515,6 +515,8 @@ pub enum Hit {
     Clock,
     /// Index into `layout.widgets` (0 = Music, 1 = Claude limits).
     Widget(usize),
+    /// The input-language indicator.
+    Ime,
     ShowDesktop,
 }
 
@@ -548,6 +550,9 @@ pub fn hit_test(l: &BarLayout, x: f32, y: f32) -> Option<Hit> {
         .position(|r| r.as_ref().is_some_and(|r| inside(r, x, y)))
     {
         return Some(Hit::Widget(i));
+    }
+    if l.ime.as_ref().is_some_and(|r| inside(r, x, y)) {
+        return Some(Hit::Ime);
     }
     if inside(&l.quick, x, y) {
         return Some(Hit::Quick);
@@ -594,6 +599,7 @@ mod tests {
             reserve_floating: true,
             tray_area: true,
             widgets: [0.0; 2],
+            ime: 0.0,
         }
     }
 
@@ -638,12 +644,23 @@ mod tests {
     fn widget_pills_hit_their_index() {
         let l = compute_layout(&LayoutInput {
             widgets: [100.0, 80.0],
+            ime: 0.0,
             ..input(2)
         });
         for i in 0..2 {
             let (x, y) = centre(&l.widgets[i].unwrap());
             assert_eq!(hit_test(&l, x, y), Some(Hit::Widget(i)));
         }
+    }
+
+    #[test]
+    fn the_ime_indicator_is_hit() {
+        let l = compute_layout(&LayoutInput {
+            ime: 30.0,
+            ..input(2)
+        });
+        let (x, y) = centre(&l.ime.unwrap());
+        assert_eq!(hit_test(&l, x, y), Some(Hit::Ime));
     }
 
     #[test]

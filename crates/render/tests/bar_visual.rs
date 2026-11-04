@@ -31,6 +31,7 @@ fn layout(shape: Shape, apps: usize) -> BarLayout {
         reserve_floating: true,
         tray_area: true,
         widgets: [0.0; 2],
+        ime: 0.0,
     })
 }
 
@@ -326,6 +327,7 @@ fn tray_icons_and_chevron_draw_once() {
         reserve_floating: true,
         tray_area: true,
         widgets: [0.0; 2],
+        ime: 0.0,
     };
     let l = compute_layout(&input);
     let img = Arc::new(icon(16));
@@ -394,6 +396,7 @@ fn bar_without_tray_area_draws_start_and_clock_only() {
         reserve_floating: true,
         tray_area: false,
         widgets: [0.0; 2],
+        ime: 0.0,
     });
     // Even if the app handed tray items over, a bar without the tray area shows none.
     bar.set_tray(vec![TrayItemState::default(); 3], ChevronState::default());
@@ -456,6 +459,7 @@ fn focus_ring_follows_the_focused_item_without_redrawing() {
         reserve_floating: true,
         tray_area: true,
         widgets: [0.0; 2],
+        ime: 0.0,
     };
     let l = compute_layout(&input);
     let items = icons(3);
@@ -531,6 +535,7 @@ fn widget_pills_draw_only_what_the_app_supplies() {
     let hover = hover_style(HoverEffect::Plate);
     let mut l = compute_layout(&LayoutInput {
         widgets: [120.0, 90.0],
+        ime: 0.0,
         ..input_for(Shape::Pill)
     });
     // Slots without content draw nothing: the bar looks as before.
@@ -574,5 +579,37 @@ fn input_for(shape: Shape) -> LayoutInput {
         reserve_floating: true,
         tray_area: true,
         widgets: [0.0; 2],
+        ime: 0.0,
     }
+}
+
+#[test]
+fn the_ime_indicator_draws_its_text_when_given_a_rect() {
+    let comp = init_compositor().unwrap();
+    let gpu = create_gpu_device(&comp).unwrap();
+    let mut bar = BarVisual::new(&comp, &gpu, 0).unwrap();
+    bar.set_env(VisualEnv {
+        animations: false,
+        ..Default::default()
+    });
+    let style = material_style(Material::Frosted, Theme::Dark, true);
+    let hover = hover_style(HoverEffect::Plate);
+    let mut l = compute_layout(&LayoutInput {
+        ime: 32.0,
+        ..input_for(Shape::Pill)
+    });
+    bar.update(&l, &[], "12:34", &style, &hover).unwrap();
+    assert!(!bar.ime_shown());
+    let base = bar.surfaces_drawn();
+    bar.set_ime(Some("ITA".into()), false);
+    bar.update(&l, &[], "12:34", &style, &hover).unwrap();
+    assert!(bar.ime_shown());
+    assert_eq!(bar.surfaces_drawn(), base + 1);
+    // Hover is a plate, not a new text surface.
+    bar.set_ime(Some("ITA".into()), true);
+    bar.update(&l, &[], "12:34", &style, &hover).unwrap();
+    assert_eq!(bar.surfaces_drawn(), base + 1);
+    l.ime = None;
+    bar.update(&l, &[], "12:34", &style, &hover).unwrap();
+    assert!(!bar.ime_shown());
 }

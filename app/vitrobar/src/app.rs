@@ -115,7 +115,7 @@ use crate::keys::{
 use crate::launcher::{Job, Launcher};
 use crate::menus::{app_menu, bar_menu, power_menu, start_item_menu, MenuChoice, MenuCtx};
 use crate::notify::{
-    inbox_pending, take_inbox, Inbox, NotifyWindow, TIMER_CALENDAR_MIDNIGHT, TIMER_CLAUDE_MINUTE, TIMER_CLAUDE_STALE, TIMER_CLOCK, TIMER_GPU_RETRY, TIMER_HOVER_HIDE,
+    inbox_pending, take_inbox, Inbox, NotifyWindow, TIMER_CALENDAR_MIDNIGHT, TIMER_CLAUDE_MINUTE, TIMER_CLAUDE_STALE, TIMER_CLOCK, TIMER_IME, TIMER_GPU_RETRY, TIMER_HOVER_HIDE,
     TIMER_HOVER_SHOW, TIMER_MARGIN_COLLAPSE, TIMER_QUICK_BT, TIMER_QUICK_SCAN, TIMER_REASSERT,
     TIMER_START_CLOSED, TIMER_START_PREFETCH, TIMER_TRAY_TIP, WM_APP_TAKE_OVER,
 };
@@ -123,6 +123,8 @@ use crate::calendar_panel::{CalendarPanel, Outcome as CalOutcome};
 use crate::widgets::{Claude, ClaudePanel, Music, MusicPanel, Outcome as MusicOutcome};
 use vitro_core::settings_ui::set_claude_hint;
 use vitro_win::claude_usage::{self, Wrap};
+use vitro_win::tray_host::{set_icon_rects, IconRects};
+use vitro_core::ime::ime_short_name;
 use crate::quick::{Gfx, Outcome as QuickOutcome, QuickPanel};
 use crate::settings_window::{apply_choice, Effect, SettingsAction, SettingsInput, SettingsWindow};
 use crate::shell::{self, StockGuard};
@@ -148,6 +150,10 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 const CLOCK_FONT_DIP: f32 = 12.0;
 const CLOCK_PAD_DIP: f32 = 4.0;
 const CLOCK_MIN_DIP: f32 = 64.0;
+/// Padding each side of the input-language indicator's text.
+const IME_PAD_DIP: f32 = 6.0;
+/// After a click on the indicator, the new layout is read this much later.
+const IME_REREAD_MS: u32 = 250;
 const GPU_RETRY_MS: u32 = 2000;
 /// Hovering an app opens its thumbnail strip after this long.
 const HOVER_SHOW_MS: u32 = 400;
@@ -252,6 +258,7 @@ fn empty_layout() -> BarLayout {
         reserve_floating: false,
         tray_area: false,
         widgets: [0.0; 2],
+        ime: 0.0,
     })
 }
 
@@ -503,6 +510,8 @@ struct Overflow {
     over: bool,
     /// Slot under a button press, and whether it is the right button.
     pressed: Option<(usize, bool)>,
+    /// The foreground window when it opened: Esc gives the foreground back to it.
+    fg_at_open: usize,
 }
 
 /// A tray icon under the cursor (bar or overflow): the tooltip's subject.
@@ -641,6 +650,10 @@ struct App {
     claude_panel: Option<ClaudePanel>,
     /// Turning the Claude widget on failed: the settings say so under its toggle.
     claude_failed: bool,
+    /// The input-language indicator's text (`None` with a single keyboard layout) and its
+    /// DIP width.
+    ime_text: Option<String>,
+    ime_w: f32,
     /// The open settings window (its visuals and window go before the compositor and GPU).
     settings_win: Option<SettingsWindow>,
     /// One per monitor, in [`current_monitors`] order: the first carries the tray area.
@@ -770,6 +783,8 @@ impl App {
             claude: None,
             claude_panel: None,
             claude_failed: false,
+            ime_text: None,
+            ime_w: 0.0,
             settings_win: None,
             monitors,
             tracker,
@@ -820,6 +835,7 @@ impl App {
             input_time: 0,
         };
         app.tick_clock();
+        app.read_ime();
         app.sync_music();
         app.sync_claude();
         // Show the bars before the (slower) first window enumeration.
@@ -922,6 +938,7 @@ impl App {
                 self.music.as_ref().map_or(0.0, |m| m.width),
                 self.claude.as_ref().map_or(0.0, |c| c.width),
             ],
+            ime: self.ime_w,
         })
     }
 
@@ -1145,6 +1162,56 @@ impl App {
         }
     }
 
+    /// Reads the foreground window's input language for the indicator (hidden with a single
+    /// keyboard layout); true if the text or width changed.
+    fn read_ime(&mut self) -> bool {
+        let text = (vitro_win::ime::layout_count() > 1).then(|| {
+            let (langid, name) = vitro_win::ime::foreground_language()
+                .unwrap_or_else(|| vitro_win::ime::thread_language(0));
+            ime_short_name(langid, &name)
+        });
+        let w = match &text {
+            Some(t) => {
+                let tw = self
+                    .painter
+                    .measure(t, FontKind::Text, CLOCK_FONT_DIP)
+                    .map(|(w, _)| w.ceil())
+                    .unwrap_or(24.0);
+                (tw + 2.0 * IME_PAD_DIP).round()
+            }
+            None => 0.0,
+        };
+        let changed = text != self.ime_text || w != self.ime_w;
+        self.ime_text = text;
+        self.ime_w = w;
+        changed
+    }
+
+    /// Tells the tray host where bar `k` (the tray bar) draws each icon, for apps that ask
+    /// with `Shell_NotifyIconGetRect`.
+    fn publish_icon_rects(&self, k: usize) {
+        let mb = &self.monitors[k];
+        let scale = mb.scale();
+        let promoted = self
+            .tray_bar
+            .iter()
+            .zip(&mb.layout.tray)
+            .filter_map(|(&i, r)| Some((self.tray_entries.get(i)?.icon.id, to_px(*r, scale))))
+            .collect();
+        let overflowed = self
+            .tray_over
+            .iter()
+            .filter_map(|&i| Some(self.tray_entries.get(i)?.icon.id))
+            .collect();
+        let chev = mb.layout.overflow_chevron;
+        let chevron = (!self.tray_over.is_empty() && chev.w > 0.0).then(|| to_px(chev, scale));
+        set_icon_rects(IconRects {
+            promoted,
+            overflowed,
+            chevron,
+        });
+    }
+
     /// The loaded image of tray entry `idx` (requests it if needed).
     fn tray_image(&mut self, idx: usize) -> Option<Arc<BgraImage>> {
         let px = self.tray_px();
@@ -1263,6 +1330,8 @@ impl App {
             self.music.as_ref().and_then(|m| m.pill.clone()),
             self.claude.as_ref().and_then(|c| c.pill.clone()),
         ];
+        let ime_hover = self.hover == Some(Hit::Ime) && self.monitors[k].id() == self.cur;
+        let ime_text = self.ime_text.clone();
         let pill_hover = match self.hover {
             Some(Hit::Widget(w)) if self.monitors[k].id() == self.cur => Some(w),
             _ => None,
@@ -1289,6 +1358,7 @@ impl App {
             bar.visual.set_tray(tray_items.clone(), chevron);
             bar.visual.set_focus(focus);
             bar.visual.set_widgets(pills.clone(), pill_hover);
+            bar.visual.set_ime(ime_text.clone(), ime_hover);
             if let Err(e) = bar.visual.update(
                 &layout,
                 &items,
@@ -1311,6 +1381,7 @@ impl App {
         if tray {
             // The pill grows and shrinks as apps come and go: the panel follows its button.
             self.quick_reanchor();
+            self.publish_icon_rects(k);
         }
         self.calendar_reanchor(k);
         if tray {
@@ -1789,6 +1860,10 @@ impl App {
                 self.start_foreground_changed(fg);
                 self.quick_foreground_changed(fg);
                 self.calendar_foreground_changed(fg);
+                // Each window has its own input language.
+                if self.read_ime() {
+                    dirty.visuals = true;
+                }
                 self.music_foreground_changed(fg);
                 self.claude_foreground_changed(fg);
                 // A foreground change is when the shell reorders the topmost band: keep our
@@ -1888,6 +1963,12 @@ impl App {
             TIMER_QUICK_SCAN | TIMER_QUICK_BT => self.quick_timer(id),
             TIMER_CALENDAR_MIDNIGHT => self.calendar_timer(id),
             TIMER_CLAUDE_STALE | TIMER_CLAUDE_MINUTE => self.claude_timer(id, dirty),
+            TIMER_IME => {
+                self.kill_timer(id);
+                if self.read_ime() {
+                    dirty.visuals = true;
+                }
+            }
             other => self.tracker.on_timer(other),
         }
     }
@@ -2261,6 +2342,7 @@ impl App {
         let slot = metrics(self.settings.icon_size).slot;
         let (ids, images) = self.overflow_images();
         let (size, _) = grid_layout(ids.len(), slot);
+        let fg_at_open = foreground().unwrap_or(0) as usize;
         let opened = Flyout::show(
             &self.comp,
             anchor,
@@ -2278,6 +2360,7 @@ impl App {
                 ids,
                 over: false,
                 pressed: None,
+                fg_at_open,
             })
         });
         match opened {
@@ -2454,6 +2537,10 @@ impl App {
             return false;
         }
         if msg.wParam.0 == usize::from(VK_ESCAPE.0) {
+            // Back to the window the user was in (while the flyout still has the foreground).
+            if let Some(o) = &self.overflow {
+                let _ = self.hand_back_foreground(o.flyout.hwnd(), o.fg_at_open);
+            }
             self.close_overflow();
             dirty.visuals = true;
         }
@@ -2883,6 +2970,14 @@ impl App {
             }
             Hit::Widget(1) => self.toggle_claude_panel(dirty),
             Hit::Widget(_) => {}
+            Hit::Ime => {
+                vitro_win::ime::next_layout_for_foreground();
+                // The switch is asynchronous: read it again a moment later.
+                // SAFETY: timer on our own window; setting the id again replaces it.
+                unsafe {
+                    SetTimer(Some(self.notify.hwnd), TIMER_IME, IME_REREAD_MS, None);
+                }
+            }
             Hit::More | Hit::ShowDesktop => {}
         }
     }
@@ -5172,6 +5267,10 @@ impl App {
         }
         if inbox.claude {
             self.on_claude_data(dirty);
+        }
+        if inbox.clock && self.read_ime() {
+            // Regional settings changed: keyboard layouts may have been added or removed.
+            dirty.visuals = true;
         }
         if inbox.clock {
             // The system clock or time zone changed: today may have moved.

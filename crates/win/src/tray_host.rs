@@ -39,7 +39,10 @@ use vitro_core::appbar_wire::{
     is_appbar_data, parse_appbar_copydata, with_shared_block, APPBAR_COPYDATA_ID, APPBAR_DATA_SIZE,
 };
 use vitro_core::tray_model::{tray_key, TrayIcon, TrayModel};
-use vitro_core::tray_wire::{parse_tray_copydata, TrayMessage, TrayOp, TRAY_COPYDATA_ID};
+use vitro_core::tray_wire::{
+    icon_rect_answer, icon_rect_for, parse_icon_rect_query, parse_tray_copydata, IconRect,
+    TrayIconId, TrayMessage, TrayOp, ICON_RECT_COPYDATA_ID, TRAY_COPYDATA_ID,
+};
 use windows::core::{w, Error, Result, BOOL, PCWSTR};
 use windows::Win32::Foundation::{E_FAIL, HANDLE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
@@ -69,6 +72,33 @@ pub const WM_VITRO_TRAY: u32 = WM_APP + 2;
 
 /// Accepted tray messages waiting for the UI thread.
 static TRAY_QUEUE: WakeQueue<TrayMessage> = WakeQueue::new();
+
+/// Where the bar draws each tray icon (screen px), for `Shell_NotifyIconGetRect`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IconRects {
+    pub promoted: Vec<(TrayIconId, IconRect)>,
+    pub overflowed: Vec<TrayIconId>,
+    /// The overflow chevron, when the bar shows one.
+    pub chevron: Option<IconRect>,
+}
+
+/// Set by the UI thread after each tray layout; read by the host thread (never held across
+/// a call).
+static ICON_RECTS: Mutex<Option<IconRects>> = Mutex::new(None);
+
+/// The UI thread publishes where the icons are now.
+pub fn set_icon_rects(r: IconRects) {
+    *ICON_RECTS.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
+}
+
+/// Our answer to an icon-rect query (`None`: not ours to answer, Explorer does).
+fn answer_icon_rect(data: &[u8]) -> Option<isize> {
+    let q = parse_icon_rect_query(data)?;
+    let rects = ICON_RECTS.lock().unwrap_or_else(|e| e.into_inner());
+    let r = rects.as_ref()?;
+    let rect = icon_rect_for(&q.id, &r.promoted, &r.overflowed, r.chevron)?;
+    Some(icon_rect_answer(q.corner, rect))
+}
 
 /// `NIN_SELECT` (`WM_USER + 0`): a version-4 icon was selected with the mouse.
 pub const NIN_SELECT: u32 = WM_USER;
@@ -437,6 +467,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 // Explorer already has: it says FALSE, we say TRUE), and an app told FALSE may
                 // give up on an icon that is perfectly alive in the bar.
                 LRESULT(ours as isize)
+            } else if let Some(answer) = (id == ICON_RECT_COPYDATA_ID)
+                .then(|| answer_icon_rect(data))
+                .flatten()
+            {
+                // An icon the bar draws: its rect in the bar, so the app's own flyout opens
+                // next to it (Explorer would answer with its hidden taskbar's).
+                LRESULT(answer)
             } else {
                 if id == APPBAR_COPYDATA_ID {
                     // SAFETY: `data` and `wparam` of the message being handled.
@@ -444,8 +481,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         return answer;
                     }
                 }
-                // Other appbar calls (0), icon-rect queries (3) and anything newer: Explorer
-                // answers.
+                // Other appbar calls (0), icon-rect queries for icons we do not draw (3) and
+                // anything newer: Explorer answers.
                 // SAFETY: the message as we received it.
                 unsafe { forward(hwnd, msg, wparam, lparam) }
             }
@@ -972,5 +1009,27 @@ mod tests {
         assert_ne!(c.handle(), 0);
         assert!(copy_icon(0).is_none());
         assert!(copy_icon(0x7FFF_FFF0).is_none(), "not an icon");
+    }
+
+    #[test]
+    fn icon_rect_queries_get_the_bar_slot() {
+        let id = TrayIconId {
+            hwnd: 0xBEEF,
+            uid: 3,
+            guid: None,
+        };
+        let mut q = Vec::new();
+        for v in [0x3475_3423u32, 1, 40, 0, 0xBEEF, 3] {
+            q.extend(v.to_le_bytes());
+        }
+        q.extend([0u8; 16]);
+        set_icon_rects(IconRects {
+            promoted: vec![(id, (100, 1040, 124, 1072))],
+            overflowed: Vec::new(),
+            chevron: None,
+        });
+        assert_eq!(answer_icon_rect(&q), Some((1040 << 16) | 100));
+        q[16] = 0x01; // another window: not ours
+        assert_eq!(answer_icon_rect(&q), None);
     }
 }
