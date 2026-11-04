@@ -60,6 +60,19 @@ fn settings_with(dir: &Path, prev: Option<&str>) -> PathBuf {
     p
 }
 
+/// How long the bridge takes here with no previous command: starting the exe is not part of
+/// the bridge's budget, and under a loaded test run it alone can take most of a second.
+fn baseline(dir: &Path) -> Duration {
+    // Its own folder: the test's settings and cache stay as they are.
+    let own = dir.join("baseline");
+    std::fs::create_dir_all(&own).unwrap();
+    let settings = settings_with(&own, None);
+    bridge(&settings, &own, "powershell", SAMPLE).2
+}
+
+/// The bridge's 950 ms budget plus some slack for the cut and the exit.
+const OVER_BASELINE: Duration = Duration::from_millis(1200);
+
 fn slash(p: &Path) -> String {
     p.display().to_string().replace('\\', "/")
 }
@@ -131,9 +144,10 @@ fn a_hanging_previous_command_is_cut_off_after_a_second() {
         cases.push((bash.display().to_string(), "sleep 5"));
     }
     for (shell, cmd) in cases {
+        let base = baseline(dir.path());
         let (_, ok, took) = bridge(&settings_with(dir.path(), Some(cmd)), dir.path(), &shell, SAMPLE);
         assert!(ok);
-        assert!(took < Duration::from_millis(1600), "{shell}: {took:?}");
+        assert!(took < base + OVER_BASELINE, "{shell}: {took:?} (baseline {base:?})");
     }
 }
 
@@ -150,9 +164,10 @@ fn a_slow_previous_status_line_prints_its_last_complete_output() {
     let (out, _, _) = bridge(&settings, dir.path(), &bash, SAMPLE);
     assert!(out.contains("hello-cache"), "{out:?}");
     std::fs::write(&flag, "").unwrap();
+    let base = baseline(dir.path());
     let (out, ok, took) = bridge(&settings, dir.path(), &bash, SAMPLE);
     assert!(ok);
-    assert!(took < Duration::from_millis(1600), "{took:?}");
+    assert!(took < base + OVER_BASELINE, "{took:?} (baseline {base:?})");
     assert!(out.contains("hello-cache"), "the last complete output: {out:?}");
 }
 
@@ -161,10 +176,11 @@ fn a_slow_status_line_with_nothing_cached_prints_what_it_wrote_so_far() {
     let Some(bash) = git_bash() else { return };
     let bash = bash.display().to_string();
     let dir = tempfile::tempdir().unwrap();
+    let base = baseline(dir.path());
     let settings = settings_with(dir.path(), Some("echo partial-line; sleep 3"));
     let (out, ok, took) = bridge(&settings, dir.path(), &bash, SAMPLE);
     assert!(ok);
-    assert!(took < Duration::from_millis(1600), "{took:?}");
+    assert!(took < base + OVER_BASELINE, "{took:?} (baseline {base:?})");
     assert!(out.contains("partial-line"), "{out:?}");
 }
 
