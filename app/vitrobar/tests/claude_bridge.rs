@@ -89,3 +89,33 @@ fn odd_input_never_fails_and_writes_nothing() {
     }
     assert!(!dir.path().join("Vitrobar").join("claude-usage.json").exists());
 }
+
+#[test]
+fn a_slow_previous_status_line_prints_its_last_complete_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let flag = dir.path().join("slow");
+    // Fast while the flag file is missing, slower than the bridge's budget once it exists;
+    // it prints only at the end either way.
+    let cmd = format!(
+        "(if exist \"{}\" ping -n 4 127.0.0.1 >nul) & echo hello-cache",
+        flag.display()
+    );
+    let settings = settings_with(dir.path(), Some(&cmd));
+    let (out, _, _) = bridge(&settings, dir.path(), SAMPLE);
+    assert!(out.contains("hello-cache"), "{out:?}");
+    std::fs::write(&flag, "").unwrap();
+    let (out, ok, took) = bridge(&settings, dir.path(), SAMPLE);
+    assert!(ok);
+    assert!(took < Duration::from_millis(1600), "{took:?}");
+    assert!(out.contains("hello-cache"), "the last complete output: {out:?}");
+}
+
+#[test]
+fn a_slow_status_line_with_nothing_cached_prints_what_it_wrote_so_far() {
+    let dir = tempfile::tempdir().unwrap();
+    let settings = settings_with(dir.path(), Some("echo partial-line & ping -n 4 127.0.0.1 >nul"));
+    let (out, ok, took) = bridge(&settings, dir.path(), SAMPLE);
+    assert!(ok);
+    assert!(took < Duration::from_millis(1600), "{took:?}");
+    assert!(out.contains("partial-line"), "{out:?}");
+}

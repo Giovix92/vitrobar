@@ -325,6 +325,20 @@ fn shown_used(w: &Window, now: i64) -> f32 {
     }
 }
 
+/// The next moment the pill's text changes by itself: a window resets (it then reads 0 %) or
+/// the data turns "old". `None` when nothing is ahead of `now`.
+pub fn next_pill_change(u: &ClaudeUsage, now: i64) -> Option<i64> {
+    // The first second at which `claude_pill_text` reads differently.
+    let stale = u.at.saturating_add(STALE_AFTER_S + 1);
+    [u.five_hour, u.seven_day]
+        .into_iter()
+        .flatten()
+        .filter_map(|w| w.resets_at)
+        .chain(Some(stale))
+        .filter(|&t| t > now)
+        .min()
+}
+
 /// "resets in 2 h 10 min" (whole minutes, rounded up; days from 24 h on); "resets now" once
 /// the time has come.
 pub fn resets_in(resets_at: i64, now: i64, lang: Lang) -> String {
@@ -518,6 +532,28 @@ mod claude_tests {
         assert_eq!(claude_pill_text(Some(&u), NOW, Lang::En), "5h 0% · 7d 30%");
         assert_eq!(bar_fill(&u.five_hour.unwrap(), NOW), 0.0);
         assert_eq!(bar_fill(&u.seven_day.unwrap(), NOW), 0.3);
+    }
+
+    #[test]
+    fn the_pill_changes_at_the_next_reset_or_when_it_goes_stale() {
+        let u = ClaudeUsage {
+            five_hour: Some(win(100.0, Some(NOW + 600))),
+            seven_day: Some(win(40.0, Some(NOW + 86_400))),
+            at: NOW - 60,
+        };
+        // The 5-hour reset comes first.
+        assert_eq!(next_pill_change(&u, NOW), Some(NOW + 600));
+        // After it: the stale moment (at + 6 h) comes before the weekly reset.
+        assert_eq!(next_pill_change(&u, NOW + 600), Some(NOW - 60 + STALE_AFTER_S + 1));
+        // Past everything but the weekly reset.
+        assert_eq!(next_pill_change(&u, NOW + STALE_AFTER_S), Some(NOW + 86_400));
+        assert_eq!(next_pill_change(&u, NOW + 86_400), None);
+        let none = ClaudeUsage {
+            five_hour: None,
+            seven_day: Some(win(1.0, None)),
+            at: NOW,
+        };
+        assert_eq!(next_pill_change(&none, NOW), Some(NOW + STALE_AFTER_S + 1));
     }
 
     #[test]

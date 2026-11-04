@@ -10,10 +10,11 @@ use std::io::{Read, Write};
 use std::os::windows::process::CommandExt;
 use std::process::{Command, ExitCode, Stdio};
 use std::sync::mpsc::channel;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use vitro_core::widgets::parse_statusline;
-use vitro_win::claude_usage::{data_path, save_at};
+use vitro_win::claude_usage::{data_dir, data_path, save_at};
 use windows::Win32::Foundation::{
     CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS,
 };
@@ -50,7 +51,7 @@ pub fn run() -> ExitCode {
         .and_then(|s| s.claude_prev_statusline)
         .filter(|c| !c.trim().is_empty());
     let out = match prev {
-        Some(cmd) => run_previous(&cmd, &input, deadline),
+        Some(cmd) => previous_output(&cmd, &input, deadline),
         None => minimal_line(&json).into_bytes(),
     };
     let mut stdout = std::io::stdout().lock();
@@ -138,9 +139,51 @@ impl Drop for Job {
     }
 }
 
-/// Runs `cmd` through `cmd /C` with `input` on its stdin; its stdout if it came before
-/// `deadline` (else nothing, and it and whatever it started are ended).
-fn run_previous(cmd: &str, input: &[u8], deadline: Instant) -> Vec<u8> {
+/// The previous status line's output: this run's when it finished in time (and it is kept
+/// for later); else the last complete output of the same command, or failing that whatever
+/// it printed before the cut. A slow status line (a cold `npx`) so keeps showing.
+fn previous_output(cmd: &str, input: &[u8], deadline: Instant) -> Vec<u8> {
+    let (out, complete) = run_previous(cmd, input, deadline);
+    let cache = data_dir().map(|d| d.join(PREV_OUT_FILE));
+    if complete {
+        if let Some(p) = &cache {
+            save_prev_output(p, cmd, &out);
+        }
+        return out;
+    }
+    cache
+        .and_then(|p| load_prev_output(&p, cmd))
+        .unwrap_or(out)
+}
+
+/// The last complete output of the previous status line, with the command that printed it.
+const PREV_OUT_FILE: &str = "claude-prev-out.json";
+
+fn save_prev_output(path: &std::path::Path, cmd: &str, out: &[u8]) {
+    let v = serde_json::json!({ "command": cmd, "output": String::from_utf8_lossy(out) });
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    let saved = std::fs::write(&tmp, v.to_string()).and_then(|()| std::fs::rename(&tmp, path));
+    if saved.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// The cached output, only if `cmd` printed it (the user may have changed the command).
+fn load_prev_output(path: &std::path::Path, cmd: &str) -> Option<Vec<u8>> {
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    if v.get("command")?.as_str()? != cmd {
+        return None;
+    }
+    Some(v.get("output")?.as_str()?.as_bytes().to_vec())
+}
+
+/// Runs `cmd` through `cmd /C` with `input` on its stdin; its stdout and whether that is
+/// complete (it ended before `deadline`). Otherwise what it printed so far, and it and
+/// whatever it started are ended.
+fn run_previous(cmd: &str, input: &[u8], deadline: Instant) -> (Vec<u8>, bool) {
     keep_std_handles();
     let job = Job::new();
     let child = Command::new("cmd")
@@ -153,7 +196,7 @@ fn run_previous(cmd: &str, input: &[u8], deadline: Instant) -> Vec<u8> {
         .creation_flags(CREATE_NO_WINDOW)
         .spawn();
     let Ok(mut child) = child else {
-        return Vec::new();
+        return (Vec::new(), true);
     };
     if let Some(j) = &job {
         j.add(child.id());
@@ -165,22 +208,30 @@ fn run_previous(cmd: &str, input: &[u8], deadline: Instant) -> Vec<u8> {
             let _ = stdin.write_all(&input);
         });
     }
+    // The reader appends as output arrives, so a cut still has what came so far.
+    let got = Arc::new(Mutex::new(Vec::new()));
     let (tx, rx) = channel();
     if let Some(mut stdout) = child.stdout.take() {
+        let got = Arc::clone(&got);
         std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = stdout.read_to_end(&mut buf);
-            let _ = tx.send(buf);
+            let mut chunk = [0u8; 4096];
+            while let Ok(n @ 1..) = stdout.read(&mut chunk) {
+                got.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(&chunk[..n]);
+            }
+            let _ = tx.send(());
         });
     }
     let left = deadline.saturating_duration_since(Instant::now());
-    let out = rx.recv_timeout(left).unwrap_or_default();
-    // The output is complete; give the process the rest of the budget to exit, then end it.
-    while Instant::now() < deadline {
-        if let Ok(Some(_)) = child.try_wait() {
-            return out;
+    let eof = rx.recv_timeout(left).is_ok();
+    let take = || std::mem::take(&mut *got.lock().unwrap_or_else(|e| e.into_inner()));
+    if eof {
+        // The output is complete; give the process the rest of the budget to exit.
+        while Instant::now() < deadline {
+            if let Ok(Some(_)) = child.try_wait() {
+                return (take(), true);
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
-        std::thread::sleep(Duration::from_millis(10));
     }
     match &job {
         Some(j) => j.end(),
@@ -188,7 +239,7 @@ fn run_previous(cmd: &str, input: &[u8], deadline: Instant) -> Vec<u8> {
             let _ = child.kill();
         }
     }
-    out
+    (take(), eof)
 }
 
 #[cfg(test)]

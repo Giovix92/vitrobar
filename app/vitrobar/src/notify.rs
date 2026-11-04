@@ -116,7 +116,7 @@ pub const TIMER_QUICK_SCAN: usize = 0x570A;
 pub const TIMER_QUICK_BT: usize = 0x570B;
 /// One-shot at the next local midnight while the calendar is open: today moves.
 pub const TIMER_CALENDAR_MIDNIGHT: usize = 0x570C;
-/// One-shot: the Claude widget's data turns "old" on the pill.
+/// One-shot: the Claude pill changes by itself (a window resets, or the data turns "old").
 pub const TIMER_CLAUDE_STALE: usize = 0x570D;
 /// One-shot while the Claude panel is open: a minute passed ("resets in" counts down).
 pub const TIMER_CLAUDE_MINUTE: usize = 0x570E;

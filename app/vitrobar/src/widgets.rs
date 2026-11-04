@@ -16,7 +16,7 @@ use vitro_core::widgets::{
     bar_fill, claude_pill_text, claude_rows, music_action, music_glyph, music_pill_text,
     music_rows, pill_width, ClaudeUsage, MusicAction, MusicView, ART_DIP, CLAUDE_PILL_MAX_DIP,
     G_CLAUDE, ID_ART, ID_BAR_5H, ID_BAR_7D, MUSIC_PILL_MAX_CHARS, MUSIC_PILL_MAX_DIP,
-    PILL_FONT_DIP, STALE_AFTER_S,
+    PILL_FONT_DIP, next_pill_change,
 };
 use vitro_render::bar_visual::WidgetPill;
 use vitro_render::compositor::Comp;
@@ -501,11 +501,12 @@ impl Claude {
         changed
     }
 
-    /// Milliseconds until the saved data turns "old" on the pill; `None` when there is none or
-    /// it already is.
-    pub fn ms_until_stale(&self) -> Option<u32> {
-        let left = self.usage?.at + STALE_AFTER_S - now_s();
-        (left >= 0).then(|| ((left as u64 + 1) * 1000).min(u64::from(u32::MAX)) as u32)
+    /// Milliseconds until the pill's text changes by itself (a window resets, or the data
+    /// turns "old"); `None` when nothing is ahead.
+    pub fn ms_until_change(&self) -> Option<u32> {
+        let now = now_s();
+        let at = next_pill_change(&self.usage?, now)?;
+        Some(((at - now).max(1) as u64 * 1000).min(u64::from(u32::MAX)) as u32)
     }
 }
 

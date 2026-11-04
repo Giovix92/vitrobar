@@ -4295,9 +4295,10 @@ impl App {
         }
     }
 
-    /// One one-shot timer for when the saved data turns "old" on the pill.
+    /// One one-shot timer for the next time the pill changes by itself (a reset, or the data
+    /// turning "old").
     fn arm_claude_stale(&mut self) {
-        match self.claude.as_ref().and_then(|c| c.ms_until_stale()) {
+        match self.claude.as_ref().and_then(|c| c.ms_until_change()) {
             // SAFETY: timer on our own window; setting the id again replaces it.
             Some(ms) => unsafe {
                 SetTimer(Some(self.notify.hwnd), TIMER_CLAUDE_STALE, ms, None);
@@ -4330,6 +4331,7 @@ impl App {
             if c.remeasure(&self.painter, lang) {
                 dirty.visuals = true;
             }
+            self.arm_claude_stale();
             return;
         }
         // The minute timer: "resets in" moves on while the panel is open.
