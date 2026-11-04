@@ -6,6 +6,26 @@ use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, E_FAIL};
 use windows::Win32::System::Registry::{
     RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ,
 };
+use windows::Win32::UI::WindowsAndMessaging::{
+    MessageBoxW, IDYES, MB_ICONQUESTION, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO,
+};
+
+/// Asks, with a plain Yes/No message box, whether to start with Windows (`question` is the
+/// localized text). Blocks until answered; closing the box counts as "No", so nothing is
+/// written to the Run key without a yes.
+pub fn ask_start_with_windows(question: &str) -> bool {
+    let text = HSTRING::from(question);
+    // SAFETY: both strings outlive the call; no owner window.
+    let r = unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(text.as_ptr()),
+            w!("Vitrobar"),
+            MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND | MB_TOPMOST,
+        )
+    };
+    r == IDYES
+}
 
 const RUN_KEY: PCWSTR = w!(r"Software\Microsoft\Windows\CurrentVersion\Run");
 const RUN_VALUE: PCWSTR = w!("Vitrobar");

@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/core", "crates/win", "crates/render", "app/vitrobar"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "GPL-3.0-only"
 repository = "https://github.com/Giovix92/vitrobar"

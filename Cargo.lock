@@ -379,7 +379,7 @@ checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
 
 [[package]]
 name = "vitro-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -390,7 +390,7 @@ dependencies = [
 
 [[package]]
 name = "vitro-render"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "vitro-core",
  "windows",
@@ -399,7 +399,7 @@ dependencies = [
 
 [[package]]
 name = "vitro-win"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde_json",
  "tempfile",
@@ -411,7 +411,7 @@ dependencies = [
 
 [[package]]
 name = "vitrobar"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "embed-resource",
  "serde_json",

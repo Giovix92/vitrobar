@@ -480,7 +480,8 @@ mod tests {
         assert!(apply(&mut s, ControlId::WinKey, 0));
         assert!(!s.win_key_opens_start);
         assert!(!apply(&mut s, ControlId::WinKey, 0));
-        assert!(apply(&mut s, ControlId::StartWithWindows, 0));
+        assert!(apply(&mut s, ControlId::StartWithWindows, 1));
+        assert!(s.start_with_windows);
         assert!(apply(&mut s, ControlId::ReserveFloating, 0));
         assert!(apply(&mut s, ControlId::StockTaskbar, 1));
         assert!(!apply(&mut s, ControlId::AboutLicense, 0));

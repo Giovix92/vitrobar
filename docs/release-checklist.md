@@ -196,6 +196,10 @@ the real `%APPDATA%\Vitrobar\settings.toml` stays as it is.
    windows and no others (try it with Character Map, not with an app holding unsaved work).
 9. Start with Windows (menu or window) toggles `HKCU\...\Run\Vitrobar`; the menu check and
    the switch agree.
+   First run (no settings file; point `VITROBAR_SETTINGS` at a new path and delete the
+   `Run\Vitrobar` value first): before the bar appears, a Yes/No box asks "Start Vitrobar
+   when you sign in to Windows?" in the Windows display language. No (or closing it) writes
+   nothing to `Run` and the switch is off; Yes writes the value and the switch is on.
 10. Exit Vitrobar: the stock taskbar and its tray come back, as with any other clean exit.
 
 Automated where safe: `cargo test -p vitro-win --test pins_import -- --nocapture` prints what

@@ -160,6 +160,7 @@ pub enum Key {
     ClaudeFiveHour,
     ClaudeWeekly,
     ResetsNow,
+    AutostartQuestion,
 }
 
 pub const ALL_KEYS: &[Key] = &[
@@ -305,6 +306,7 @@ pub const ALL_KEYS: &[Key] = &[
     Key::ClaudeFiveHour,
     Key::ClaudeWeekly,
     Key::ResetsNow,
+    Key::AutostartQuestion,
 ];
 
 pub fn tr(lang: Lang, key: Key) -> &'static str {
@@ -601,6 +603,16 @@ pub fn tr(lang: Lang, key: Key) -> &'static str {
         (Lang::It, Key::ClaudeWeekly) => "Limite settimanale",
         (Lang::En, Key::ResetsNow) => "resets now",
         (Lang::It, Key::ResetsNow) => "si azzera ora",
+        (Lang::En, Key::AutostartQuestion) => {
+            "Start Vitrobar when you sign in to Windows?
+
+You can change this later in Settings."
+        }
+        (Lang::It, Key::AutostartQuestion) => {
+            "Avviare Vitrobar quando accedi a Windows?
+
+Puoi cambiarlo in seguito nelle Impostazioni."
+        }
     }
 }
 
@@ -621,7 +633,7 @@ mod tests {
             assert!(!tr(Lang::En, k).is_empty());
             assert!(!tr(Lang::It, k).is_empty());
         }
-        assert_eq!(ALL_KEYS.len(), 142);
+        assert_eq!(ALL_KEYS.len(), 143);
     }
     #[test]
     fn italian_differs_from_english() {
@@ -640,5 +652,7 @@ mod tests {
         assert_eq!(tr(Lang::En, Key::ExitVitrobar), "Exit Vitrobar");
         assert_eq!(tr(Lang::It, Key::MaterialSmoked), "Vetro fumé");
         assert_eq!(tr(Lang::En, Key::HoverSweep), "Light sweep");
+        assert!(tr(Lang::En, Key::AutostartQuestion).starts_with("Start Vitrobar"));
+        assert!(tr(Lang::It, Key::AutostartQuestion).starts_with("Avviare Vitrobar"));
     }
 }

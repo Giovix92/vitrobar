@@ -115,7 +115,8 @@ impl Default for Settings {
             accent: None,
             battery_fallback: true,
             live_refraction: false,
-            start_with_windows: true,
+            // Opt-in: the first run asks (see the app's first-run path).
+            start_with_windows: false,
             language: None,
             pins: Vec::new(),
             tray_promoted: Vec::new(),
@@ -295,7 +296,8 @@ mod tests {
         assert_eq!(s.material, Material::Frosted);
         assert_eq!(s.hover, HoverEffect::Plate);
         assert!(s.reserve_space_floating);
-        assert!(s.start_with_windows);
+        // Opt-in: the first run asks before anything is written to HKCU\...\Run.
+        assert!(!s.start_with_windows);
         assert!(!s.first_run_done);
     }
 

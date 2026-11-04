@@ -5560,7 +5560,7 @@ impl Drop for ComGuard {
 }
 
 /// Writes (or removes) the `Run\Vitrobar` value to match the setting.
-/// Used by the "Start with Windows" switch (window and menu) and the first run only.
+/// Used by the "Start with Windows" switch (window and menu) and a first-run yes.
 fn apply_autostart(enabled: bool) {
     if let Err(e) = vitro_win::autostart::set_autostart(enabled) {
         eprintln!("vitrobar: could not update \"Start with Windows\": {e}");
@@ -5638,6 +5638,13 @@ pub fn run(opts: Options) -> Result<()> {
     if first_run {
         // Before the stock taskbar is taken over: the import only reads.
         first_run_import(&mut settings);
+        // "Start with Windows" is opt-in: nothing goes into HKCU\...\Run without a yes.
+        // Not asked in debug-state runs (scripts and live tests drive those).
+        settings.start_with_windows = !opts.debug_state
+            && vitro_win::autostart::ask_start_with_windows(tr(
+                ui_lang(&settings),
+                Key::AutostartQuestion,
+            ));
         if opts.debug_state {
             eprintln!(
                 "vitrobar-import {} pins, {} promoted tray icons",
@@ -5652,7 +5659,9 @@ pub fn run(opts: Options) -> Result<()> {
         }
     }
     if first_run {
-        apply_autostart(settings.start_with_windows);
+        if settings.start_with_windows {
+            apply_autostart(true);
+        }
     } else if settings.start_with_windows && !corrupt {
         // Only follows a Vitrobar that moved: never registers the exe started now by itself.
         if let Err(e) = vitro_win::autostart::repair_autostart() {
