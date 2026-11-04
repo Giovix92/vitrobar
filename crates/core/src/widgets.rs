@@ -2,6 +2,8 @@
 //! panel's rows. Pure; the app feeds it service snapshots.
 
 use crate::i18n::Lang;
+use unicode_segmentation::UnicodeSegmentation;
+
 use crate::panel_kit::{Button, Part, Row};
 
 /// The pill's look, shared with the bar visual that draws it (DIPs).
@@ -58,39 +60,9 @@ fn ellipsize(s: &str, max: usize) -> String {
     format!("{}…", s[..cut].trim_end())
 }
 
-/// Byte offsets where grapheme clusters start. An approximation of UAX #29 that is enough for
-/// track titles: combining marks, variation selectors, emoji modifiers, tag characters and the
-/// keycap mark extend a cluster; a zero-width joiner glues the next character on; regional
-/// indicators pair up into flags.
+/// Byte offsets where (extended) grapheme clusters start.
 fn cluster_starts(s: &str) -> Vec<usize> {
-    let mut starts = Vec::new();
-    let mut after_zwj = false;
-    // The previous character was a regional indicator still waiting for its pair.
-    let mut open_ri = false;
-    for (i, c) in s.char_indices() {
-        let ri = ('\u{1F1E6}'..='\u{1F1FF}').contains(&c);
-        let glued = !starts.is_empty() && (after_zwj || extends(c) || (ri && open_ri));
-        if !glued {
-            starts.push(i);
-        }
-        after_zwj = c == '\u{200D}';
-        open_ri = ri && !open_ri;
-    }
-    starts
-}
-
-fn extends(c: char) -> bool {
-    matches!(c,
-        '\u{0300}'..='\u{036F}'
-        | '\u{1AB0}'..='\u{1AFF}'
-        | '\u{1DC0}'..='\u{1DFF}'
-        | '\u{20D0}'..='\u{20FF}'
-        | '\u{FE00}'..='\u{FE0F}'
-        | '\u{FE20}'..='\u{FE2F}'
-        | '\u{200D}'
-        | '\u{1F3FB}'..='\u{1F3FF}'
-        | '\u{E0020}'..='\u{E007F}'
-        | '\u{E0100}'..='\u{E01EF}')
+    s.grapheme_indices(true).map(|(i, _)| i).collect()
 }
 
 /// The pill's width for text `text` measuring `text_w_dip`, capped at `max_dip`; 0 for empty
