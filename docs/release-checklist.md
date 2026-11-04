@@ -26,11 +26,9 @@ Explorer windows open, no `settings.toml` (or one with an empty pin list).
 Also check while you are here:
 
 - Start opens Vitrobar's Start panel (see "Start menu"), the quick-settings button opens
-  Quick Settings, the clock opens the notification centre and calendar.
-- Click the Quick Settings button twice: it opens then closes; same for the clock; Quick
-  Settings then the clock switches to the notification centre.
-- On a Quick Settings sub-page (Wi-Fi list, volume mixer) a second click may go back a page
-  instead of closing: note which.
+  Vitrobar's quick panel (see "Quick panel"), the clock its calendar (see "Calendar").
+- Click the Quick button twice: it opens then closes; same for the clock; the Quick button
+  then the clock switches from the quick panel to the calendar.
 - An icon that takes long to load shows a soft rounded placeholder first; the bar never
   freezes while icons load.
 - An app asking for attention (e.g. a chat app flashing) gets an accent plate that pulses
@@ -389,6 +387,91 @@ ignored by the hook by design.
     with stock Windows (setting off) and note any difference. Hold Win, press a mouse button
     and Win+E as well: Explorer opens, no Start.
 
+## Quick panel
+
+Introduced by stage 3, Tasks 1–7. The Quick button opens Vitrobar's own glass panel (volume
+and output device, brightness, Wi-Fi, Bluetooth, battery and power mode). Its system
+services start when it opens and stop when it closes. Do these checks on purpose: they do
+change your Wi-Fi, Bluetooth, volume and brightness.
+
+1. Click the Quick button: the panel opens right above it (below it with the bar at the top),
+   inside the work area. Check in each shape (Pill, Islands, Full), on both monitors (the
+   panel belongs to the bar with the tray) and with the bar at the top.
+2. It closes on: a second click on the Quick button, Esc, a click anywhere else, switching
+   apps. Afterwards the window you were in has the foreground again. On a sub-page (Wi-Fi,
+   Bluetooth, output device) Esc goes back one page instead of closing.
+3. Wi-Fi: the list fills within a few seconds; connect to a known network (no password
+   asked); to a new password network (the password row appears, Enter connects); a wrong
+   password shows a message instead of hanging. The radio switch turns Wi-Fi off and on.
+4. Bluetooth: the switch turns the radio off and on; paired devices are listed with their
+   state (a Bluetooth LE mouse too); headphones connect and disconnect from the list; any
+   other device opens Bluetooth settings.
+5. Volume: the slider follows the volume keys and changes the volume; mute toggles; the
+   output list switches the default device.
+6. Brightness: on a laptop panel the slider follows the brightness keys; on an external
+   monitor with DDC/CI it changes the monitor; without either the row is hidden.
+7. Power: the battery label matches Windows (desktop PC: no battery row); the power mode
+   changes as in Settings > System > Power.
+
+## Calendar
+
+Introduced by stage 3, Task 8. The clock opens Vitrobar's own calendar panel.
+
+1. Click the clock: the panel shows today's long date, the month grid with today in an
+   accent circle and the weekdays starting on your locale's first day of the week.
+2. The chevrons, the mouse wheel over the grid and Page Up / Page Down change the month;
+   Home goes back to today's month.
+3. "Notifications" closes the panel and opens the stock notification centre; "Date & time
+   settings" opens Settings > Time & language > Date & time.
+4. Esc, a second click on the clock and a click elsewhere close it; leave it open across
+   midnight (or change the date in Settings): today moves.
+
+## Widgets
+
+Introduced by stage 3, Tasks 9 and 10. Both are off by default (Settings window > Widgets);
+an off widget loads nothing.
+
+1. Music on, with something playing (Spotify, a browser video, Media Player): a pill with the
+   track ("Title — Artist", cut with an ellipsis) appears left of the tray. With nothing
+   playing it is hidden.
+2. Clicking the pill's glyph plays / pauses (the glyph follows); clicking its text opens the
+   detail panel: artwork, title, artist, previous / play-pause / next (only those the player
+   allows) and the player's name. Changing track updates the panel and the artwork.
+3. Claude limits on, first with no `statusLine` in `%USERPROFILE%\.claude\settings.json`:
+   `statusLine.command` becomes `"<path>\vitrobar.exe" --claude-statusline`; the pill shows
+   "Claude: no data" until Claude Code next answers, then "5h N% · 7d N%". The panel shows a
+   bar for each limit, when it resets and "as of HH:MM".
+4. Turn Claude limits off: `statusLine` is removed again. Then set your own status line
+   (any command), turn the widget on and off: your command is back exactly (other keys of
+   `statusLine` such as `padding` are kept) and your status line keeps showing in Claude
+   Code while the widget is on.
+5. With a status-line command that hangs (`ping -n 30 127.0.0.1 >nul`) Claude Code is not
+   held up for more than about a second.
+6. A malformed `settings.json`: turning the widget on fails, the toggle stays off and the
+   hint under it says so; the file is untouched.
+
+## Tray, input language and leftovers
+
+Introduced by stage 3, Task 11.
+
+1. An app that places its own flyout at its tray icon (e.g. a VPN or sync client) opens it
+   next to the icon in Vitrobar's bar (or at the chevron when the icon is in the overflow),
+   not where the hidden stock taskbar would be.
+2. With two or more keyboard layouts installed, a short language name (e.g. "ITA") shows
+   left of the Quick button; it follows the window in front. A click moves the window in
+   front to the next layout. With one layout it is hidden.
+3. Open the tray overflow from an app and press Esc: that app has the foreground again.
+4. Right after sign-in, open Start at once: "Loading apps…" stays until the app list is
+   there (no empty "All apps").
+
+## Stage 2.5 behaviour (never verified live)
+
+1. Start fades out on closing and hands the foreground back to the app you were in.
+2. Glass menus (bar and app right-click menus): Esc, Alt, the Windows key and a click outside
+   all close them.
+3. Thumbnail preview: the ✕ button and a middle click close that window.
+4. The Quick button and the clock: a second click closes what the first one opened.
+
 ## Safety net
 
 Introduced by stage 1, Task 15. `vitrobar.exe` with no arguments is a small watchdog (no
@@ -449,6 +532,9 @@ folder name, Character Map and Paint by the process the check started.
    - `shell_ok` true: afterwards Explorer's `Shell_TrayWnd` is the only one and visible.
    `failures` names every budget missed, and every test window left open. Run it 3 times;
    all 3 must pass.
+   With both widgets on (stage 3): `pwsh scripts/perf-check.ps1 -Exe
+   target\release\vitrobar.exe -Widgets` → `"pass": true` with the same idle budgets
+   (`memory_mb` < 40).
    The Start panel, measured on its own (stage 2, Task 10):
    `pwsh scripts/perf-check.ps1 -Exe target\release\vitrobar.exe -StartPanel` -> one line
    of JSON with `"pass": true`. It starts Vitrobar with `--debug-state`, posts the debug

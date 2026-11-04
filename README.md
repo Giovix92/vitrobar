@@ -11,6 +11,9 @@ Status: pre-alpha.
 - A Start panel of its own: pinned apps, recent files, an "All apps" list, search over apps, Settings pages and files (from the Windows Search index), a calculator in the search box, the account and a power menu. A full-screen app grid is available as an alternative style.
 - The Windows key opens Vitrobar's Start; Win+1...9 act on the bar's apps and Win+T / Win+B move a focus ring over the apps and the tray. Other Windows shortcuts stay as they are.
 - A settings window for the look, behaviour and language (English and Italian), applied live.
+- A quick panel of its own on the Quick button: volume and output device, brightness, Wi-Fi, Bluetooth, battery and power mode.
+- A calendar panel on the clock, with a button to the Windows notification centre; an input-language indicator when more than one keyboard layout is installed.
+- Optional widgets, off by default: the music playing now (play / pause / skip, from Windows media sessions) and your Claude 5-hour and weekly limits (from Claude Code's own status line, no account and no network).
 - A watchdog gives the stock taskbar back if the bar crashes or exits.
 
 ## Build and test

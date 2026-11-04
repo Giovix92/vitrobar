@@ -48,13 +48,18 @@
     figures; see above.
 .PARAMETER MemoryReportOnly
     Report the memory but do not fail on it (CI: see .github/workflows/ci.yml).
+.PARAMETER Widgets
+    Run with both widgets on (Music and Claude limits) in the temp settings file; the idle
+    budgets stay the same (spec: < 40 MB idle with both widgets on). Turning them on this
+    way only starts their watchers: Claude Code's settings are never touched.
 #>
 param(
     [Parameter(Mandatory = $true)][string]$Exe,
     [ValidateRange(0, 10)][int]$Apps = 10,
     [switch]$MeasureStartup,
     [switch]$StartPanel,
-    [switch]$MemoryReportOnly
+    [switch]$MemoryReportOnly,
+    [switch]$Widgets
 )
 
 $ErrorActionPreference = 'Stop'
@@ -262,7 +267,9 @@ $temp = Join-Path ([IO.Path]::GetTempPath()) $tag
 New-Item -ItemType Directory -Path $temp | Out-Null
 $settings = Join-Path $temp 'settings.toml'
 # No first-run import, and "Start with Windows" off so nothing is written to HKCU\...\Run.
-Set-Content -LiteralPath $settings -Encoding utf8 -Value "first-run-done = true`nstart-with-windows = false"
+$settingsText = "first-run-done = true`nstart-with-windows = false"
+if ($Widgets) { $settingsText += "`nwidget-music = true`nwidget-claude = true" }
+Set-Content -LiteralPath $settings -Encoding utf8 -Value $settingsText
 $oldSettingsEnv = $env:VITROBAR_SETTINGS
 $env:VITROBAR_SETTINGS = $settings
 
