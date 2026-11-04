@@ -38,6 +38,7 @@ use vitro_core::clock::ms_until_next_minute;
 use vitro_core::i18n::{lang_from_tag, tr, Key, Lang};
 use vitro_core::image::BgraImage;
 use vitro_core::key_hook::HookOutput;
+use vitro_core::widgets::{on_pill_glyph, MusicAction};
 use vitro_core::layout::{
     anchor_for, compute_layout, diff_monitors, metrics, AnchorTarget, BarLayout, LayoutInput, Rect,
 };
@@ -119,6 +120,7 @@ use crate::notify::{
     TIMER_START_CLOSED, TIMER_START_PREFETCH, TIMER_TRAY_TIP, WM_APP_TAKE_OVER,
 };
 use crate::calendar_panel::{CalendarPanel, Outcome as CalOutcome};
+use crate::widgets::{Music, MusicPanel, Outcome as MusicOutcome};
 use crate::quick::{Gfx, Outcome as QuickOutcome, QuickPanel};
 use crate::settings_window::{apply_choice, Effect, SettingsAction, SettingsInput, SettingsWindow};
 use crate::shell::{self, StockGuard};
@@ -628,6 +630,10 @@ struct App {
     quick: Option<QuickPanel>,
     /// The open calendar panel (same rules as `quick`, no services).
     calendar: Option<CalendarPanel>,
+    /// The music widget while it is enabled (it owns the media service, P4).
+    music: Option<Music>,
+    /// The music widget's open detail panel (same rules as `quick`).
+    music_panel: Option<MusicPanel>,
     /// The open settings window (its visuals and window go before the compositor and GPU).
     settings_win: Option<SettingsWindow>,
     /// One per monitor, in [`current_monitors`] order: the first carries the tray area.
@@ -752,6 +758,8 @@ impl App {
             start_data: StartData::new(),
             quick: None,
             calendar: None,
+            music: None,
+            music_panel: None,
             settings_win: None,
             monitors,
             tracker,
@@ -802,6 +810,7 @@ impl App {
             input_time: 0,
         };
         app.tick_clock();
+        app.sync_music();
         // Show the bars before the (slower) first window enumeration.
         app.refresh()?;
         let all = app.tracker.enumerate();
@@ -898,7 +907,7 @@ impl App {
             clock_w: self.clock_w,
             reserve_floating: self.settings.reserve_space_floating,
             tray_area: mb.tray,
-            widgets: [0.0; 2],
+            widgets: [self.music.as_ref().map_or(0.0, |m| m.width), 0.0],
         })
     }
 
@@ -1236,6 +1245,11 @@ impl App {
             .focus()
             .filter(|f| f.monitor == self.monitors[k].id())
             .map(|f| f.item);
+        let pills = [self.music.as_ref().and_then(|m| m.pill.clone()), None];
+        let pill_hover = match self.hover {
+            Some(Hit::Widget(w)) if self.monitors[k].id() == self.cur => Some(w),
+            _ => None,
+        };
         let mb = &mut self.monitors[k];
         let mut raised = layout.surfaces != mb.layout.surfaces;
         while mb.bars.len() > layout.surfaces.len() {
@@ -1257,6 +1271,7 @@ impl App {
             bar.visual.set_env(env);
             bar.visual.set_tray(tray_items.clone(), chevron);
             bar.visual.set_focus(focus);
+            bar.visual.set_widgets(pills.clone(), pill_hover);
             if let Err(e) = bar.visual.update(
                 &layout,
                 &items,
@@ -1281,6 +1296,9 @@ impl App {
             self.quick_reanchor();
         }
         self.calendar_reanchor(k);
+        if tray {
+            self.music_reanchor();
+        }
         Ok(raised)
     }
 
@@ -1322,6 +1340,7 @@ impl App {
         self.close_start_now();
         self.close_quick_now();
         self.close_calendar_now();
+        self.close_music_panel_now();
         self.stock.on_taskbar_created();
         // The old manager is a proxy into the Explorer that just ended: every query on it
         // would fail open (every window "on the current desktop") until the next restart.
@@ -1366,6 +1385,7 @@ impl App {
             if tray {
                 self.close_overflow();
                 self.close_quick();
+                self.close_music_panel();
                 self.set_tip_target(None);
             }
             if self.calendar.as_ref().is_some_and(|c| c.monitor == id) {
@@ -1749,6 +1769,7 @@ impl App {
                 self.start_foreground_changed(fg);
                 self.quick_foreground_changed(fg);
                 self.calendar_foreground_changed(fg);
+                self.music_foreground_changed(fg);
                 // A foreground change is when the shell reorders the topmost band: keep our
                 // Shell_TrayWnd above Explorer's (async, never waits).
                 if let Some(t) = &self.tray {
@@ -1909,6 +1930,10 @@ impl App {
         }
         if self.calendar.as_ref().is_some_and(|c| c.hwnd() == msg.hwnd) {
             self.calendar_event(|c, g| c.on_mouse(msg, g));
+            return true;
+        }
+        if self.music_panel.as_ref().is_some_and(|p| p.hwnd() == msg.hwnd) {
+            self.music_event(|p, _| p.on_mouse(msg));
             return true;
         }
         if self.is_settings(msg.hwnd) {
@@ -2375,6 +2400,13 @@ impl App {
             self.on_calendar_key(msg);
             return true;
         }
+        if self.music_panel.as_ref().is_some_and(|p| p.hwnd() == msg.hwnd) {
+            let vk = msg.wParam.0 as u16;
+            // SAFETY: plain query of this thread's keyboard state.
+            let shift = unsafe { GetKeyState(i32::from(VK_SHIFT.0)) < 0 };
+            self.music_event(|p, _| p.on_key(vk, shift));
+            return true;
+        }
         if self.start.as_ref().is_some_and(|s| s.hwnd() == msg.hwnd) {
             self.on_start_key(msg, dirty);
             return true;
@@ -2751,6 +2783,9 @@ impl App {
         if hit != Hit::Clock {
             self.close_calendar();
         }
+        if hit != Hit::Widget(0) {
+            self.close_music_panel();
+        }
         if hit != Hit::Chevron {
             self.close_overflow();
         }
@@ -2802,7 +2837,17 @@ impl App {
                 }
             }
             // The overflow menu and show-desktop arrive in later tasks.
-            // The Music and Claude-limits pills open their panels in the widget tasks.
+            // The music pill: its glyph plays / pauses, its text opens the detail panel.
+            Hit::Widget(0) => {
+                if self.on_music_glyph() {
+                    if let Some(m) = &self.music {
+                        m.act(MusicAction::PlayPause);
+                    }
+                } else {
+                    self.toggle_music_panel(dirty);
+                }
+            }
+            // The Claude-limits pill opens its panel in the next widget task.
             Hit::Widget(_) => {}
             Hit::More | Hit::ShowDesktop => {}
         }
@@ -2816,6 +2861,7 @@ impl App {
         self.close_start();
         self.close_quick();
         self.close_calendar();
+        self.close_music_panel();
         self.close_strip();
         self.close_overflow();
         self.set_tip_target(None);
@@ -3811,6 +3857,259 @@ impl App {
     }
 
     // -----------------------------------------------------------------------------------
+    // The music widget (controller in `widgets.rs`)
+    // -----------------------------------------------------------------------------------
+
+    /// Opens the media service when the widget is on and drops it when it is off (P4).
+    fn sync_music(&mut self) {
+        match (self.settings.widget_music, self.music.is_some()) {
+            (true, false) => match Music::open(self.notify.hwnd) {
+                Ok(mut m) => {
+                    m.remeasure(&self.painter);
+                    self.music = Some(m);
+                }
+                Err(e) => eprintln!("vitrobar: the music widget could not start: {e}"),
+            },
+            (false, true) => {
+                self.close_music_panel();
+                self.music = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// [`WM_APP_MEDIA`](crate::notify::WM_APP_MEDIA) arrived: the pill and the open panel
+    /// follow the session.
+    fn on_media(&mut self, dirty: &mut Dirty) {
+        let Some(m) = self.music.as_mut() else {
+            return;
+        };
+        let wake = m.on_wake(&self.painter);
+        if wake.pill {
+            // The pill appears, leaves or changes width: every bar is laid out anew.
+            dirty.visuals = true;
+        }
+        let view = m.view.clone();
+        if wake.session {
+            match view {
+                None => {
+                    // The session ended: nothing left to show.
+                    self.close_music_panel();
+                }
+                Some(v) => {
+                    self.music_event(|p, g| p.set_data(g, v));
+                    self.music_request_art();
+                }
+            }
+        }
+        if wake.thumbnail {
+            let art = self.music.as_ref().and_then(|m| m.take_thumbnail());
+            self.music_event(|p, g| p.set_art(g, art));
+        }
+    }
+
+    /// The press on the music pill was on its glyph (play / pause) rather than its text.
+    fn on_music_glyph(&self) -> bool {
+        let Some(mb) = self.tray_monitor() else {
+            return false;
+        };
+        let Some(r) = mb.layout.widgets[0] else {
+            return false;
+        };
+        on_pill_glyph(self.msg_pt.0 as f32 / mb.scale() - r.x)
+    }
+
+    fn toggle_music_panel(&mut self, dirty: &mut Dirty) {
+        if !self.close_music_panel() {
+            self.open_music_panel(dirty);
+        }
+    }
+
+    /// Opens the detail panel above the music pill (below it with the bar at the top) and
+    /// gives it the foreground; asks for the artwork.
+    fn open_music_panel(&mut self, dirty: &mut Dirty) {
+        if let Some(f) = self.keys.focus() {
+            dirty.bars.insert(f.monitor);
+        }
+        self.reset_interaction();
+        let Some(view) = self.music.as_ref().and_then(|m| m.view.clone()) else {
+            return;
+        };
+        let Some(mb) = self.tray_monitor() else {
+            return;
+        };
+        if mb.layout.widgets[0].is_none() {
+            return;
+        }
+        let Some(anchor) = surface_anchor(&mb.layout, AnchorTarget::Widget(0), mb.scale()) else {
+            return;
+        };
+        let (id, dpi) = (mb.id(), mb.info.dpi);
+        dirty.bars.insert(id);
+        let (accent, lang) = self.start_look();
+        let fg = foreground().unwrap_or(0) as usize;
+        let opened = MusicPanel::open(
+            &Gfx {
+                comp: &self.comp,
+                painter: &self.painter,
+            },
+            &self.style,
+            dpi,
+            anchor,
+            self.settings.position,
+            accent,
+            lang,
+            view,
+        );
+        match opened {
+            Ok(mut p) => {
+                p.fg_at_open = fg;
+                if !p.activate() {
+                    eprintln!("vitrobar: the music panel could not take the foreground");
+                }
+                if self.opts.debug_state {
+                    eprintln!(
+                        "vitrobar-music-open rect={:?} anchor={:?} activated={}",
+                        p.rect_px(),
+                        anchor,
+                        p.activated
+                    );
+                }
+                self.music_panel = Some(p);
+                self.music_request_art();
+            }
+            Err(e) => eprintln!("vitrobar: the music panel failed: {e}"),
+        }
+    }
+
+    /// Asks the media service for the open panel's artwork when its track is new.
+    fn music_request_art(&mut self) {
+        let Some(p) = self.music_panel.as_mut() else {
+            return;
+        };
+        if p.take_art_wanted() {
+            if let Some(m) = &self.music {
+                m.request_thumbnail(p.art_px());
+            }
+        }
+    }
+
+    /// True if it was open. The foreground goes back to the window that had it before.
+    fn close_music_panel(&mut self) -> bool {
+        self.close_music_panel_as(true)
+    }
+
+    /// [`Self::close_music_panel`] without the foreground hand-back (Explorer restart, GPU
+    /// loss, monitor change).
+    fn close_music_panel_now(&mut self) -> bool {
+        self.close_music_panel_as(false)
+    }
+
+    fn close_music_panel_as(&mut self, hand_back: bool) -> bool {
+        let Some(p) = self.music_panel.take() else {
+            return false;
+        };
+        if hand_back {
+            let _ = self.hand_back_foreground(p.hwnd(), p.fg_at_open);
+        }
+        drop(p);
+        // A late artwork is not kept.
+        if let Some(m) = &self.music {
+            let _ = m.take_thumbnail();
+        }
+        if self.opts.debug_state {
+            eprintln!("vitrobar-music-closed");
+        }
+        true
+    }
+
+    /// Runs `f` on the open music panel and acts on what it asks for.
+    fn music_event(&mut self, f: impl FnOnce(&mut MusicPanel, &Gfx) -> MusicOutcome) {
+        let Some(p) = self.music_panel.as_mut() else {
+            return;
+        };
+        let g = Gfx {
+            comp: &self.comp,
+            painter: &self.painter,
+        };
+        match f(p, &g) {
+            MusicOutcome::None => {}
+            MusicOutcome::Close => {
+                self.close_music_panel();
+            }
+            MusicOutcome::Act(a) => {
+                if let Some(m) = &self.music {
+                    m.act(a);
+                }
+            }
+        }
+    }
+
+    /// Alt+F4 on the music panel; false for anything else.
+    fn on_music_msg(&mut self, msg: &MSG) -> bool {
+        if !self.music_panel.as_ref().is_some_and(|p| p.hwnd() == msg.hwnd) {
+            return false;
+        }
+        if msg.message == WM_SYSKEYDOWN && msg.wParam.0 == usize::from(VK_F4.0) {
+            self.close_music_panel();
+            return true;
+        }
+        false
+    }
+
+    /// Like [`Self::quick_foreground_changed`].
+    fn music_foreground_changed(&mut self, fg: Option<Hwnd>) {
+        let Some(p) = self.music_panel.as_mut() else {
+            return;
+        };
+        if p.activated {
+            return;
+        }
+        let fg = fg.unwrap_or(0) as usize;
+        if fg == p.hwnd().0 as usize {
+            p.activated = true;
+        } else if fg != p.fg_at_open {
+            self.close_music_panel();
+        }
+    }
+
+    /// Moves the open music panel to where its pill is now, or closes it with the pill.
+    fn music_reanchor(&mut self) {
+        if self.music_panel.is_none() {
+            return;
+        }
+        let anchor = self.tray_monitor().and_then(|mb| {
+            mb.layout.widgets[0]?;
+            surface_anchor(&mb.layout, AnchorTarget::Widget(0), mb.scale())
+        });
+        let Some(anchor) = anchor else {
+            self.close_music_panel();
+            return;
+        };
+        if let Some(p) = self.music_panel.as_mut() {
+            if let Err(e) = p.reanchor(&self.comp, anchor) {
+                eprintln!("vitrobar: the music panel could not follow its pill: {e}");
+                self.close_music_panel();
+            }
+        }
+    }
+
+    fn music_restyle(&mut self) {
+        let (accent, _) = self.start_look();
+        let Some(p) = self.music_panel.as_mut() else {
+            return;
+        };
+        let g = Gfx {
+            comp: &self.comp,
+            painter: &self.painter,
+        };
+        if let Err(e) = p.restyle(&g, &self.style, accent) {
+            eprintln!("vitrobar: the music panel could not be restyled: {e}");
+            self.close_music_panel();
+        }
+    }
+
+    // -----------------------------------------------------------------------------------
     // The quick panel (controller in `quick.rs`)
     // -----------------------------------------------------------------------------------
 
@@ -4361,6 +4660,9 @@ impl App {
         }
         match effect {
             Effect::Relayout => {
+                if id == ControlId::WidgetMusic {
+                    self.sync_music();
+                }
                 self.relayout(dirty);
                 if matches!(id, ControlId::Material | ControlId::Theme) {
                     self.settings_restyle();
@@ -4515,6 +4817,7 @@ impl App {
         self.close_start_now();
         self.close_quick_now();
         self.close_calendar_now();
+        self.close_music_panel_now();
         self.close_settings();
         // GPU device removed (TDR, driver update): recreate, then redraw everything.
         self.gpu_lost = true;
@@ -4548,6 +4851,9 @@ impl App {
         if inbox.debug_open_calendar && self.opts.debug_state {
             // Debug hook (live checks): toggles the calendar on the current bar's clock.
             self.toggle_calendar(dirty);
+        }
+        if inbox.media {
+            self.on_media(dirty);
         }
         if inbox.clock {
             // The system clock or time zone changed: today may have moved.
@@ -4650,6 +4956,13 @@ impl App {
         {
             self.close_calendar();
         }
+        if self
+            .music_panel
+            .as_ref()
+            .is_some_and(|p| deactivated.contains(&p.hwnd()))
+        {
+            self.close_music_panel();
+        }
         if inbox.fullscreen {
             // Explorer may have raised its own Shell_TrayWnd for the full-screen change: go
             // back above it. (Restarts, settings and display changes reach the tray host's
@@ -4690,6 +5003,7 @@ impl App {
             // Its anchor moved or went away.
             self.close_quick_now();
             self.close_calendar_now();
+            self.close_music_panel_now();
             // New bars, new geometry: everything is laid out and drawn again, and every
             // window's monitor is read again (windows on a removed monitor were moved).
             d.visuals = true;
@@ -4731,6 +5045,7 @@ impl App {
                 self.close_start_now();
                 self.quick_restyle();
                 self.calendar_restyle();
+                self.music_restyle();
                 self.settings_restyle();
                 self.settings_render();
             }
@@ -4954,6 +5269,7 @@ pub fn run(opts: Options) -> Result<()> {
                 },
                 WM_CHAR | WM_SYSKEYDOWN | WM_MOUSEWHEEL if app.on_quick_msg(&msg) => {}
                 WM_SYSKEYDOWN | WM_MOUSEWHEEL if app.on_calendar_msg(&msg) => {}
+                WM_SYSKEYDOWN if app.on_music_msg(&msg) => {}
                 WM_CHAR | WM_SYSKEYDOWN | WM_MOUSEWHEEL if app.on_start_msg(&msg, &mut dirty) => {}
                 WM_SYSKEYDOWN | WM_MOUSEWHEEL if app.on_settings_msg(&msg, &mut dirty) => {}
                 _ => unsafe {

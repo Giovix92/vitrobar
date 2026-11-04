@@ -277,9 +277,9 @@ pub const TRAY_ICON_DIP: f32 = crate::tray_flyout::TRAY_ICON_DIP;
 const GLYPH_DIP: f32 = 16.0;
 const CLOCK_FONT_DIP: f32 = 12.0;
 /// Widget pills: one font size for the glyph and the text, padding inside the plate.
-const WIDGET_FONT_DIP: f32 = 13.0;
-const WIDGET_PAD_DIP: f32 = 10.0;
-const WIDGET_GAP_DIP: f32 = 6.0;
+const WIDGET_FONT_DIP: f32 = vitro_core::widgets::PILL_FONT_DIP;
+const WIDGET_PAD_DIP: f32 = vitro_core::widgets::PILL_PAD_DIP;
+const WIDGET_GAP_DIP: f32 = vitro_core::widgets::PILL_GAP_DIP;
 const DOT_DIP: f32 = 4.0;
 const ACTIVE_DOT_DIP: f32 = 12.0;
 const DOT_GAP_DIP: f32 = 3.0;

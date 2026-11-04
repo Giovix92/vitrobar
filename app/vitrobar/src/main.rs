@@ -19,6 +19,7 @@ mod settings_window;
 mod shell;
 mod start;
 mod watchdog;
+mod widgets;
 mod window_set;
 
 use std::path::Path;

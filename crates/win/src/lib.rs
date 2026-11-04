@@ -14,6 +14,7 @@ pub mod file_search;
 pub mod icons;
 pub mod key_hook;
 pub mod launch;
+pub mod media;
 pub mod monitors;
 pub mod pins_import;
 pub mod power;

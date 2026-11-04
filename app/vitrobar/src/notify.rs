@@ -53,6 +53,8 @@ pub const WM_APP_START_DATA: u32 = WM_APP + 0x26;
 /// A quick-panel service (audio, brightness, Wi-Fi, Bluetooth) has changes queued
 /// (payload-free wake-up shared by all of them).
 pub const WM_APP_QUICK: u32 = WM_APP + 0x27;
+/// The music widget's media session changed (payload-free wake-up from its worker).
+pub const WM_APP_MEDIA: u32 = WM_APP + 0x28;
 
 /// The registered window message that toggles the Start panel on the primary monitor. The
 /// app honours it only when it runs with `--debug-state` (the perf check posts it).
@@ -164,6 +166,8 @@ pub struct Inbox {
     pub debug_open_quick: bool,
     /// The debug message [`open_calendar_msg`] arrived (only acted on with `--debug-state`).
     pub debug_open_calendar: bool,
+    /// [`WM_APP_MEDIA`]: drain the music widget's media service.
+    pub media: bool,
 }
 
 thread_local! {
@@ -265,6 +269,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_APP_QUICK => {
             // A wake-up: wParam / lParam are ignored (anyone may post this id).
             with_inbox(|i| i.quick = true);
+            return LRESULT(0);
+        }
+        WM_APP_MEDIA => {
+            // A wake-up: wParam / lParam are ignored (anyone may post this id).
+            with_inbox(|i| i.media = true);
             return LRESULT(0);
         }
         WM_POWERBROADCAST => {
@@ -636,10 +645,12 @@ mod tests {
             );
             SendMessageW(n.hwnd, open_quick_msg(), None, None);
             SendMessageW(n.hwnd, open_calendar_msg(), None, None);
+            PostMessageW(Some(n.hwnd), WM_APP_MEDIA, WPARAM(0), LPARAM(0)).unwrap();
         }
         pump(n.hwnd);
         let inbox = take_inbox();
         assert!(inbox.quick && inbox.power && inbox.debug_open_quick && inbox.debug_open_calendar);
+        assert!(inbox.media);
         // Other power broadcasts (suspend, resume) are not the panel's business.
         // SAFETY: as above.
         unsafe {

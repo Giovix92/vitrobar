@@ -20,4 +20,5 @@ pub mod style;
 pub mod text_input;
 pub mod tray_model;
 pub mod tray_wire;
+pub mod widgets;
 pub mod windows_model;
