@@ -305,7 +305,12 @@ mod tests {
             ["new.txt", "old.txt"],
             "no folder, no missing file, once each"
         );
-        assert!(got[0].path.eq_ignore_ascii_case(&new.to_string_lossy()));
+        // The same file, however the temp folder is spelled (CI's is an 8.3 short path, the
+        // shortcut resolves to the long one).
+        let same = |a: &str, b: &std::path::Path| {
+            std::fs::canonicalize(a).ok() == std::fs::canonicalize(b).ok()
+        };
+        assert!(same(&got[0].path, &new), "{} vs {}", got[0].path, new.display());
         assert_eq!(recent_in(&links, 1).len(), 1);
         assert!(recent_in(&links, 0).is_empty());
         let _ = std::fs::remove_dir_all(&root);
