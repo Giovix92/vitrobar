@@ -31,6 +31,22 @@ branch `stage3-panels`). Input for stage 3b and later.
 - Quick panel: Backspace / Delete do not zero the removed password characters; "Connecting" stays when Windows reconnects without leaving the old network (until the failure event).
 - Unrelated flake: `crates/win/tests/icons.rs::notepad_icon_by_path` failed once in a full run and passed alone and on rerun.
 
+## Final review (whole branch)
+Fixed: the Claude pill now follows a window reset; a slow previous status line prints its last complete output (or what came before the cut); the previous status line runs in Claude Code's own shell (Git Bash, else PowerShell) and the written bridge command suits that shell.
+
+Deferred minors:
+- Music panel can show the previous track's artwork when a player sends the title before the thumbnail (no wake for a thumbnail-only change).
+- statusLine restore is exact only for the command string: an original statusLine without a string command, or a lost Vitrobar settings.toml, cannot be restored fully (store the whole statusLine value).
+- CLAUDE_CONFIG_DIR is ignored (Vitrobar wraps ~/.claude/settings.json).
+- A symlinked ~/.claude/settings.json is replaced by a regular file on wrap/unwrap (rename replaces the link).
+- The media worker is never joined: a player hung in a call leaks one thread per widget off/on.
+- The Claude folder watch ends silently if %LOCALAPPDATA%\Vitrobar is deleted while running (pill stale until restart/toggle).
+- RetryApps sleeps 3 s on the shared Start data worker, delaying Recent/Account behind it right after sign-in.
+- IME indicator: UWP apps report the frame's thread layout; a Vitrobar panel in front shows Vitrobar's own layout; a single IME layout (e.g. Japanese) shows no indicator.
+- Calendar: Home means 'today's month' while End still means 'last item' (asymmetric keys).
+- Bridge integration tests run the debug (console) exe only; the release (GUI-subsystem) exe under Claude Code needs a live check.
+- Clippy warnings in vitro-win (same-type casts in wifi.rs, transmute annotations, map_or in power_status.rs test).
+
 ## Not verified here (see `docs/release-checklist.md`)
 Everything live: the quick panel, calendar, both widgets, tray rects, the IME indicator, the overflow Esc hand-back, and the stage-2.5 items listed in the checklist. The ignored stage-1 stock-taskbar tests were not run (they change the real taskbar), only their wait was raised from 2 s to 10 s.
 
