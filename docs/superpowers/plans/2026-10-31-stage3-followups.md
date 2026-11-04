@@ -35,4 +35,7 @@ branch `stage3-panels`). Input for stage 3b and later.
 Everything live: the quick panel, calendar, both widgets, tray rects, the IME indicator, the overflow Esc hand-back, and the stage-2.5 items listed in the checklist. The ignored stage-1 stock-taskbar tests were not run (they change the real taskbar), only their wait was raised from 2 s to 10 s.
 
 ## Measured numbers
-Pending: `scripts/perf-check.ps1` (idle, `-StartPanel`, `-Widgets`) needs no other Vitrobar running, and the user's try build was running during this session. To run: close Vitrobar, then the three commands in the checklist's Performance section; all must print `"pass": true`.
+Release build, 2026-11-04, one 2560×1080 monitor at 96 DPI, 10 test apps open (`scripts/perf-check.ps1`), all `"pass": true`:
+- Idle (`-MeasureStartup`): memory 15.91 MB (bar 14.02 + watchdog 1.78), CPU 0 ms in 30 s, start-up 231 ms, exe 2.09 MB.
+- Start panel (`-StartPanel`): open in 12 ms, 16.87 MB open, 16.86 MB 3 s after closing.
+- Both widgets on (`-Widgets`): memory 16.07 MB (bar 14.15 + watchdog 1.79), CPU 15.6 ms in 30 s (one WARP redraw tick, within the 50 ms budget).
