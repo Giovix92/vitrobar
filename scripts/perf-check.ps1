@@ -381,7 +381,15 @@ function Open-Apps([int]$count) {
                 $h = [VitroPerf]::OpenWindow($tag)
                 if ($h -ne [IntPtr]::Zero) { $ownWindows.Add($h); $ok = $true }
             }
-            default { $ok = Start-Tracked $app[0] $app[1] }
+            default {
+                $ok = Start-Tracked $app[0] $app[1]
+                if (-not $ok -and $app[1]) {
+                    # The packaged app is not installed (Calculator on a Windows Server
+                    # runner): its launcher exits without a window. Another app instead.
+                    Write-Note "no window for $($app[0]); charmap.exe instead"
+                    $ok = Start-Tracked 'charmap.exe' ''
+                }
+            }
         }
         if ($ok) { $n++ } else { Write-Note "no window for $($app[0])" }
     }
