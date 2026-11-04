@@ -115,9 +115,81 @@ pub fn read() -> Option<ClaudeUsage> {
     read_at(&data_path()?)
 }
 
-/// The status-line command that runs `exe` as the bridge.
-pub fn bridge_command(exe: &Path) -> String {
-    format!("\"{}\" {BRIDGE_ARG}", exe.display())
+/// The shell Claude Code runs status-line commands with on Windows: Git Bash when it is
+/// installed, else PowerShell (Claude Code docs, "Status line" > "Windows configuration").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatusShell {
+    GitBash(PathBuf),
+    PowerShell,
+}
+
+/// Overrides the detected shell: `powershell`, or the path of a `bash.exe` (tests).
+pub const STATUS_SHELL_ENV: &str = "VITROBAR_STATUS_SHELL";
+
+/// Where Git Bash may be, in the order to try: `CLAUDE_CODE_GIT_BASH_PATH`, next to the
+/// `git.exe` found on PATH (`<root>\cmd\git.exe`, `<root>\bin\git.exe` or
+/// `<root>\mingw64\bin\git.exe` → `<root>\bin\bash.exe`), then `<Program Files>\Git`.
+pub fn git_bash_candidates(
+    env_path: Option<&Path>,
+    git_exe: Option<&Path>,
+    program_files: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = env_path.map(Path::to_path_buf).into_iter().collect();
+    if let Some(dir) = git_exe.and_then(Path::parent) {
+        // ...\cmd or ...\bin is one level under the Git root, ...\mingw64\bin two.
+        let mingw = dir
+            .parent()
+            .filter(|p| p.file_name().is_some_and(|n| n.eq_ignore_ascii_case("mingw64")));
+        let root = mingw.and_then(Path::parent).or_else(|| dir.parent());
+        if let Some(root) = root {
+            out.push(root.join("bin").join("bash.exe"));
+        }
+    }
+    if let Some(pf) = program_files {
+        out.push(pf.join("Git").join("bin").join("bash.exe"));
+    }
+    out.dedup();
+    out
+}
+
+/// [`STATUS_SHELL_ENV`]'s value as a shell.
+pub fn parse_shell_override(v: &str) -> StatusShell {
+    if v.trim().eq_ignore_ascii_case("powershell") {
+        StatusShell::PowerShell
+    } else {
+        StatusShell::GitBash(PathBuf::from(v.trim()))
+    }
+}
+
+/// The shell Claude Code would pick on this machine.
+pub fn status_shell() -> StatusShell {
+    if let Some(v) = std::env::var_os(STATUS_SHELL_ENV).filter(|v| !v.is_empty()) {
+        return parse_shell_override(&v.to_string_lossy());
+    }
+    let env = std::env::var_os("CLAUDE_CODE_GIT_BASH_PATH").map(PathBuf::from);
+    let git = find_on_path("git.exe");
+    let pf = std::env::var_os("ProgramFiles").map(PathBuf::from);
+    git_bash_candidates(env.as_deref(), git.as_deref(), pf.as_deref())
+        .into_iter()
+        .find(|p| p.is_file())
+        .map_or(StatusShell::PowerShell, StatusShell::GitBash)
+}
+
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|d| d.join(name))
+        .find(|p| p.is_file())
+}
+
+/// The status-line command that runs `exe` as the bridge, written for `shell`: Git Bash
+/// takes a double-quoted path with forward slashes (backslashes are escapes there);
+/// PowerShell needs the call operator before a quoted path.
+pub fn bridge_command(exe: &Path, shell: &StatusShell) -> String {
+    let path = exe.display().to_string();
+    match shell {
+        StatusShell::GitBash(_) => format!("\"{}\" {BRIDGE_ARG}", path.replace('\\', "/")),
+        StatusShell::PowerShell => format!("& '{}' {BRIDGE_ARG}", path.replace('\'', "''")),
+    }
 }
 
 /// Whether `cmd` is a Vitrobar bridge (any install path).
@@ -127,7 +199,7 @@ pub fn is_bridge(cmd: &str) -> bool {
 
 /// Points Claude Code's `statusLine` at the bridge in the settings file `path` (missing file:
 /// created), keeping every other key and the other keys of `statusLine`; 2-space JSON.
-pub fn wrap_statusline_at(path: &Path, exe: &Path) -> Result<Wrap, SetupError> {
+pub fn wrap_statusline_at(path: &Path, bridge: &str) -> Result<Wrap, SetupError> {
     let mut root = read_settings(path)?;
     let line = root.get("statusLine").and_then(Value::as_object);
     let prev = line
@@ -139,7 +211,7 @@ pub fn wrap_statusline_at(path: &Path, exe: &Path) -> Result<Wrap, SetupError> {
     }
     let mut line = line.cloned().unwrap_or_default();
     line.insert("type".into(), Value::String("command".into()));
-    line.insert("command".into(), Value::String(bridge_command(exe)));
+    line.insert("command".into(), Value::String(bridge.to_string()));
     root.insert("statusLine".into(), Value::Object(line));
     write_settings(path, &root)?;
     Ok(Wrap::Wrapped(prev))
@@ -192,7 +264,7 @@ fn write_settings(path: &Path, root: &Map<String, Value>) -> Result<(), SetupErr
 
 pub fn wrap_statusline(exe: &Path) -> Result<Wrap, SetupError> {
     let path = claude_settings_path().ok_or(SetupError::Malformed)?;
-    wrap_statusline_at(&path, exe)
+    wrap_statusline_at(&path, &bridge_command(exe, &status_shell()))
 }
 
 pub fn unwrap_statusline(prev: Option<&str>) -> Result<(), SetupError> {
@@ -403,6 +475,57 @@ mod tests {
         PathBuf::from(EXE)
     }
 
+    fn ours() -> String {
+        bridge_command(&exe(), &StatusShell::GitBash(PathBuf::from("bash.exe")))
+    }
+
+    #[test]
+    fn the_bridge_command_suits_the_shell() {
+        assert_eq!(ours(), r#""C:/Program Files/Vitrobar/vitrobar.exe" --claude-statusline"#);
+        assert_eq!(
+            bridge_command(&exe(), &StatusShell::PowerShell),
+            r"& 'C:\Program Files\Vitrobar\vitrobar.exe' --claude-statusline"
+        );
+        let odd = PathBuf::from(r"C:\Users\O'Neil\vitrobar.exe");
+        assert_eq!(
+            bridge_command(&odd, &StatusShell::PowerShell),
+            r"& 'C:\Users\O''Neil\vitrobar.exe' --claude-statusline"
+        );
+        assert!(is_bridge(&bridge_command(&exe(), &StatusShell::PowerShell)));
+    }
+
+    #[test]
+    fn git_bash_is_looked_for_where_claude_code_finds_it() {
+        let c = git_bash_candidates(
+            Some(Path::new(r"E:\bash.exe")),
+            Some(Path::new(r"D:\Git\cmd\git.exe")),
+            Some(Path::new(r"C:\Program Files")),
+        );
+        assert_eq!(
+            c,
+            vec![
+                PathBuf::from(r"E:\bash.exe"),
+                PathBuf::from(r"D:\Git\bin\bash.exe"),
+                PathBuf::from(r"C:\Program Files\Git\bin\bash.exe"),
+            ]
+        );
+        let c = git_bash_candidates(None, Some(Path::new(r"D:\Git\mingw64\bin\git.exe")), None);
+        assert_eq!(c, vec![PathBuf::from(r"D:\Git\bin\bash.exe")]);
+        let c = git_bash_candidates(None, Some(Path::new(r"D:\Git\bin\git.exe")), None);
+        assert_eq!(c, vec![PathBuf::from(r"D:\Git\bin\bash.exe")]);
+        assert!(git_bash_candidates(None, None, None).is_empty());
+    }
+
+    #[test]
+    fn the_shell_override() {
+        assert_eq!(parse_shell_override("powershell"), StatusShell::PowerShell);
+        assert_eq!(parse_shell_override("PowerShell"), StatusShell::PowerShell);
+        assert_eq!(
+            parse_shell_override(r"D:\Git\bin\bash.exe"),
+            StatusShell::GitBash(PathBuf::from(r"D:\Git\bin\bash.exe"))
+        );
+    }
+
     fn json(path: &Path) -> Value {
         serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
     }
@@ -411,10 +534,10 @@ mod tests {
     fn wrap_with_no_file_creates_the_status_line() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("settings.json");
-        assert_eq!(wrap_statusline_at(&p, &exe()).unwrap(), Wrap::Wrapped(None));
+        assert_eq!(wrap_statusline_at(&p, &ours()).unwrap(), Wrap::Wrapped(None));
         assert_eq!(
             json(&p),
-            serde_json::json!({"statusLine": {"type": "command", "command": bridge_command(&exe())}})
+            serde_json::json!({"statusLine": {"type": "command", "command": ours()}})
         );
     }
 
@@ -425,7 +548,7 @@ mod tests {
         let before = "{\n  \"model\": \"opus\",\n  \"statusLine\": {\n    \"type\": \"command\",\n    \"command\": \"node ~/line.js\",\n    \"padding\": 2\n  },\n  \"zeta\": [1, 2]\n}\n";
         std::fs::write(&p, before).unwrap();
         assert_eq!(
-            wrap_statusline_at(&p, &exe()).unwrap(),
+            wrap_statusline_at(&p, &ours()).unwrap(),
             Wrap::Wrapped(Some("node ~/line.js".into()))
         );
         let text = std::fs::read_to_string(&p).unwrap();
@@ -439,7 +562,7 @@ mod tests {
         assert!(text.contains("\n  \"model\": \"opus\""), "{text}");
         let v = json(&p);
         assert_eq!(v["statusLine"]["padding"], 2);
-        assert_eq!(v["statusLine"]["command"], bridge_command(&exe()));
+        assert_eq!(v["statusLine"]["command"], ours());
         assert_eq!(v["zeta"], serde_json::json!([1, 2]));
     }
 
@@ -448,9 +571,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("settings.json");
         std::fs::write(&p, r#"{"statusLine":{"type":"command","command":"echo hi"}}"#).unwrap();
-        wrap_statusline_at(&p, &exe()).unwrap();
+        wrap_statusline_at(&p, &ours()).unwrap();
         let once = std::fs::read_to_string(&p).unwrap();
-        assert_eq!(wrap_statusline_at(&p, &exe()).unwrap(), Wrap::AlreadyOurs);
+        assert_eq!(wrap_statusline_at(&p, &ours()).unwrap(), Wrap::AlreadyOurs);
         assert_eq!(std::fs::read_to_string(&p).unwrap(), once);
     }
 
@@ -463,7 +586,7 @@ mod tests {
             r#"{"a":1,"statusLine":{"type":"command","command":"bash -c 'x \"y\"'","padding":0}}"#,
         )
         .unwrap();
-        let Wrap::Wrapped(prev) = wrap_statusline_at(&p, &exe()).unwrap() else {
+        let Wrap::Wrapped(prev) = wrap_statusline_at(&p, &ours()).unwrap() else {
             panic!("not wrapped");
         };
         unwrap_statusline_at(&p, prev.as_deref()).unwrap();
@@ -478,7 +601,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("settings.json");
         std::fs::write(&p, r#"{"theme":"dark"}"#).unwrap();
-        wrap_statusline_at(&p, &exe()).unwrap();
+        wrap_statusline_at(&p, &ours()).unwrap();
         unwrap_statusline_at(&p, None).unwrap();
         assert_eq!(json(&p), serde_json::json!({"theme": "dark"}));
     }
@@ -499,7 +622,7 @@ mod tests {
         let p = dir.path().join("settings.json");
         for bad in ["{ not json", "[1, 2]", "\"text\""] {
             std::fs::write(&p, bad).unwrap();
-            assert!(matches!(wrap_statusline_at(&p, &exe()), Err(SetupError::Malformed)));
+            assert!(matches!(wrap_statusline_at(&p, &ours()), Err(SetupError::Malformed)));
             assert!(matches!(unwrap_statusline_at(&p, None), Err(SetupError::Malformed)));
             assert_eq!(std::fs::read_to_string(&p).unwrap(), bad);
         }
@@ -528,7 +651,7 @@ mod tests {
 
     #[test]
     fn bridge_commands_are_recognised() {
-        assert!(is_bridge(&bridge_command(&exe())));
+        assert!(is_bridge(&ours()));
         assert!(is_bridge("\"D:\\other\\vitrobar.exe\" --claude-statusline  "));
         assert!(!is_bridge("node line.js"));
     }

@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use vitro_core::widgets::parse_statusline;
-use vitro_win::claude_usage::{data_dir, data_path, save_at};
+use vitro_win::claude_usage::{data_dir, data_path, save_at, status_shell, StatusShell};
 use windows::Win32::Foundation::{
     CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS,
 };
@@ -180,16 +180,30 @@ fn load_prev_output(path: &std::path::Path, cmd: &str) -> Option<Vec<u8>> {
     Some(v.get("output")?.as_str()?.as_bytes().to_vec())
 }
 
-/// Runs `cmd` through `cmd /C` with `input` on its stdin; its stdout and whether that is
+/// `cmd` run the way Claude Code runs status lines: `bash -c` in Git Bash when it is
+/// installed, else PowerShell.
+fn shell_command(shell: &StatusShell, cmd: &str) -> Command {
+    match shell {
+        StatusShell::GitBash(bash) => {
+            let mut c = Command::new(bash);
+            c.args(["-c", cmd]);
+            c
+        }
+        StatusShell::PowerShell => {
+            let mut c = Command::new("powershell.exe");
+            c.args(["-NoProfile", "-NonInteractive", "-Command", cmd]);
+            c
+        }
+    }
+}
+
+/// Runs `cmd` in Claude Code's shell with `input` on its stdin; its stdout and whether that is
 /// complete (it ended before `deadline`). Otherwise what it printed so far, and it and
 /// whatever it started are ended.
 fn run_previous(cmd: &str, input: &[u8], deadline: Instant) -> (Vec<u8>, bool) {
     keep_std_handles();
     let job = Job::new();
-    let child = Command::new("cmd")
-        .args(["/D", "/S", "/C"])
-        // `/S`: cmd strips these outer quotes and runs the rest exactly as the user wrote it.
-        .raw_arg(format!("\"{cmd}\""))
+    let child = shell_command(&status_shell(), cmd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
