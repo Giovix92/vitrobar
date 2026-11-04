@@ -17,8 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
-use windows::core::{implement, Interface, w, Result, BOOL, BSTR, HRESULT, PCWSTR};
-use windows::Win32::System::Variant::VARIANT;
+use windows::core::{implement, w, Interface, Result, BOOL, BSTR, HRESULT, PCWSTR};
 use windows::Win32::Devices::Display::{
     DestroyPhysicalMonitors, GetMonitorBrightness, GetNumberOfPhysicalMonitorsFromHMONITOR,
     GetPhysicalMonitorsFromHMONITOR, SetMonitorBrightness, PHYSICAL_MONITOR,
@@ -26,13 +25,16 @@ use windows::Win32::Devices::Display::{
 use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, HDC, HMONITOR};
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoSetProxyBlanket, CoUninitialize, CLSCTX_INPROC_SERVER, CLSCTX_LOCAL_SERVER,
-    COINIT_MULTITHREADED, EOAC_NONE, RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE,
+    CoCreateInstance, CoInitializeEx, CoSetProxyBlanket, CoUninitialize, CLSCTX_INPROC_SERVER,
+    CLSCTX_LOCAL_SERVER, COINIT_MULTITHREADED, EOAC_NONE, RPC_C_AUTHN_LEVEL_CALL,
+    RPC_C_IMP_LEVEL_IMPERSONATE,
 };
 use windows::Win32::System::Rpc::{RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE};
+use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::System::Wmi::{
-    IUnsecuredApartment, IWbemClassObject, IWbemLocator, IWbemObjectSink, IWbemObjectSink_Impl, IWbemServices,
-    UnsecuredApartment, WbemLocator, WBEM_FLAG_FORWARD_ONLY, WBEM_FLAG_RETURN_IMMEDIATELY, WBEM_INFINITE,
+    IUnsecuredApartment, IWbemClassObject, IWbemLocator, IWbemObjectSink, IWbemObjectSink_Impl,
+    IWbemServices, UnsecuredApartment, WbemLocator, WBEM_FLAG_FORWARD_ONLY,
+    WBEM_FLAG_RETURN_IMMEDIATELY, WBEM_INFINITE,
 };
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
@@ -159,7 +161,12 @@ impl Shared {
         if self.queue.push(change) && self.notify != 0 {
             // SAFETY: a payload-free post to a window of this process.
             if unsafe {
-                PostMessageW(Some(HWND(self.notify as *mut _)), self.msg, WPARAM(0), LPARAM(0))
+                PostMessageW(
+                    Some(HWND(self.notify as *mut _)),
+                    self.msg,
+                    WPARAM(0),
+                    LPARAM(0),
+                )
             }
             .is_err()
             {
@@ -421,7 +428,9 @@ impl Wmi {
         // SAFETY: sets the two documented input parameters; WMI coerces the VT_I4s.
         unsafe {
             params.Put(w!("Timeout"), 0, &VARIANT::from(0i32), 0).ok()?;
-            params.Put(w!("Brightness"), 0, &VARIANT::from(percent), 0).ok()?;
+            params
+                .Put(w!("Brightness"), 0, &VARIANT::from(percent), 0)
+                .ok()?;
             self.svc
                 .ExecMethod(
                     &path,
@@ -449,11 +458,7 @@ fn get_i32(obj: &IWbemClassObject, name: PCWSTR) -> Option<i32> {
 struct BrightnessEvents(Arc<Shared>);
 
 impl IWbemObjectSink_Impl for BrightnessEvents_Impl {
-    fn Indicate(
-        &self,
-        count: i32,
-        objects: *const Option<IWbemClassObject>,
-    ) -> Result<()> {
+    fn Indicate(&self, count: i32, objects: *const Option<IWbemClassObject>) -> Result<()> {
         if count > 0 && !objects.is_null() {
             // SAFETY: WMI passes `count` valid (possibly null) interface slots.
             let slice = unsafe { std::slice::from_raw_parts(objects, count as usize) };
@@ -504,7 +509,12 @@ fn ddc_monitors() -> Vec<isize> {
     let mut v: Vec<isize> = Vec::new();
     // SAFETY: the callback only pushes into `v`, which outlives the call.
     let _ = unsafe {
-        EnumDisplayMonitors(None, None, Some(collect_monitor), LPARAM(&mut v as *mut _ as isize))
+        EnumDisplayMonitors(
+            None,
+            None,
+            Some(collect_monitor),
+            LPARAM(&mut v as *mut _ as isize),
+        )
     };
     v
 }

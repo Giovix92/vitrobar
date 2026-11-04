@@ -362,10 +362,7 @@ mod tests {
     #[test]
     fn october_2026_monday_first() {
         let g = grid(OCT_2026, Weekday::Mon);
-        assert_eq!(
-            g[0],
-            [None, None, None, Some(1), Some(2), Some(3), Some(4)]
-        );
+        assert_eq!(g[0], [None, None, None, Some(1), Some(2), Some(3), Some(4)]);
         // The 31st is a Saturday in the fifth week.
         assert_eq!(g[4][5], Some(31));
         assert_eq!(g[4][6], None);
@@ -382,7 +379,11 @@ mod tests {
     #[test]
     fn leap_february_has_29_days() {
         assert_eq!(m(2028, 2).days(), 29);
-        let n = grid(m(2028, 2), Weekday::Mon).iter().flatten().flatten().count();
+        let n = grid(m(2028, 2), Weekday::Mon)
+            .iter()
+            .flatten()
+            .flatten()
+            .count();
         assert_eq!(n, 29);
         assert_eq!(m(2027, 2).days(), 28);
         assert_eq!(m(1900, 2).days(), 28);
@@ -471,7 +472,9 @@ mod tests {
         assert!(matches!(&r[0], Row::Header { text, .. } if text == "sabato 31 ottobre"));
         assert!(matches!(&r[1], Row::Header { text, actions, .. }
             if text == "ottobre 2026" && actions.len() == 2));
-        assert!(r.iter().any(|x| matches!(x, Row::Custom { id: ID_GRID, .. })));
+        assert!(r
+            .iter()
+            .any(|x| matches!(x, Row::Custom { id: ID_GRID, .. })));
         let l = layout(&r);
         assert_eq!(action(Part::HeaderAction(ID_NEXT)), Some(Action::NextMonth));
         assert_eq!(

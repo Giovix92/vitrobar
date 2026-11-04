@@ -590,7 +590,9 @@ pub fn tr(lang: Lang, key: Key) -> &'static str {
         (Lang::En, Key::Stale) => "old",
         (Lang::It, Key::Stale) => "vecchio",
         (Lang::En, Key::ClaudeSetupFailed) => "Couldn't set up Claude Code's status line.",
-        (Lang::It, Key::ClaudeSetupFailed) => "Impossibile configurare la riga di stato di Claude Code.",
+        (Lang::It, Key::ClaudeSetupFailed) => {
+            "Impossibile configurare la riga di stato di Claude Code."
+        }
         (Lang::En, Key::ClaudeUpdatedHint) => "Updated while you use Claude Code.",
         (Lang::It, Key::ClaudeUpdatedHint) => "Si aggiorna mentre usi Claude Code.",
         (Lang::En, Key::ClaudeFiveHour) => "5-hour limit",

@@ -26,21 +26,21 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use windows::core::IInspectable;
 use windows::core::{Interface, Result, GUID, HSTRING};
 use windows::Devices::Bluetooth::{BluetoothDevice, BluetoothLEDevice};
 use windows::Devices::Enumeration::{
     DeviceInformation, DeviceInformationKind, DeviceInformationUpdate, DeviceWatcher,
 };
 use windows::Devices::Radios::{Radio, RadioAccessStatus, RadioKind, RadioState};
-use windows_collections::{IIterable, IMapView};
-use windows::core::IInspectable;
 use windows::Foundation::{IReference, TypedEventHandler};
 use windows::Win32::Devices::Bluetooth::{
-    BluetoothFindFirstRadio, BluetoothFindRadioClose, BluetoothSetServiceState, BLUETOOTH_DEVICE_INFO,
-    BLUETOOTH_FIND_RADIO_PARAMS,
+    BluetoothFindFirstRadio, BluetoothFindRadioClose, BluetoothSetServiceState,
+    BLUETOOTH_DEVICE_INFO, BLUETOOTH_FIND_RADIO_PARAMS,
 };
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+use windows_collections::{IIterable, IMapView};
 
 use crate::brightness::ComGuard;
 use crate::event_queue::WakeQueue;
@@ -157,8 +157,15 @@ impl Shared {
         }
         if self.queue.push(change) && self.notify != 0 {
             // SAFETY: a payload-free post to a window of this process.
-            if unsafe { PostMessageW(Some(HWND(self.notify as *mut _)), self.msg, WPARAM(0), LPARAM(0)) }
-                .is_err()
+            if unsafe {
+                PostMessageW(
+                    Some(HWND(self.notify as *mut _)),
+                    self.msg,
+                    WPARAM(0),
+                    LPARAM(0),
+                )
+            }
+            .is_err()
             {
                 self.queue.wake_failed();
             }
@@ -219,9 +226,17 @@ impl Bluetooth {
             .name("vitro-bt-devices".into())
             .spawn(move || device_worker(sh, dev_rx));
 
-        let mut this = Self { shared: shared.clone(), watchers: Vec::new(), radio_jobs: radio_tx, device_jobs: dev_tx };
+        let mut this = Self {
+            shared: shared.clone(),
+            watchers: Vec::new(),
+            radio_jobs: radio_tx,
+            device_jobs: dev_tx,
+        };
         // The classic watcher is required; a missing LE selector only loses BLE-only devices.
-        this.start_watcher(BluetoothDevice::GetDeviceSelectorFromPairingState(true)?, false)?;
+        this.start_watcher(
+            BluetoothDevice::GetDeviceSelectorFromPairingState(true)?,
+            false,
+        )?;
         if let Ok(sel) = BluetoothLEDevice::GetDeviceSelectorFromPairingState(true) {
             let _ = this.start_watcher(sel, true);
         }
@@ -246,7 +261,8 @@ impl Bluetooth {
         let sh = self.shared.clone();
         let jobs = self.device_jobs.clone();
         let added = watcher.Added(&TypedEventHandler::new(
-            move |_: windows::core::Ref<'_, DeviceWatcher>, info: windows::core::Ref<'_, DeviceInformation>| {
+            move |_: windows::core::Ref<'_, DeviceWatcher>,
+                  info: windows::core::Ref<'_, DeviceInformation>| {
                 if let Some(info) = info.as_ref() {
                     let id = info.Id().map(|s| s.to_string()).unwrap_or_default();
                     if !id.is_empty() {
@@ -273,7 +289,8 @@ impl Bluetooth {
         let sh = self.shared.clone();
         let jobs = self.device_jobs.clone();
         let updated = watcher.Updated(&TypedEventHandler::new(
-            move |_: windows::core::Ref<'_, DeviceWatcher>, upd: windows::core::Ref<'_, DeviceInformationUpdate>| {
+            move |_: windows::core::Ref<'_, DeviceWatcher>,
+                  upd: windows::core::Ref<'_, DeviceInformationUpdate>| {
                 if let Some(upd) = upd.as_ref() {
                     let id = upd.Id().map(|s| s.to_string()).unwrap_or_default();
                     if let Some(e) = lock(&sh.devices).get_mut(&id) {
@@ -294,7 +311,8 @@ impl Bluetooth {
 
         let sh = self.shared.clone();
         let removed = watcher.Removed(&TypedEventHandler::new(
-            move |_: windows::core::Ref<'_, DeviceWatcher>, upd: windows::core::Ref<'_, DeviceInformationUpdate>| {
+            move |_: windows::core::Ref<'_, DeviceWatcher>,
+                  upd: windows::core::Ref<'_, DeviceInformationUpdate>| {
                 if let Some(upd) = upd.as_ref() {
                     let id = upd.Id().map(|s| s.to_string()).unwrap_or_default();
                     lock(&sh.devices).remove(&id);
@@ -307,7 +325,8 @@ impl Bluetooth {
 
         let sh = self.shared.clone();
         let completed = watcher.EnumerationCompleted(&TypedEventHandler::new(
-            move |_: windows::core::Ref<'_, DeviceWatcher>, _: windows::core::Ref<'_, IInspectable>| {
+            move |_: windows::core::Ref<'_, DeviceWatcher>,
+                  _: windows::core::Ref<'_, IInspectable>| {
                 sh.wake(Change::Devices);
                 Ok(())
             },
@@ -345,15 +364,24 @@ impl Bluetooth {
             }
             devices.push(BtDevice {
                 id: id.clone(),
-                name: if e.name.is_empty() { id.clone() } else { e.name.clone() },
+                name: if e.name.is_empty() {
+                    id.clone()
+                } else {
+                    e.name.clone()
+                },
                 connected: e.connected,
                 audio: e.audio == Some(true),
                 battery: e.battery,
-                pending: e.pending.is_some_and(|(_, t)| now.duration_since(t) < PENDING_MAX),
+                pending: e
+                    .pending
+                    .is_some_and(|(_, t)| now.duration_since(t) < PENDING_MAX),
             });
         }
         drop(table);
-        BtSnapshot { radio_on: *lock(&self.shared.radio_on), devices: arrange(devices) }
+        BtSnapshot {
+            radio_on: *lock(&self.shared.radio_on),
+            devices: arrange(devices),
+        }
     }
 
     /// Switches the Bluetooth radio on a worker; the outcome is a [`Change::Radio`] or
@@ -370,19 +398,31 @@ impl Bluetooth {
         let address = {
             let mut devices = lock(&self.shared.devices);
             match devices.get_mut(id) {
-                Some(e @ Entry { audio: Some(true), address: Some(_), .. }) => {
+                Some(
+                    e @ Entry {
+                        audio: Some(true),
+                        address: Some(_),
+                        ..
+                    },
+                ) => {
                     e.pending = Some((on, Instant::now()));
                     e.address.unwrap_or_default()
                 }
                 _ => return Err(BtError::HandOff),
             }
         };
-        self.device_jobs.send(DeviceJob::Services { id: id.to_string(), address, on }).map_err(|_| {
-            if let Some(e) = lock(&self.shared.devices).get_mut(id) {
-                e.pending = None;
-            }
-            BtError::Failed
-        })
+        self.device_jobs
+            .send(DeviceJob::Services {
+                id: id.to_string(),
+                address,
+                on,
+            })
+            .map_err(|_| {
+                if let Some(e) = lock(&self.shared.devices).get_mut(id) {
+                    e.pending = None;
+                }
+                BtError::Failed
+            })
     }
 }
 
@@ -424,8 +464,18 @@ fn as_percent(v: &IInspectable) -> Option<u8> {
         .ok()
         .and_then(|r| r.Value().ok())
         .map(i64::from)
-        .or_else(|| v.cast::<IReference<i32>>().ok().and_then(|r| r.Value().ok()).map(i64::from))
-        .or_else(|| v.cast::<IReference<u32>>().ok().and_then(|r| r.Value().ok()).map(i64::from))?;
+        .or_else(|| {
+            v.cast::<IReference<i32>>()
+                .ok()
+                .and_then(|r| r.Value().ok())
+                .map(i64::from)
+        })
+        .or_else(|| {
+            v.cast::<IReference<u32>>()
+                .ok()
+                .and_then(|r| r.Value().ok())
+                .map(i64::from)
+        })?;
     (0..=100).contains(&n).then_some(n as u8)
 }
 
@@ -450,7 +500,9 @@ fn apply_properties(e: &mut Entry, p: &IMapView<HSTRING, IInspectable>) {
 
 fn bluetooth_radio() -> Option<Radio> {
     let radios = Radio::GetRadiosAsync().ok()?.join().ok()?;
-    radios.into_iter().find(|r| r.Kind().ok() == Some(RadioKind::Bluetooth))
+    radios
+        .into_iter()
+        .find(|r| r.Kind().ok() == Some(RadioKind::Bluetooth))
 }
 
 fn radio_worker(shared: Arc<Shared>, rx: Receiver<RadioJob>, devices: Sender<DeviceJob>) {
@@ -461,25 +513,27 @@ fn radio_worker(shared: Arc<Shared>, rx: Receiver<RadioJob>, devices: Sender<Dev
         *lock(&shared.radio_on) = r.State().ok().map(|s| s == RadioState::On);
         let sh = shared.clone();
         token = r
-            .StateChanged(&TypedEventHandler::new(move |sender: windows::core::Ref<'_, Radio>, _| {
-                if let Some(r) = sender.as_ref() {
-                    let on = r.State().ok().map(|s| s == RadioState::On);
-                    *lock(&sh.radio_on) = on;
-                    if on == Some(true) {
-                        // Devices that could not be resolved while the radio was off.
-                        let todo: Vec<(String, bool)> = lock(&sh.devices)
-                            .iter()
-                            .filter(|(_, e)| e.address.is_none())
-                            .map(|(id, e)| (id.clone(), e.le))
-                            .collect();
-                        for (id, le) in todo {
-                            let _ = devices.send(DeviceJob::Resolve { id, le });
+            .StateChanged(&TypedEventHandler::new(
+                move |sender: windows::core::Ref<'_, Radio>, _| {
+                    if let Some(r) = sender.as_ref() {
+                        let on = r.State().ok().map(|s| s == RadioState::On);
+                        *lock(&sh.radio_on) = on;
+                        if on == Some(true) {
+                            // Devices that could not be resolved while the radio was off.
+                            let todo: Vec<(String, bool)> = lock(&sh.devices)
+                                .iter()
+                                .filter(|(_, e)| e.address.is_none())
+                                .map(|(id, e)| (id.clone(), e.le))
+                                .collect();
+                            for (id, le) in todo {
+                                let _ = devices.send(DeviceJob::Resolve { id, le });
+                            }
                         }
                     }
-                }
-                sh.wake(Change::Radio);
-                Ok(())
-            }))
+                    sh.wake(Change::Radio);
+                    Ok(())
+                },
+            ))
             .ok();
         shared.wake(Change::Radio);
     }
@@ -519,10 +573,13 @@ fn device_worker(shared: Arc<Shared>, rx: Receiver<DeviceJob>) {
                         .ok()
                         .and_then(|d| Some((false, d.BluetoothAddress().ok()?)))
                 } else {
-                    BluetoothDevice::FromIdAsync(&hid).and_then(|a| a.join()).ok().and_then(|d| {
-                        let cod = d.ClassOfDevice().ok()?.RawValue().ok()?;
-                        Some((is_audio_class(cod), d.BluetoothAddress().ok()?))
-                    })
+                    BluetoothDevice::FromIdAsync(&hid)
+                        .and_then(|a| a.join())
+                        .ok()
+                        .and_then(|d| {
+                            let cod = d.ClassOfDevice().ok()?.RawValue().ok()?;
+                            Some((is_audio_class(cod), d.BluetoothAddress().ok()?))
+                        })
                 };
                 if let Some((audio, address)) = resolved {
                     if let Some(e) = lock(&shared.devices).get_mut(&id) {
@@ -541,7 +598,11 @@ fn device_worker(shared: Arc<Shared>, rx: Receiver<DeviceJob>) {
                         e.pending = None;
                     }
                 }
-                shared.wake(if ok { Change::Devices } else { Change::Error(BtError::Failed) });
+                shared.wake(if ok {
+                    Change::Devices
+                } else {
+                    Change::Error(BtError::Failed)
+                });
             }
         }
     }
@@ -582,7 +643,14 @@ mod tests {
     use super::*;
 
     fn dev(id: &str, name: &str, connected: bool) -> BtDevice {
-        BtDevice { id: id.into(), name: name.into(), connected, audio: false, battery: None, pending: false }
+        BtDevice {
+            id: id.into(),
+            name: name.into(),
+            connected,
+            audio: false,
+            battery: None,
+            pending: false,
+        }
     }
 
     #[test]
@@ -600,8 +668,14 @@ mod tests {
 
     #[test]
     fn service_guids_are_the_bluetooth_uuids() {
-        assert_eq!(format!("{A2DP_SINK:?}").to_uppercase(), "0000110B-0000-1000-8000-00805F9B34FB");
-        assert_eq!(format!("{HANDS_FREE:?}").to_uppercase(), "0000111E-0000-1000-8000-00805F9B34FB");
+        assert_eq!(
+            format!("{A2DP_SINK:?}").to_uppercase(),
+            "0000110B-0000-1000-8000-00805F9B34FB"
+        );
+        assert_eq!(
+            format!("{HANDS_FREE:?}").to_uppercase(),
+            "0000111E-0000-1000-8000-00805F9B34FB"
+        );
     }
 
     #[test]
@@ -627,9 +701,15 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_secs(3));
             let _ = b.drain_changes();
             let s = b.snapshot();
-            assert!(s.devices.iter().all(|d| d.battery.is_none_or(|p| p <= 100)), "{s:?}");
+            assert!(
+                s.devices.iter().all(|d| d.battery.is_none_or(|p| p <= 100)),
+                "{s:?}"
+            );
             // An unknown id is handed off, never acted upon.
-            assert_eq!(b.set_connected("no-such-device", true), Err(BtError::HandOff));
+            assert_eq!(
+                b.set_connected("no-such-device", true),
+                Err(BtError::HandOff)
+            );
         }
     }
 }

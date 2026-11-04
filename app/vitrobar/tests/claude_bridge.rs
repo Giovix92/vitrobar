@@ -40,7 +40,12 @@ fn bridge(settings: &Path, local: &Path, shell: &str, stdin: &str) -> (String, b
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
     let out = child.wait_with_output().unwrap();
     (
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -86,7 +91,10 @@ fn saves_the_limits_and_exits_fast() {
     assert!(took < Duration::from_secs(1), "{took:?}");
     let saved =
         std::fs::read_to_string(dir.path().join("Vitrobar").join("claude-usage.json")).unwrap();
-    assert!(saved.contains("\"five_hour\"") && saved.contains("42"), "{saved}");
+    assert!(
+        saved.contains("\"five_hour\"") && saved.contains("42"),
+        "{saved}"
+    );
     // No previous command: a minimal line with the model's name.
     assert_eq!(out.trim(), "Opus");
 }
@@ -100,7 +108,11 @@ fn odd_input_never_fails_and_writes_nothing() {
         assert!(ok, "{input:?}");
         assert!(out.trim().is_empty(), "{input:?} -> {out:?}");
     }
-    assert!(!dir.path().join("Vitrobar").join("claude-usage.json").exists());
+    assert!(!dir
+        .path()
+        .join("Vitrobar")
+        .join("claude-usage.json")
+        .exists());
 }
 
 #[test]
@@ -108,11 +120,21 @@ fn git_bash_runs_the_previous_status_line_with_the_same_input() {
     let Some(bash) = git_bash() else { return };
     let bash = bash.display().to_string();
     let dir = tempfile::tempdir().unwrap();
-    let (out, ok, _) = bridge(&settings_with(dir.path(), Some("echo hi")), dir.path(), &bash, SAMPLE);
+    let (out, ok, _) = bridge(
+        &settings_with(dir.path(), Some("echo hi")),
+        dir.path(),
+        &bash,
+        SAMPLE,
+    );
     assert!(ok);
     assert!(out.contains("hi"), "{out:?}");
     // The same JSON on its stdin.
-    let (out, _, _) = bridge(&settings_with(dir.path(), Some("cat")), dir.path(), &bash, SAMPLE);
+    let (out, _, _) = bridge(
+        &settings_with(dir.path(), Some("cat")),
+        dir.path(),
+        &bash,
+        SAMPLE,
+    );
     assert!(out.contains("rate_limits"), "{out:?}");
     // `~` expands as it does for Claude Code (scripts like ~/.claude/statusline.sh).
     let (out, _, _) = bridge(
@@ -145,9 +167,17 @@ fn a_hanging_previous_command_is_cut_off_after_a_second() {
     }
     for (shell, cmd) in cases {
         let base = baseline(dir.path());
-        let (_, ok, took) = bridge(&settings_with(dir.path(), Some(cmd)), dir.path(), &shell, SAMPLE);
+        let (_, ok, took) = bridge(
+            &settings_with(dir.path(), Some(cmd)),
+            dir.path(),
+            &shell,
+            SAMPLE,
+        );
         assert!(ok);
-        assert!(took < base + OVER_BASELINE, "{shell}: {took:?} (baseline {base:?})");
+        assert!(
+            took < base + OVER_BASELINE,
+            "{shell}: {took:?} (baseline {base:?})"
+        );
     }
 }
 
@@ -168,7 +198,10 @@ fn a_slow_previous_status_line_prints_its_last_complete_output() {
     let (out, ok, took) = bridge(&settings, dir.path(), &bash, SAMPLE);
     assert!(ok);
     assert!(took < base + OVER_BASELINE, "{took:?} (baseline {base:?})");
-    assert!(out.contains("hello-cache"), "the last complete output: {out:?}");
+    assert!(
+        out.contains("hello-cache"),
+        "the last complete output: {out:?}"
+    );
 }
 
 #[test]
@@ -218,7 +251,12 @@ fn the_written_bridge_command_starts_the_bridge_in_each_shell() {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        child.stdin.take().unwrap().write_all(SAMPLE.as_bytes()).unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(SAMPLE.as_bytes())
+            .unwrap();
         let out = child.wait_with_output().unwrap();
         let text = String::from_utf8_lossy(&out.stdout);
         assert_eq!(text.trim(), "Opus", "{shell:?} running {cmd}");

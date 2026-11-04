@@ -17,8 +17,7 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, WAIT_OBJECT_
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, ReadDirectoryChangesW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED,
     FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE,
-    FILE_NOTIFY_CHANGE_SIZE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    OPEN_EXISTING,
+    FILE_NOTIFY_CHANGE_SIZE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows::Win32::System::Threading::{
     CreateEventW, ResetEvent, SetEvent, WaitForMultipleObjects, INFINITE,
@@ -95,9 +94,15 @@ pub fn save_at(path: &Path, u: &ClaudeUsage) -> std::io::Result<()> {
 /// old file (`MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`): a reader sees the old file or
 /// the new one, never half of one.
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let dir = path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir)?;
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
     let written = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
     if written.is_err() {
@@ -137,9 +142,10 @@ pub fn git_bash_candidates(
     let mut out: Vec<PathBuf> = env_path.map(Path::to_path_buf).into_iter().collect();
     if let Some(dir) = git_exe.and_then(Path::parent) {
         // ...\cmd or ...\bin is one level under the Git root, ...\mingw64\bin two.
-        let mingw = dir
-            .parent()
-            .filter(|p| p.file_name().is_some_and(|n| n.eq_ignore_ascii_case("mingw64")));
+        let mingw = dir.parent().filter(|p| {
+            p.file_name()
+                .is_some_and(|n| n.eq_ignore_ascii_case("mingw64"))
+        });
         let root = mingw.and_then(Path::parent).or_else(|| dir.parent());
         if let Some(root) = root {
             out.push(root.join("bin").join("bash.exe"));
@@ -332,7 +338,12 @@ pub fn watch_dir(
     }
     .map_err(std::io::Error::other)?;
     // SAFETY: plain event creation; closed by the worker (io) and by Drop (stop).
-    let events = unsafe { (CreateEventW(None, true, false, None), CreateEventW(None, true, false, None)) };
+    let events = unsafe {
+        (
+            CreateEventW(None, true, false, None),
+            CreateEventW(None, true, false, None),
+        )
+    };
     let (io, stop) = match events {
         (Ok(io), Ok(stop)) => (io, stop),
         (a, b) => {
@@ -394,7 +405,9 @@ fn watch_worker(dir: HANDLE, io: HANDLE, stop: HANDLE, name: &[u16], wake: &dyn 
                 buf.as_mut_ptr().cast(),
                 bytes,
                 false,
-                FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE,
+                FILE_NOTIFY_CHANGE_FILE_NAME
+                    | FILE_NOTIFY_CHANGE_LAST_WRITE
+                    | FILE_NOTIFY_CHANGE_SIZE,
                 None,
                 Some(&mut ov),
                 None,
@@ -421,7 +434,11 @@ fn watch_worker(dir: HANDLE, io: HANDLE, stop: HANDLE, name: &[u16], wake: &dyn 
             break;
         }
         // n == 0: the buffer overflowed and the changes were lost; assume ours was one.
-        if n == 0 || names_in(&buf, n as usize).iter().any(|f| same_name(f, name)) {
+        if n == 0
+            || names_in(&buf, n as usize)
+                .iter()
+                .any(|f| same_name(f, name))
+        {
             wake();
         }
     }
@@ -481,7 +498,10 @@ mod tests {
 
     #[test]
     fn the_bridge_command_suits_the_shell() {
-        assert_eq!(ours(), r#""C:/Program Files/Vitrobar/vitrobar.exe" --claude-statusline"#);
+        assert_eq!(
+            ours(),
+            r#""C:/Program Files/Vitrobar/vitrobar.exe" --claude-statusline"#
+        );
         assert_eq!(
             bridge_command(&exe(), &StatusShell::PowerShell),
             r"& 'C:\Program Files\Vitrobar\vitrobar.exe' --claude-statusline"
@@ -534,7 +554,10 @@ mod tests {
     fn wrap_with_no_file_creates_the_status_line() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("settings.json");
-        assert_eq!(wrap_statusline_at(&p, &ours()).unwrap(), Wrap::Wrapped(None));
+        assert_eq!(
+            wrap_statusline_at(&p, &ours()).unwrap(),
+            Wrap::Wrapped(None)
+        );
         assert_eq!(
             json(&p),
             serde_json::json!({"statusLine": {"type": "command", "command": ours()}})
@@ -570,7 +593,11 @@ mod tests {
     fn wrapping_twice_changes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("settings.json");
-        std::fs::write(&p, r#"{"statusLine":{"type":"command","command":"echo hi"}}"#).unwrap();
+        std::fs::write(
+            &p,
+            r#"{"statusLine":{"type":"command","command":"echo hi"}}"#,
+        )
+        .unwrap();
         wrap_statusline_at(&p, &ours()).unwrap();
         let once = std::fs::read_to_string(&p).unwrap();
         assert_eq!(wrap_statusline_at(&p, &ours()).unwrap(), Wrap::AlreadyOurs);
@@ -622,8 +649,14 @@ mod tests {
         let p = dir.path().join("settings.json");
         for bad in ["{ not json", "[1, 2]", "\"text\""] {
             std::fs::write(&p, bad).unwrap();
-            assert!(matches!(wrap_statusline_at(&p, &ours()), Err(SetupError::Malformed)));
-            assert!(matches!(unwrap_statusline_at(&p, None), Err(SetupError::Malformed)));
+            assert!(matches!(
+                wrap_statusline_at(&p, &ours()),
+                Err(SetupError::Malformed)
+            ));
+            assert!(matches!(
+                unwrap_statusline_at(&p, None),
+                Err(SetupError::Malformed)
+            ));
             assert_eq!(std::fs::read_to_string(&p).unwrap(), bad);
         }
     }
@@ -652,7 +685,9 @@ mod tests {
     #[test]
     fn bridge_commands_are_recognised() {
         assert!(is_bridge(&ours()));
-        assert!(is_bridge("\"D:\\other\\vitrobar.exe\" --claude-statusline  "));
+        assert!(is_bridge(
+            "\"D:\\other\\vitrobar.exe\" --claude-statusline  "
+        ));
         assert!(!is_bridge("node line.js"));
     }
 }
@@ -673,11 +708,14 @@ mod watch_tests {
         .unwrap();
         std::fs::write(dir.path().join("other.txt"), "x").unwrap();
         assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
-        save_at(&dir.path().join(DATA_FILE), &ClaudeUsage {
-            five_hour: None,
-            seven_day: None,
-            at: 1,
-        })
+        save_at(
+            &dir.path().join(DATA_FILE),
+            &ClaudeUsage {
+                five_hour: None,
+                seven_day: None,
+                at: 1,
+            },
+        )
         .unwrap();
         assert!(rx.recv_timeout(Duration::from_secs(5)).is_ok());
         drop(w);
@@ -692,4 +730,3 @@ mod watch_tests {
         assert!(t.elapsed() < Duration::from_secs(2));
     }
 }
-

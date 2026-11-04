@@ -14,9 +14,9 @@ use vitro_core::settings::Position;
 use vitro_core::style::{MaterialStyle, Rgba};
 use vitro_core::widgets::{
     bar_fill, claude_pill_text, claude_rows, music_action, music_glyph, music_pill_text,
-    music_rows, pill_width, ClaudeUsage, MusicAction, MusicView, ART_DIP, CLAUDE_PILL_MAX_DIP,
-    G_CLAUDE, ID_ART, ID_BAR_5H, ID_BAR_7D, MUSIC_PILL_MAX_CHARS, MUSIC_PILL_MAX_DIP,
-    PILL_FONT_DIP, next_pill_change,
+    music_rows, next_pill_change, pill_width, ClaudeUsage, MusicAction, MusicView, ART_DIP,
+    CLAUDE_PILL_MAX_DIP, G_CLAUDE, ID_ART, ID_BAR_5H, ID_BAR_7D, MUSIC_PILL_MAX_CHARS,
+    MUSIC_PILL_MAX_DIP, PILL_FONT_DIP,
 };
 use vitro_render::bar_visual::WidgetPill;
 use vitro_render::compositor::Comp;
@@ -258,7 +258,9 @@ impl MusicPanel {
         if data == self.data {
             return Outcome::None;
         }
-        if (&data.title, &data.artist, &data.app) != (&self.data.title, &self.data.artist, &self.data.app) {
+        if (&data.title, &data.artist, &data.app)
+            != (&self.data.title, &self.data.artist, &self.data.app)
+        {
             self.art = None;
             self.art_wanted = true;
         }
@@ -314,16 +316,20 @@ impl MusicPanel {
             _ => {
                 let shape = comp.CreateSpriteShapeWithGeometry(&geom)?;
                 let t = self.text;
-                shape.SetFillBrush(
-                    &comp.CreateColorBrushWithColor(ui_color(Rgba(t.0, t.1, t.2, NO_ART_ALPHA)))?,
-                )?;
+                shape.SetFillBrush(&comp.CreateColorBrushWithColor(ui_color(Rgba(
+                    t.0,
+                    t.1,
+                    t.2,
+                    NO_ART_ALPHA,
+                )))?)?;
                 let v = comp.CreateShapeVisual()?;
                 v.SetSize(Vector2::new(side, side))?;
                 v.Shapes()?.Append(&shape)?;
                 v.SetOffset(Vector3::new(0.0, top, 0.0))?;
                 kids.InsertAtTop(&v)?;
                 let glyph = G_NO_ART.to_string();
-                let boxes: [TextBox; 1] = [(glyph.as_str(), FontKind::Glyph, (0.0, top, side, side))];
+                let boxes: [TextBox; 1] =
+                    [(glyph.as_str(), FontKind::Glyph, (0.0, top, side, side))];
                 self.text_sprite(g, &boxes, 24.0 * s, self.dim(), w, h)?;
             }
         }
@@ -331,7 +337,11 @@ impl MusicPanel {
         let x = side + (ART_GAP_DIP * s).round();
         let tw = (w - x).max(1.0);
         let line = (h / 2.0).round();
-        let title: [TextBox; 1] = [(self.data.title.as_str(), FontKind::Text, (x, top, tw, line - top))];
+        let title: [TextBox; 1] = [(
+            self.data.title.as_str(),
+            FontKind::Text,
+            (x, top, tw, line - top),
+        )];
         self.text_sprite(g, &title, TITLE_FONT_DIP * s, self.text, w, h)?;
         let artist: [TextBox; 1] = [(
             self.data.artist.as_str(),
@@ -345,7 +355,15 @@ impl MusicPanel {
         Rgba(self.text.0, self.text.1, self.text.2, DIM_ALPHA)
     }
 
-    fn text_sprite(&self, g: &Gfx, boxes: &[TextBox], px: f32, color: Rgba, w: f32, h: f32) -> Result<()> {
+    fn text_sprite(
+        &self,
+        g: &Gfx,
+        boxes: &[TextBox],
+        px: f32,
+        color: Rgba,
+        w: f32,
+        h: f32,
+    ) -> Result<()> {
         let Some(slot) = self.view.custom_slot(ID_ART) else {
             return Ok(());
         };
@@ -527,7 +545,9 @@ const BAR_THICK_DIP: f32 = 6.0;
 const TRACK_ALPHA: u8 = 40;
 
 fn claude_rows_now(usage: Option<&ClaudeUsage>, lang: Lang) -> Vec<Row> {
-    let at = usage.map(|u| time_format::local_short_time(u.at)).unwrap_or_default();
+    let at = usage
+        .map(|u| time_format::local_short_time(u.at))
+        .unwrap_or_default();
     claude_rows(usage, now_s(), &at, lang)
 }
 
@@ -593,9 +613,12 @@ impl ClaudePanel {
         let comp: &windows::UI::Composition::Compositor = g.comp;
         let s = self.view.scale();
         let now = now_s();
-        let windows = self
-            .usage
-            .map_or([None, None], |u| [u.five_hour.map(|w| (ID_BAR_5H, w)), u.seven_day.map(|w| (ID_BAR_7D, w))]);
+        let windows = self.usage.map_or([None, None], |u| {
+            [
+                u.five_hour.map(|w| (ID_BAR_5H, w)),
+                u.seven_day.map(|w| (ID_BAR_7D, w)),
+            ]
+        });
         for (id, w) in windows.into_iter().flatten() {
             let (Some(slot), Some(r)) = (self.view.custom_slot(id), self.view.custom_rect_px(id))
             else {
@@ -608,10 +631,7 @@ impl ClaudePanel {
             let top = ((bh - thick) / 2.0).round();
             let t = self.text;
             let fill = (bw * bar_fill(&w, now)).round();
-            for (width, color) in [
-                (bw, Rgba(t.0, t.1, t.2, TRACK_ALPHA)),
-                (fill, self.accent),
-            ] {
+            for (width, color) in [(bw, Rgba(t.0, t.1, t.2, TRACK_ALPHA)), (fill, self.accent)] {
                 if width < 1.0 {
                     continue;
                 }

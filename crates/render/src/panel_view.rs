@@ -426,7 +426,11 @@ fn build_row(ctx: &Ctx, l: &PanelLayout, index: usize, row: &Row) -> Result<RowV
                     (None, _) => 0.0,
                 };
                 let avail = (r.2 - r.0) as f32 - 8.0 * s;
-                let tw = if glyph_only { 0.0 } else { tw.min((avail - gw).max(1.0)) };
+                let tw = if glyph_only {
+                    0.0
+                } else {
+                    tw.min((avail - gw).max(1.0))
+                };
                 let mut x = r.0 as f32 + ((r.2 - r.0) as f32 - tw - gw) / 2.0;
                 let (y, bh) = (r.1 as f32, (r.3 - r.1) as f32);
                 if let Some(g) = b.glyph {

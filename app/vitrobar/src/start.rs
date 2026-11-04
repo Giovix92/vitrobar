@@ -7,8 +7,8 @@
 //! [`StartPanel`]; it routes the panel's input here and carries out the [`StartAction`]s.
 
 use std::collections::HashSet;
-use std::sync::mpsc::{channel, Sender};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 

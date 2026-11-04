@@ -93,7 +93,12 @@ impl Shared {
         if self.queue.push(change) && self.notify != 0 {
             // SAFETY: a payload-free post to a window of this process.
             if unsafe {
-                PostMessageW(Some(HWND(self.notify as *mut _)), self.msg, WPARAM(0), LPARAM(0))
+                PostMessageW(
+                    Some(HWND(self.notify as *mut _)),
+                    self.msg,
+                    WPARAM(0),
+                    LPARAM(0),
+                )
             }
             .is_err()
             {
@@ -156,7 +161,9 @@ impl Media {
     /// Reads and decodes the current artwork to a `px` square (clamped to
     /// [`MAX_THUMBNAIL_PX`]); [`Change::Thumbnail`] follows, also when there is none.
     pub fn request_thumbnail(&self, px: u32) {
-        let _ = self.jobs.send(Job::Thumbnail(px.clamp(1, MAX_THUMBNAIL_PX)));
+        let _ = self
+            .jobs
+            .send(Job::Thumbnail(px.clamp(1, MAX_THUMBNAIL_PX)));
     }
 
     /// The artwork decoded by the last [`Media::request_thumbnail`], once.
@@ -280,7 +287,10 @@ fn read_session(s: &Session) -> Option<MediaSnapshot> {
     let controls = info.Controls().ok()?;
     let on = |r: Result<bool>| r.unwrap_or(false);
     Some(MediaSnapshot {
-        app: s.SourceAppUserModelId().map(|h| h.to_string()).unwrap_or_default(),
+        app: s
+            .SourceAppUserModelId()
+            .map(|h| h.to_string())
+            .unwrap_or_default(),
         title: props.Title().map(|h| h.to_string()).unwrap_or_default(),
         artist: props.Artist().map(|h| h.to_string()).unwrap_or_default(),
         playing: info.PlaybackStatus().ok() == Some(Status::Playing),
@@ -305,7 +315,10 @@ fn thumbnail(s: &Session, px: u32) -> Result<BgraImage> {
     let reference: IRandomAccessStreamReference = props.Thumbnail()?;
     let stream = reference.OpenReadAsync()?.join()?;
     let decoder = BitmapDecoder::CreateAsync(&stream)?.join()?;
-    let (w, h) = (decoder.OrientedPixelWidth()?, decoder.OrientedPixelHeight()?);
+    let (w, h) = (
+        decoder.OrientedPixelWidth()?,
+        decoder.OrientedPixelHeight()?,
+    );
     if w == 0 || h == 0 {
         return Err(windows::Win32::Foundation::E_FAIL.into());
     }

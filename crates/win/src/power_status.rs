@@ -7,11 +7,11 @@
 use std::sync::OnceLock;
 
 use windows::core::{s, w, Result, GUID};
-use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::Foundation::{HANDLE, HWND};
+use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Power::{
-    GetSystemPowerStatus, RegisterPowerSettingNotification, UnregisterPowerSettingNotification, HPOWERNOTIFY,
-    SYSTEM_POWER_STATUS,
+    GetSystemPowerStatus, RegisterPowerSettingNotification, UnregisterPowerSettingNotification,
+    HPOWERNOTIFY, SYSTEM_POWER_STATUS,
 };
 use windows::Win32::System::SystemServices::{
     GUID_ACDC_POWER_SOURCE, GUID_BATTERY_PERCENTAGE_REMAINING, GUID_POWER_SAVING_STATUS,
@@ -127,8 +127,8 @@ fn load_overlay_api() -> Option<(GetOverlayFn, SetOverlayFn)> {
         let get = GetProcAddress(lib, s!("PowerGetEffectiveOverlayScheme"))?;
         let set = GetProcAddress(lib, s!("PowerSetActiveOverlayScheme"))?;
         Some((
-            std::mem::transmute::<_, GetOverlayFn>(get),
-            std::mem::transmute::<_, SetOverlayFn>(set),
+            std::mem::transmute::<unsafe extern "system" fn() -> isize, GetOverlayFn>(get),
+            std::mem::transmute::<unsafe extern "system" fn() -> isize, SetOverlayFn>(set),
         ))
     }
 }
@@ -214,12 +214,21 @@ mod tests {
     }
 
     fn snap(has: bool, pct: Option<u8>, charging: bool) -> PowerSnapshot {
-        PowerSnapshot { has_battery: has, percent: pct, charging, saver: false, mode: None }
+        PowerSnapshot {
+            has_battery: has,
+            percent: pct,
+            charging,
+            saver: false,
+            mode: None,
+        }
     }
 
     #[test]
     fn label_plain_and_charging_in_both_languages() {
-        assert_eq!(battery_label(&snap(true, Some(99), false), Lang::En).as_deref(), Some("99%"));
+        assert_eq!(
+            battery_label(&snap(true, Some(99), false), Lang::En).as_deref(),
+            Some("99%")
+        );
         assert_eq!(
             battery_label(&snap(true, Some(99), true), Lang::En).as_deref(),
             Some("99% · charging")
@@ -256,6 +265,6 @@ mod tests {
     #[ignore = "reads the real power state; run manually"]
     fn real_snapshot_percent_in_range() {
         let s = snapshot();
-        assert!(s.percent.map_or(true, |p| p <= 100), "{s:?}");
+        assert!(s.percent.is_none_or(|p| p <= 100), "{s:?}");
     }
 }

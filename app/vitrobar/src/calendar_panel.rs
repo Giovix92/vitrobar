@@ -8,8 +8,8 @@
 //! midnight so "today" moves by itself (never a repeating timer).
 
 use vitro_core::calendar::{
-    self, action, cells, weekday_initials, Action, Date, Month, Weekday,
-    CELL_H_DIP, ID_GRID, WEEKDAY_H_DIP,
+    self, action, cells, weekday_initials, Action, Date, Month, Weekday, CELL_H_DIP, ID_GRID,
+    WEEKDAY_H_DIP,
 };
 use vitro_core::i18n::Lang;
 use vitro_core::menu_model::NavKey;
@@ -25,8 +25,8 @@ use vitro_win::time_format;
 use windows::core::Result;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT,
-    VK_SPACE, VK_TAB, VK_UP,
+    VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SPACE,
+    VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     KillTimer, SetTimer, MSG, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
@@ -216,7 +216,12 @@ impl CalendarPanel {
                 .measure(t, FontKind::Text, size)
                 .map(|(tw, _)| tw.ceil())
                 .unwrap_or(cell_w / 2.0);
-            (x + ((cell_w - tw) / 2.0).max(0.0), y, (cell_w - 2.0).max(1.0), bh)
+            (
+                x + ((cell_w - tw) / 2.0).max(0.0),
+                y,
+                (cell_w - 2.0).max(1.0),
+                bh,
+            )
         };
 
         let initials = weekday_initials(self.first, self.lang);

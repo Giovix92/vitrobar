@@ -251,7 +251,9 @@ fn parse_rfc3339(t: &str) -> Option<i64> {
     }
     let num = |r: std::ops::Range<usize>| -> Option<i64> {
         let s = t.get(r)?;
-        s.bytes().all(|c| c.is_ascii_digit()).then(|| s.parse().ok())?
+        s.bytes()
+            .all(|c| c.is_ascii_digit())
+            .then(|| s.parse().ok())?
     };
     let (y, mo, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
     let (h, mi, sec) = (num(11..13)?, num(14..16)?, num(17..19)?);
@@ -455,21 +457,40 @@ mod claude_tests {
     fn resets_at_in_ms_or_as_a_string() {
         let ms = r#"{"rate_limits":{"five_hour":{"used_percentage":1,"resets_at":1793476800000}}}"#;
         assert_eq!(
-            parse_statusline(ms, NOW).unwrap().five_hour.unwrap().resets_at,
+            parse_statusline(ms, NOW)
+                .unwrap()
+                .five_hour
+                .unwrap()
+                .resets_at,
             Some(1_793_476_800)
         );
         let iso = r#"{"rate_limits":{"five_hour":{"used_percentage":1,"resets_at":"2026-10-31T18:00:00Z"}}}"#;
         assert_eq!(
-            parse_statusline(iso, NOW).unwrap().five_hour.unwrap().resets_at,
+            parse_statusline(iso, NOW)
+                .unwrap()
+                .five_hour
+                .unwrap()
+                .resets_at,
             Some(NOW)
         );
         let offset = r#"{"rate_limits":{"five_hour":{"used_percentage":1,"resets_at":"2026-10-31T19:30:00.250+01:30"}}}"#;
         assert_eq!(
-            parse_statusline(offset, NOW).unwrap().five_hour.unwrap().resets_at,
+            parse_statusline(offset, NOW)
+                .unwrap()
+                .five_hour
+                .unwrap()
+                .resets_at,
             Some(NOW)
         );
         let junk = r#"{"rate_limits":{"five_hour":{"used_percentage":1,"resets_at":"soon"}}}"#;
-        assert_eq!(parse_statusline(junk, NOW).unwrap().five_hour.unwrap().resets_at, None);
+        assert_eq!(
+            parse_statusline(junk, NOW)
+                .unwrap()
+                .five_hour
+                .unwrap()
+                .resets_at,
+            None
+        );
     }
 
     #[test]
@@ -484,7 +505,10 @@ mod claude_tests {
     fn nothing_usable_is_none() {
         assert_eq!(parse_statusline(r#"{"model":{}}"#, NOW), None);
         assert_eq!(parse_statusline(r#"{"rate_limits":{}}"#, NOW), None);
-        assert_eq!(parse_statusline(r#"{"rate_limits":{"five_hour":{}}}"#, NOW), None);
+        assert_eq!(
+            parse_statusline(r#"{"rate_limits":{"five_hour":{}}}"#, NOW),
+            None
+        );
         assert_eq!(parse_statusline("not json at all", NOW), None);
         assert_eq!(parse_statusline("", NOW), None);
         assert_eq!(parse_statusline("[1,2]", NOW), None);
@@ -505,8 +529,14 @@ mod claude_tests {
             seven_day: Some(win(17.6, Some(NOW + 86_400))),
             at: NOW - 60,
         };
-        assert_eq!(claude_pill_text(Some(&both), NOW, Lang::En), "5h 42% · 7d 18%");
-        assert_eq!(claude_pill_text(Some(&both), NOW, Lang::It), "5h 42% · 7d 18%");
+        assert_eq!(
+            claude_pill_text(Some(&both), NOW, Lang::En),
+            "5h 42% · 7d 18%"
+        );
+        assert_eq!(
+            claude_pill_text(Some(&both), NOW, Lang::It),
+            "5h 42% · 7d 18%"
+        );
         let one = ClaudeUsage {
             five_hour: None,
             ..both
@@ -517,7 +547,10 @@ mod claude_tests {
             ..one
         };
         assert_eq!(claude_pill_text(Some(&old), NOW, Lang::En), "7d 18% · old");
-        assert_eq!(claude_pill_text(Some(&old), NOW, Lang::It), "7d 18% · vecchio");
+        assert_eq!(
+            claude_pill_text(Some(&old), NOW, Lang::It),
+            "7d 18% · vecchio"
+        );
         assert_eq!(claude_pill_text(None, NOW, Lang::En), "Claude: no data");
         assert_eq!(claude_pill_text(None, NOW, Lang::It), "Claude: nessun dato");
     }
@@ -544,9 +577,15 @@ mod claude_tests {
         // The 5-hour reset comes first.
         assert_eq!(next_pill_change(&u, NOW), Some(NOW + 600));
         // After it: the stale moment (at + 6 h) comes before the weekly reset.
-        assert_eq!(next_pill_change(&u, NOW + 600), Some(NOW - 60 + STALE_AFTER_S + 1));
+        assert_eq!(
+            next_pill_change(&u, NOW + 600),
+            Some(NOW - 60 + STALE_AFTER_S + 1)
+        );
         // Past everything but the weekly reset.
-        assert_eq!(next_pill_change(&u, NOW + STALE_AFTER_S), Some(NOW + 86_400));
+        assert_eq!(
+            next_pill_change(&u, NOW + STALE_AFTER_S),
+            Some(NOW + 86_400)
+        );
         assert_eq!(next_pill_change(&u, NOW + 86_400), None);
         let none = ClaudeUsage {
             five_hour: None,
@@ -561,11 +600,23 @@ mod claude_tests {
         assert_eq!(resets_in(NOW + 59, NOW, Lang::En), "resets in 1 min");
         assert_eq!(resets_in(NOW + 60, NOW, Lang::En), "resets in 1 min");
         assert_eq!(resets_in(NOW + 61, NOW, Lang::En), "resets in 2 min");
-        assert_eq!(resets_in(NOW + 2 * 3600 + 600, NOW, Lang::En), "resets in 2 h 10 min");
+        assert_eq!(
+            resets_in(NOW + 2 * 3600 + 600, NOW, Lang::En),
+            "resets in 2 h 10 min"
+        );
         assert_eq!(resets_in(NOW + 3600, NOW, Lang::En), "resets in 1 h");
-        assert_eq!(resets_in(NOW + 2 * 3600 + 600, NOW, Lang::It), "si azzera tra 2 h 10 min");
-        assert_eq!(resets_in(NOW + 3 * 86_400 + 4 * 3600, NOW, Lang::En), "resets in 3 d 4 h");
-        assert_eq!(resets_in(NOW + 3 * 86_400 + 4 * 3600, NOW, Lang::It), "si azzera tra 3 g 4 h");
+        assert_eq!(
+            resets_in(NOW + 2 * 3600 + 600, NOW, Lang::It),
+            "si azzera tra 2 h 10 min"
+        );
+        assert_eq!(
+            resets_in(NOW + 3 * 86_400 + 4 * 3600, NOW, Lang::En),
+            "resets in 3 d 4 h"
+        );
+        assert_eq!(
+            resets_in(NOW + 3 * 86_400 + 4 * 3600, NOW, Lang::It),
+            "si azzera tra 3 g 4 h"
+        );
         assert_eq!(resets_in(NOW, NOW, Lang::En), "resets now");
         assert_eq!(resets_in(NOW - 5, NOW, Lang::It), "si azzera ora");
     }
@@ -586,14 +637,28 @@ mod claude_tests {
                 actions: Vec::new(),
             }
         );
-        assert_eq!(rows[1], Row::Custom { id: ID_BAR_5H, h: BAR_ROW_H_DIP });
+        assert_eq!(
+            rows[1],
+            Row::Custom {
+                id: ID_BAR_5H,
+                h: BAR_ROW_H_DIP
+            }
+        );
         assert_eq!(rows[2], Row::Text("resets in 10 min".into()));
-        assert!(!rows.iter().any(|r| matches!(r, Row::Custom { id: ID_BAR_7D, .. })));
+        assert!(!rows
+            .iter()
+            .any(|r| matches!(r, Row::Custom { id: ID_BAR_7D, .. })));
         assert!(rows.contains(&Row::Text("as of 17:59".into())));
-        assert_eq!(rows.last(), Some(&Row::Text("Updated while you use Claude Code.".into())));
+        assert_eq!(
+            rows.last(),
+            Some(&Row::Text("Updated while you use Claude Code.".into()))
+        );
         let none = claude_rows(None, NOW, "", Lang::It);
         assert_eq!(none[0], Row::Text("Claude: nessun dato".into()));
-        assert_eq!(none.last(), Some(&Row::Text("Si aggiorna mentre usi Claude Code.".into())));
+        assert_eq!(
+            none.last(),
+            Some(&Row::Text("Si aggiorna mentre usi Claude Code.".into()))
+        );
     }
 
     #[test]
@@ -604,7 +669,10 @@ mod claude_tests {
             at: 7,
         };
         let text = serde_json::to_string(&u).unwrap();
-        assert!(text.contains("\"five_hour\"") && text.contains("\"at\":7"), "{text}");
+        assert!(
+            text.contains("\"five_hour\"") && text.contains("\"at\":7"),
+            "{text}"
+        );
         assert_eq!(serde_json::from_str::<ClaudeUsage>(&text).unwrap(), u);
     }
 }
@@ -666,8 +734,14 @@ mod tests {
         let title = format!("{family}{flag}{thumb}{e}xyz");
         let v = view(&title, "");
         assert_eq!(music_pill_text(Some(&v), 3), format!("{family}{flag}…"));
-        assert_eq!(music_pill_text(Some(&v), 4), format!("{family}{flag}{thumb}…"));
-        assert_eq!(music_pill_text(Some(&v), 5), format!("{family}{flag}{thumb}{e}…"));
+        assert_eq!(
+            music_pill_text(Some(&v), 4),
+            format!("{family}{flag}{thumb}…")
+        );
+        assert_eq!(
+            music_pill_text(Some(&v), 5),
+            format!("{family}{flag}{thumb}{e}…")
+        );
         // A heart with its emoji variation selector stays whole.
         let heart = "\u{2764}\u{FE0F}";
         let v = view(&format!("{heart}{heart}{heart}"), "");
@@ -681,15 +755,23 @@ mod tests {
     #[test]
     fn pill_width_adds_the_glyph_and_padding_and_caps() {
         let w = pill_width("Song", 40.0, MUSIC_PILL_MAX_DIP);
-        assert_eq!(w, 2.0 * PILL_PAD_DIP + PILL_GLYPH_W_DIP + PILL_GAP_DIP + 40.0);
-        assert_eq!(pill_width("Long", 900.0, MUSIC_PILL_MAX_DIP), MUSIC_PILL_MAX_DIP);
+        assert_eq!(
+            w,
+            2.0 * PILL_PAD_DIP + PILL_GLYPH_W_DIP + PILL_GAP_DIP + 40.0
+        );
+        assert_eq!(
+            pill_width("Long", 900.0, MUSIC_PILL_MAX_DIP),
+            MUSIC_PILL_MAX_DIP
+        );
     }
 
     #[test]
     fn the_glyph_half_of_the_pill() {
         assert!(on_pill_glyph(0.0));
         assert!(on_pill_glyph(PILL_PAD_DIP + PILL_GLYPH_W_DIP));
-        assert!(!on_pill_glyph(PILL_PAD_DIP + PILL_GLYPH_W_DIP + PILL_GAP_DIP));
+        assert!(!on_pill_glyph(
+            PILL_PAD_DIP + PILL_GLYPH_W_DIP + PILL_GAP_DIP
+        ));
         assert!(!on_pill_glyph(120.0));
     }
 
@@ -701,7 +783,10 @@ mod tests {
             app_label("Microsoft.ZuneMusic_8wekyb3d8bbwe!Microsoft.ZuneMusic"),
             "ZuneMusic"
         );
-        assert_eq!(app_label("SpotifyAB.SpotifyMusic_zpdnekdrzrea0!Spotify"), "Spotify");
+        assert_eq!(
+            app_label("SpotifyAB.SpotifyMusic_zpdnekdrzrea0!Spotify"),
+            "Spotify"
+        );
         assert_eq!(app_label(""), "");
     }
 
@@ -745,7 +830,10 @@ mod tests {
         assert_eq!(glyph(&v), Some(G_PAUSE));
         v.playing = false;
         assert_eq!(glyph(&v), Some(G_PLAY));
-        assert_eq!(music_action(Part::Button(ID_PLAY)), Some(MusicAction::PlayPause));
+        assert_eq!(
+            music_action(Part::Button(ID_PLAY)),
+            Some(MusicAction::PlayPause)
+        );
         assert_eq!(music_action(Part::Custom(ID_ART)), None);
     }
 

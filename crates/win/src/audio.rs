@@ -10,7 +10,6 @@
 //! The COM work sits behind [`AudioBackend`] so the pure parts (clamping, ordering) and the
 //! panel logic are tested with a fake that never touches the real mixer.
 
-
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -214,13 +213,7 @@ unsafe trait IPolicyConfig: windows::core::IUnknown {
     unsafe fn get_device_format(&self, a: PCWSTR, b: i32, c: *mut *mut c_void) -> HRESULT;
     unsafe fn reset_device_format(&self, a: PCWSTR) -> HRESULT;
     unsafe fn set_device_format(&self, a: PCWSTR, b: *mut c_void, c: *mut c_void) -> HRESULT;
-    unsafe fn get_processing_period(
-        &self,
-        a: PCWSTR,
-        b: i32,
-        c: *mut i64,
-        d: *mut i64,
-    ) -> HRESULT;
+    unsafe fn get_processing_period(&self, a: PCWSTR, b: i32, c: *mut i64, d: *mut i64) -> HRESULT;
     unsafe fn set_processing_period(&self, a: PCWSTR, b: *mut i64) -> HRESULT;
     unsafe fn get_share_mode(&self, a: PCWSTR, b: *mut c_void) -> HRESULT;
     unsafe fn set_share_mode(&self, a: PCWSTR, b: *mut c_void) -> HRESULT;
@@ -481,7 +474,10 @@ mod tests {
     }
 
     fn dev(id: &str, name: &str) -> OutputDevice {
-        OutputDevice { id: id.into(), name: name.into() }
+        OutputDevice {
+            id: id.into(),
+            name: name.into(),
+        }
     }
 
     impl AudioBackend for Fake {
@@ -514,7 +510,11 @@ mod tests {
 
     fn fake() -> Fake {
         Fake {
-            devices: vec![dev("c", "Speakers"), dev("a", "headphones"), dev("b", "HDMI")],
+            devices: vec![
+                dev("c", "Speakers"),
+                dev("a", "headphones"),
+                dev("b", "HDMI"),
+            ],
             default: RefCell::new(Some("c".into())),
             switch: true,
             ..Default::default()

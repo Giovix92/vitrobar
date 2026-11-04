@@ -2,12 +2,12 @@
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
-use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 use windows::Win32::Globalization::{
     GetDateFormatEx, GetLocaleInfoEx, GetTimeFormatEx, DATE_SHORTDATE, LOCALE_IFIRSTDAYOFWEEK,
     TIME_NOSECONDS,
 };
 use windows::Win32::System::SystemInformation::GetLocalTime;
+use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 
 fn wide_to_string(buf: &[u16], n: i32) -> String {
     // The returned count includes the terminating NUL; 0 means failure.
@@ -166,6 +166,10 @@ mod tests {
         let b = local_short_time(1_793_469_600 + 3600);
         assert!(!a.is_empty() && !b.is_empty());
         assert_ne!(a, b);
-        assert_eq!(a, local_short_time(1_793_469_600 + 20), "seconds are not shown");
+        assert_eq!(
+            a,
+            local_short_time(1_793_469_600 + 20),
+            "seconds are not shown"
+        );
     }
 }

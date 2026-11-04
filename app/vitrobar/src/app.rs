@@ -38,7 +38,6 @@ use vitro_core::clock::ms_until_next_minute;
 use vitro_core::i18n::{lang_from_tag, tr, Key, Lang};
 use vitro_core::image::BgraImage;
 use vitro_core::key_hook::HookOutput;
-use vitro_core::widgets::{on_pill_glyph, MusicAction};
 use vitro_core::layout::{
     anchor_for, compute_layout, diff_monitors, metrics, AnchorTarget, BarLayout, LayoutInput, Rect,
 };
@@ -48,6 +47,7 @@ use vitro_core::settings_ui::ControlId;
 use vitro_core::start_layout::{panel_layout, place_panel};
 use vitro_core::style::{hover_style, material_style, HoverStyle, MaterialStyle, Rgba, Theme};
 use vitro_core::tray_model::{split_promoted, TrayIcon};
+use vitro_core::widgets::{on_pill_glyph, MusicAction};
 use vitro_core::windows_model::{
     build_groups, click_action, AppGroup, ClickAction, GroupKey, Hwnd,
 };
@@ -95,18 +95,18 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetKeyState, VK_CONTROL, VK_ESCAPE, VK_F4, VK_MENU, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetCursorPos, GetForegroundWindow, GetMessagePos,
-    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, KillTimer,
-    MsgWaitForMultipleObjectsEx, PeekMessageW, PostMessageW, PostQuitMessage, PostThreadMessageW,
-    SetForegroundWindow, SetTimer, TranslateMessage, MSG, MWMO_INPUTAVAILABLE,
-    PM_REMOVE, QS_ALLINPUT, WM_CHAR, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-    WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NULL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SYSKEYDOWN,
+    DispatchMessageW, GetCursorPos, GetForegroundWindow, GetMessagePos, GetWindowThreadProcessId,
+    IsIconic, IsWindow, IsWindowVisible, KillTimer, MsgWaitForMultipleObjectsEx, PeekMessageW,
+    PostMessageW, PostQuitMessage, PostThreadMessageW, SetForegroundWindow, SetTimer,
+    TranslateMessage, MSG, MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT, WM_CHAR, WM_KEYDOWN,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_NULL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
 };
 
 use crate::bar_window::{
     create_bar_window, hit_test, mouse_pos, track_leave, BarWindow, Hit, MarginMode, PxRect,
 };
+use crate::calendar_panel::{CalendarPanel, Outcome as CalOutcome};
 use crate::icon_loader::{IconLoader, IconSrc, Lookup, TrayImage, MAX_ICON_PX};
 use crate::keys::{
     activation_ends_focus, first_in, launch_action, open_start_fresh, step, Counts, Focus, Keys,
@@ -115,23 +115,23 @@ use crate::keys::{
 use crate::launcher::{Job, Launcher};
 use crate::menus::{app_menu, bar_menu, power_menu, start_item_menu, MenuChoice, MenuCtx};
 use crate::notify::{
-    inbox_pending, take_inbox, Inbox, NotifyWindow, TIMER_CALENDAR_MIDNIGHT, TIMER_CLAUDE_MINUTE, TIMER_CLAUDE_STALE, TIMER_CLOCK, TIMER_IME, TIMER_GPU_RETRY, TIMER_HOVER_HIDE,
-    TIMER_HOVER_SHOW, TIMER_MARGIN_COLLAPSE, TIMER_QUICK_BT, TIMER_QUICK_SCAN, TIMER_REASSERT,
+    inbox_pending, take_inbox, Inbox, NotifyWindow, TIMER_CALENDAR_MIDNIGHT, TIMER_CLAUDE_MINUTE,
+    TIMER_CLAUDE_STALE, TIMER_CLOCK, TIMER_GPU_RETRY, TIMER_HOVER_HIDE, TIMER_HOVER_SHOW,
+    TIMER_IME, TIMER_MARGIN_COLLAPSE, TIMER_QUICK_BT, TIMER_QUICK_SCAN, TIMER_REASSERT,
     TIMER_START_CLOSED, TIMER_START_PREFETCH, TIMER_TRAY_TIP, WM_APP_TAKE_OVER,
 };
-use crate::calendar_panel::{CalendarPanel, Outcome as CalOutcome};
-use crate::widgets::{Claude, ClaudePanel, Music, MusicPanel, Outcome as MusicOutcome};
-use vitro_core::settings_ui::set_claude_hint;
-use vitro_win::claude_usage::{self, Wrap};
-use vitro_win::tray_host::{set_icon_rects, IconRects};
-use vitro_core::ime::ime_short_name;
 use crate::quick::{Gfx, Outcome as QuickOutcome, QuickPanel};
 use crate::settings_window::{apply_choice, Effect, SettingsAction, SettingsInput, SettingsWindow};
 use crate::shell::{self, StockGuard};
 use crate::start::{
     launch_job, same_app, Look, MenuItem, StartAction, StartData, StartInput, StartPanel,
 };
+use crate::widgets::{Claude, ClaudePanel, Music, MusicPanel, Outcome as MusicOutcome};
 use crate::window_set::WindowSet;
+use vitro_core::ime::ime_short_name;
+use vitro_core::settings_ui::set_claude_hint;
+use vitro_win::claude_usage::{self, Wrap};
+use vitro_win::tray_host::{set_icon_rects, IconRects};
 
 /// Command-line options for the bar process.
 #[derive(Debug, Clone, Default)]
@@ -2035,11 +2035,19 @@ impl App {
             self.calendar_event(|c, g| c.on_mouse(msg, g));
             return true;
         }
-        if self.music_panel.as_ref().is_some_and(|p| p.hwnd() == msg.hwnd) {
+        if self
+            .music_panel
+            .as_ref()
+            .is_some_and(|p| p.hwnd() == msg.hwnd)
+        {
             self.music_event(|p, _| p.on_mouse(msg));
             return true;
         }
-        if self.claude_panel.as_ref().is_some_and(|p| p.hwnd() == msg.hwnd) {
+        if self
+            .claude_panel
+            .as_ref()
+            .is_some_and(|p| p.hwnd() == msg.hwnd)
+        {
             self.claude_event(|p, _| p.on_mouse(msg));
             return true;
         }
@@ -2509,14 +2517,22 @@ impl App {
             self.on_calendar_key(msg);
             return true;
         }
-        if self.music_panel.as_ref().is_some_and(|p| p.hwnd() == msg.hwnd) {
+        if self
+            .music_panel
+            .as_ref()
+            .is_some_and(|p| p.hwnd() == msg.hwnd)
+        {
             let vk = msg.wParam.0 as u16;
             // SAFETY: plain query of this thread's keyboard state.
             let shift = unsafe { GetKeyState(i32::from(VK_SHIFT.0)) < 0 };
             self.music_event(|p, _| p.on_key(vk, shift));
             return true;
         }
-        if self.claude_panel.as_ref().is_some_and(|p| p.hwnd() == msg.hwnd) {
+        if self
+            .claude_panel
+            .as_ref()
+            .is_some_and(|p| p.hwnd() == msg.hwnd)
+        {
             let vk = msg.wParam.0 as u16;
             self.claude_event(|p, _| p.on_key(vk));
             return true;
@@ -4177,7 +4193,11 @@ impl App {
 
     /// Alt+F4 on the music panel; false for anything else.
     fn on_music_msg(&mut self, msg: &MSG) -> bool {
-        if !self.music_panel.as_ref().is_some_and(|p| p.hwnd() == msg.hwnd) {
+        if !self
+            .music_panel
+            .as_ref()
+            .is_some_and(|p| p.hwnd() == msg.hwnd)
+        {
             return false;
         }
         if msg.message == WM_SYSKEYDOWN && msg.wParam.0 == usize::from(VK_F4.0) {
@@ -4448,7 +4468,11 @@ impl App {
 
     /// Alt+F4 on the Claude panel; false for anything else.
     fn on_claude_msg(&mut self, msg: &MSG) -> bool {
-        if !self.claude_panel.as_ref().is_some_and(|p| p.hwnd() == msg.hwnd) {
+        if !self
+            .claude_panel
+            .as_ref()
+            .is_some_and(|p| p.hwnd() == msg.hwnd)
+        {
             return false;
         }
         if msg.message == WM_SYSKEYDOWN && msg.wParam.0 == usize::from(VK_F4.0) {

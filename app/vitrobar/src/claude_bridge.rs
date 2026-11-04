@@ -16,14 +16,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use vitro_core::widgets::parse_statusline;
 use vitro_win::claude_usage::{data_dir, data_path, save_at, status_shell, StatusShell};
 use windows::Win32::Foundation::{
-    CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS,
+    CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAGS, HANDLE_FLAG_INHERIT,
 };
 use windows::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 use windows::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject, TerminateJobObject,
-    JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE};
@@ -151,9 +151,7 @@ fn previous_output(cmd: &str, input: &[u8], deadline: Instant) -> Vec<u8> {
         }
         return out;
     }
-    cache
-        .and_then(|p| load_prev_output(&p, cmd))
-        .unwrap_or(out)
+    cache.and_then(|p| load_prev_output(&p, cmd)).unwrap_or(out)
 }
 
 /// The last complete output of the previous status line, with the command that printed it.
@@ -230,7 +228,9 @@ fn run_previous(cmd: &str, input: &[u8], deadline: Instant) -> (Vec<u8>, bool) {
         std::thread::spawn(move || {
             let mut chunk = [0u8; 4096];
             while let Ok(n @ 1..) = stdout.read(&mut chunk) {
-                got.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(&chunk[..n]);
+                got.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend_from_slice(&chunk[..n]);
             }
             let _ = tx.send(());
         });
@@ -262,7 +262,10 @@ mod tests {
 
     #[test]
     fn the_minimal_line_is_the_model_name() {
-        assert_eq!(minimal_line(r#"{"model":{"display_name":"Opus"}}"#), "Opus\n");
+        assert_eq!(
+            minimal_line(r#"{"model":{"display_name":"Opus"}}"#),
+            "Opus\n"
+        );
         assert_eq!(minimal_line(r#"{"model":{}}"#), "");
         assert_eq!(minimal_line("garbage"), "");
     }

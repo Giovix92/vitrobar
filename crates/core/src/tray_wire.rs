@@ -291,14 +291,20 @@ mod icon_rect_tests {
         };
         let promoted = [(a, (10, 0, 30, 40)), (b, (30, 0, 50, 40))];
         let chevron = Some((0, 0, 10, 40));
-        assert_eq!(icon_rect_for(&a, &promoted, &[c], chevron), Some((10, 0, 30, 40)));
+        assert_eq!(
+            icon_rect_for(&a, &promoted, &[c], chevron),
+            Some((10, 0, 30, 40))
+        );
         // By GUID, whatever window the caller names.
         let by_guid = TrayIconId {
             hwnd: 0,
             uid: 0,
             guid: Some(g),
         };
-        assert_eq!(icon_rect_for(&by_guid, &promoted, &[c], chevron), Some((30, 0, 50, 40)));
+        assert_eq!(
+            icon_rect_for(&by_guid, &promoted, &[c], chevron),
+            Some((30, 0, 50, 40))
+        );
         assert_eq!(icon_rect_for(&c, &promoted, &[c], chevron), chevron);
         let unknown = TrayIconId {
             hwnd: 4,
