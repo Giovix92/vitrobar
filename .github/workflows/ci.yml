@@ -20,6 +20,10 @@ jobs:
         with:
           name: vitrobar-x64
           path: target/x86_64-pc-windows-msvc/release/vitrobar.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vitrobar-arm64
+          path: target/aarch64-pc-windows-msvc/release/vitrobar.exe
 
   perf:
     needs: build

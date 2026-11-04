@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vitrobar — a glass taskbar for Windows 11</title>
+<meta name="description" content="Vitrobar replaces the Windows 11 taskbar with a frosted-glass bar: your apps, a Start panel, quick settings, a calendar and optional widgets. Free and open source.">
+<link rel="icon" href="favicon.ico">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --ink: #0e1b2c;
+    --lake: #2b5f8a;
+    --mist: #6e8ca8;
+    --frost: #f2f5f8;
+    --amber: #e8b04b;
+    --paper: #f7f8fa;
+    --text: #17222f;
+    --muted: #4c5d70;
+    --rule: #d5dde6;
+    --measure: 64ch;
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    overflow-x: clip;
+    background: var(--paper);
+    color: var(--text);
+    font-family: "Familjen Grotesk", system-ui, sans-serif;
+    font-size: 1.0625rem;
+    line-height: 1.55;
+  }
+  a { color: var(--lake); text-underline-offset: 0.18em; }
+  a:hover { color: var(--ink); }
+  :focus-visible { outline: 3px solid var(--amber); outline-offset: 3px; border-radius: 4px; }
+
+  /* ---- the desktop: wallpaper, headline and the bar ---------------------------------- */
+  .desktop {
+    position: relative;
+    min-height: clamp(640px, 100svh, 1000px);
+    display: flex;
+    flex-direction: column;
+    color: var(--frost);
+    overflow: hidden;
+    background:
+      radial-gradient(60% 45% at 78% 22%, rgba(232, 176, 75, 0.55), transparent 70%),
+      radial-gradient(50% 40% at 18% 70%, rgba(110, 140, 168, 0.55), transparent 70%),
+      radial-gradient(80% 60% at 60% 110%, rgba(43, 95, 138, 0.9), transparent 70%),
+      linear-gradient(170deg, #1d3550 0%, #0e1b2c 55%, #0a1422 100%);
+  }
+  /* The far shore: two soft ridges low on the wallpaper, so the glass has something to blur. */
+  .desktop::before, .desktop::after {
+    content: "";
+    position: absolute;
+    left: -10%;
+    right: -10%;
+    border-radius: 50% 50% 0 0;
+    pointer-events: none;
+  }
+  .desktop::before { bottom: 18%; height: 22%; background: #16304a; filter: blur(1px); }
+  .desktop::after { bottom: 0; height: 22%; background: linear-gradient(#2b5f8a, #0e1b2c); opacity: 0.85; }
+
+  .intro {
+    position: relative;
+    z-index: 1;
+    width: min(1120px, 100% - 32px);
+    margin: 0 auto;
+    padding: clamp(40px, 9vh, 112px) 0 32px;
+  }
+  .brand { display: flex; align-items: center; gap: 12px; font-weight: 600; font-size: 1.125rem; }
+  .brand img { width: 32px; height: 32px; }
+  h1 {
+    margin: clamp(32px, 7vh, 80px) 0 20px;
+    font-size: clamp(2.6rem, 7.2vw, 5.6rem);
+    line-height: 0.98;
+    letter-spacing: -0.035em;
+    font-weight: 700;
+    max-width: 12ch;
+  }
+  .lede { max-width: 46ch; font-size: clamp(1.1rem, 1.6vw, 1.3rem); color: #d9e2ec; margin: 0 0 32px; }
+  .actions { display: flex; flex-wrap: wrap; gap: 12px; }
+  .btn {
+    display: inline-block;
+    padding: 12px 22px;
+    border-radius: 999px;
+    font-weight: 600;
+    text-decoration: none;
+    border: 1px solid rgba(242, 245, 248, 0.45);
+    color: var(--frost);
+  }
+  .btn:hover { background: rgba(242, 245, 248, 0.12); color: var(--frost); }
+  .btn.primary { background: var(--amber); border-color: var(--amber); color: var(--ink); }
+  .btn.primary:hover { background: #f2c46d; color: var(--ink); }
+  .note { margin: 14px 0 0; font-size: 0.9rem; color: #b9c6d4; }
+
+  /* The controls that restyle the bar, as Vitrobar's own settings do. */
+  .tweak {
+    position: relative;
+    z-index: 1;
+    width: min(1120px, 100% - 32px);
+    margin: auto auto 0;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px 28px;
+    align-items: center;
+    padding-bottom: 20px;
+    font-size: 0.95rem;
+  }
+  .tweak fieldset { border: 0; margin: 0; padding: 0; display: flex; gap: 4px; align-items: center; flex-wrap: wrap; }
+  .tweak legend { float: left; margin-right: 8px; color: #c3cfdb; }
+  .tweak button {
+    font: inherit;
+    color: var(--frost);
+    background: rgba(242, 245, 248, 0.08);
+    border: 1px solid rgba(242, 245, 248, 0.25);
+    border-radius: 999px;
+    padding: 5px 14px;
+    cursor: pointer;
+  }
+  .tweak button[aria-pressed="true"] { background: var(--frost); color: var(--ink); border-color: var(--frost); }
+
+  .stage { position: relative; z-index: 1; padding: 0 16px 14px; }
+  .bar {
+    color: #fff;
+    --glass: rgba(242, 245, 248, 0.16);
+    --edge: rgba(255, 255, 255, 0.35);
+    --fg: #ffffff;
+    display: flex;
+    justify-content: center;
+    gap: 10px;
+    margin: 0 auto;
+    transition: max-width 220ms ease;
+  }
+  .bar[data-material="smoked"] { --glass: rgba(14, 22, 32, 0.55); --edge: rgba(255, 255, 255, 0.14); }
+  /* The glass: the whole bar in Pill and Full, each island in Islands. */
+  .bar[data-shape="pill"], .bar[data-shape="full"], .bar[data-shape="islands"] .group {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    height: 52px;
+    padding: 0 6px;
+    background: var(--glass);
+    border: 1px solid var(--edge);
+    border-radius: 26px;
+    backdrop-filter: blur(22px) saturate(160%);
+    -webkit-backdrop-filter: blur(22px) saturate(160%);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.28), 0 12px 32px rgba(5, 10, 20, 0.35);
+    color: var(--fg);
+  }
+  .bar .group { display: contents; }
+  .bar[data-shape="pill"] { width: fit-content; max-width: 100%; }
+  .bar[data-shape="pill"] .apps-wrap > :first-child { margin-left: 10px; }
+  .bar[data-shape="pill"] .apps-wrap > :last-child { margin-right: 10px; }
+  .bar[data-shape="islands"] { justify-content: space-between; }
+  .bar[data-shape="full"] { margin: 0 -16px -14px; border-radius: 0; border-width: 1px 0 0; }
+  .bar[data-shape="full"] .spacer { flex: 1; }
+  .spacer { display: none; }
+  .bar[data-shape="full"] .spacer { display: block; }
+
+  .item { width: 40px; height: 40px; display: grid; place-items: center; border-radius: 8px; position: relative; }
+  .item:hover { background: rgba(255, 255, 255, 0.16); }
+  .item svg { width: 18px; height: 18px; }
+  /* App icons: abstract tiles, not real apps. */
+  .app::before { content: ""; width: 24px; height: 24px; border-radius: 6px; background: var(--c); }
+  .app.open::after {
+    content: ""; position: absolute; bottom: 3px; width: 4px; height: 4px; border-radius: 2px;
+    background: rgba(255, 255, 255, 0.75);
+  }
+  .app.active::after { width: 12px; background: var(--amber); }
+  .clock { padding: 0 10px; text-align: right; font-size: 0.75rem; line-height: 1.25; font-variant-numeric: tabular-nums; }
+  .pillw {
+    height: 40px; display: flex; align-items: center; gap: 6px; padding: 0 10px; border-radius: 8px;
+    font-size: 0.8rem; white-space: nowrap;
+  }
+  .caption { text-align: center; margin: 10px 0 0; font-size: 0.8rem; color: #9fb0c2; }
+  .bar[data-shape="full"] + .caption { display: none; }
+
+  /* ---- the page below ------------------------------------------------------------------ */
+  main { width: min(1120px, 100% - 32px); margin: 0 auto; padding: 72px 0 48px; }
+  section { padding: 40px 0; border-top: 1px solid var(--rule); display: grid; grid-template-columns: 1fr 2fr; gap: 16px 48px; }
+  section:first-child { border-top: 0; padding-top: 0; }
+  h2 { margin: 0; font-size: 1.6rem; line-height: 1.15; letter-spacing: -0.015em; font-weight: 600; }
+  .body { max-width: var(--measure); }
+  .body p { margin: 0 0 1em; }
+  dl { margin: 0; display: grid; grid-template-columns: 1fr 1fr; gap: 24px 40px; }
+  dt { font-weight: 600; margin-bottom: 4px; }
+  dd { margin: 0; color: var(--muted); }
+  ol { margin: 0; padding-left: 1.3em; }
+  ol li { margin-bottom: 0.7em; padding-left: 0.3em; }
+  ol li::marker { color: var(--lake); font-weight: 600; }
+  kbd, code { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 0.9em; background: #e8edf2; padding: 1px 6px; border-radius: 4px; }
+  footer .links { display: flex; gap: 20px; }
+  footer { width: min(1120px, 100% - 32px); margin: 0 auto; padding: 28px 0 48px; border-top: 1px solid var(--rule); color: var(--muted); font-size: 0.95rem; display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px; }
+
+  @media (max-width: 760px) {
+    section { grid-template-columns: 1fr; }
+    dl { grid-template-columns: 1fr; }
+    .bar .app:nth-child(n+5), .bar .pillw, .bar .tray-icon { display: none; }
+  }
+  @media (max-width: 480px) {
+    .bar[data-shape="islands"] .apps-wrap { display: none; }
+  }
+  @media (prefers-reduced-motion: reduce) { .bar { transition: none; } }
+</style>
+</head>
+<body>
+
+<div class="desktop">
+  <header class="intro">
+    <div class="brand"><img src="favicon.ico" alt=""> Vitrobar</div>
+    <h1>A glass taskbar for Windows&nbsp;11.</h1>
+    <p class="lede">Vitrobar replaces the stock taskbar with a frosted bar of its own: your apps, a Start panel, quick settings, a calendar and a few optional widgets. Free, open source, and it gives the Windows taskbar back the moment you quit.</p>
+    <div class="actions">
+      <a class="btn primary" href="https://github.com/Giovix92/vitrobar/releases/latest">Download for Windows</a>
+      <a class="btn" href="https://github.com/Giovix92/vitrobar">Source on GitHub</a>
+    </div>
+    <p class="note">x64 and ARM64. Early preview: the builds are not signed yet, so Windows SmartScreen asks before the first run.</p>
+  </header>
+
+  <form class="tweak" aria-label="Try the bar's look" onsubmit="return false">
+    <fieldset data-set="shape">
+      <legend>Shape</legend>
+      <button type="button" value="pill" aria-pressed="true">Pill</button>
+      <button type="button" value="islands" aria-pressed="false">Islands</button>
+      <button type="button" value="full" aria-pressed="false">Full width</button>
+    </fieldset>
+    <fieldset data-set="material">
+      <legend>Material</legend>
+      <button type="button" value="frosted" aria-pressed="true">Frosted</button>
+      <button type="button" value="smoked" aria-pressed="false">Smoked</button>
+    </fieldset>
+  </form>
+
+  <div class="stage">
+    <div class="bar" id="bar" data-shape="pill" data-material="frosted" role="img"
+         aria-label="Illustration of the Vitrobar taskbar: Start button, open apps, music widget, tray icons, quick settings and clock">
+      <div class="group start-wrap">
+        <span class="item" aria-hidden="true">
+          <svg viewBox="0 0 18 18" fill="currentColor"><rect x="1" y="1" width="7" height="7" rx="1.5"/><rect x="10" y="1" width="7" height="7" rx="1.5"/><rect x="1" y="10" width="7" height="7" rx="1.5"/><rect x="10" y="10" width="7" height="7" rx="1.5"/></svg>
+        </span>
+      </div>
+      <span class="spacer" aria-hidden="true"></span>
+      <div class="group apps-wrap">
+        <span class="item app open active" style="--c:#7fb2e0" aria-hidden="true"></span>
+        <span class="item app open" style="--c:#e8b04b" aria-hidden="true"></span>
+        <span class="item app" style="--c:#9cc79a" aria-hidden="true"></span>
+        <span class="item app open" style="--c:#d98a8a" aria-hidden="true"></span>
+        <span class="item app" style="--c:#b9a2e0" aria-hidden="true"></span>
+        <span class="item app open" style="--c:#e6e9ee" aria-hidden="true"></span>
+      </div>
+      <span class="spacer" aria-hidden="true"></span>
+      <div class="group tray-wrap">
+        <span class="pillw" aria-hidden="true">
+          <svg viewBox="0 0 18 18" width="14" height="14" fill="currentColor"><rect x="4" y="3" width="3" height="12" rx="1"/><rect x="11" y="3" width="3" height="12" rx="1"/></svg>
+          Night Drive — Lake Room
+        </span>
+        <span class="item tray-icon" aria-hidden="true">
+          <svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M5 7l4 4 4-4"/></svg>
+        </span>
+        <span class="item" aria-hidden="true">
+          <svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M2 7.5a10 10 0 0 1 14 0"/><path d="M4.5 10a6.5 6.5 0 0 1 9 0"/><circle cx="9" cy="13" r="1.2" fill="currentColor"/></svg>
+        </span>
+        <span class="clock" aria-hidden="true"><span id="time">12:34</span><br><span id="date">04/11/2026</span></span>
+      </div>
+    </div>
+    <p class="caption">An illustration of the bar. Try the shapes and materials above.</p>
+  </div>
+</div>
+
+<main>
+  <section>
+    <h2>What it does</h2>
+    <dl class="body">
+      <div><dt>The bar</dt><dd>Pinned and open apps with window dots, thumbnails on hover, tray icons with an overflow, and a clock. Pill, islands or full width; top or bottom; one bar per monitor.</dd></div>
+      <div><dt>Start</dt><dd>Its own Start panel: pinned apps, recent files, all apps, and search over apps, settings pages and files, with a calculator in the search box.</dd></div>
+      <div><dt>Quick settings</dt><dd>Volume and output device, brightness, Wi-Fi, Bluetooth, battery and power mode, in a glass panel above the button.</dd></div>
+      <div><dt>Calendar</dt><dd>A month view on the clock, and a button to the Windows notification centre.</dd></div>
+      <div><dt>Widgets</dt><dd>Off until you turn them on: the music playing now, with play, pause and skip, and your Claude 5-hour and weekly limits, read from Claude Code's own status line.</dd></div>
+      <div><dt>Keyboard</dt><dd>The Windows key opens Vitrobar's Start; Win+1…9, Win+T and Win+B work on the bar. English and Italian.</dd></div>
+    </dl>
+  </section>
+
+  <section>
+    <h2>Light on your PC</h2>
+    <div class="body">
+      <p>Idle, Vitrobar uses about 16&nbsp;MB of memory and no CPU, with both widgets on. Nothing polls in the background: the bar wakes only when Windows tells it something changed.</p>
+      <p>It never changes Windows for good. A small watchdog brings the stock taskbar back at once if the bar crashes, and quitting Vitrobar leaves the taskbar exactly as it was.</p>
+    </div>
+  </section>
+
+  <section>
+    <h2>Private by design</h2>
+    <div class="body">
+      <p>No account, no server, no telemetry. Vitrobar makes no network connections of its own. The Claude widget never reads your Claude login: it only reads what Claude Code already shows in its status line.</p>
+    </div>
+  </section>
+
+  <section>
+    <h2>Install</h2>
+    <div class="body">
+      <ol>
+        <li>Download the zip for your PC from the <a href="https://github.com/Giovix92/vitrobar/releases/latest">latest release</a>: <code>x64</code> for most PCs, <code>arm64</code> for Snapdragon laptops.</li>
+        <li>Unzip it anywhere and run <code>vitrobar.exe</code>. The bar appears and the Windows taskbar steps aside.</li>
+        <li>Right-click the bar for its settings. To stop, choose “Exit Vitrobar”: the Windows taskbar comes back.</li>
+      </ol>
+      <p>Vitrobar starts with Windows by default; turn that off in its settings.</p>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <span>Vitrobar is free software under the GNU GPL v3.</span>
+  <span class="links"><a href="https://github.com/Giovix92/vitrobar">GitHub</a> <a href="https://github.com/Giovix92/vitrobar/issues">Report a problem</a></span>
+</footer>
+
+<script>
+  // The look controls: one choice per group, applied to the bar.
+  const bar = document.getElementById("bar");
+  document.querySelectorAll(".tweak fieldset").forEach((set) => {
+    set.addEventListener("click", (e) => {
+      const b = e.target.closest("button");
+      if (!b) return;
+      set.querySelectorAll("button").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
+      bar.dataset[set.dataset.set] = b.value;
+    });
+  });
+  // ?shape=islands&material=smoked opens the page with that look.
+  const params = new URLSearchParams(location.search);
+  document.querySelectorAll(".tweak fieldset").forEach((set) => {
+    const want = params.get(set.dataset.set);
+    const b = want && set.querySelector(`button[value="${CSS.escape(want)}"]`);
+    if (b) b.click();
+  });
+  // The clock shows the visitor's own time and date, in their format.
+  function tick() {
+    const now = new Date();
+    document.getElementById("time").textContent = now.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    document.getElementById("date").textContent = now.toLocaleDateString();
+    setTimeout(tick, 60000 - (now.getSeconds() * 1000 + now.getMilliseconds()));
+  }
+  tick();
+</script>
+</body>
+</html>

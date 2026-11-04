@@ -22,7 +22,7 @@ pub const ACCENT_SWATCHES: &[Option<u32>] = &[
 
 pub const LICENSE_URL: &str = "https://www.gnu.org/licenses/gpl-3.0.html";
 /// Placeholder until the repository exists; update when it is pushed.
-pub const SOURCE_URL: &str = "https://github.com/vitrobar/vitrobar";
+pub const SOURCE_URL: &str = "https://github.com/Giovix92/vitrobar";
 
 const PAD: f32 = 24.0;
 const ROW_H: f32 = 48.0;
