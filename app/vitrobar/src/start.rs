@@ -54,6 +54,8 @@ pub const CATALOG_MAX_AGE: Duration = Duration::from_secs(60);
 const CATALOG_RETRY_DELAY: Duration = Duration::from_secs(3);
 /// The account page the account button opens.
 pub const ACCOUNT_URI: &str = "ms-settings:yourinfo";
+/// Settings › Personalization › Start, where "Show recently opened items" is.
+const RECENT_SETTINGS_URI: &str = "ms-settings:personalization-start";
 /// Icons in the full-screen grid are drawn this big.
 pub const GRID_ICON_DIP: f32 = 48.0;
 /// Alpha (of 255) the full-screen grid's frosted tint gets: 0.12.
@@ -149,6 +151,8 @@ pub enum Target {
     AllApps,
     Pin(usize),
     Recent(usize),
+    /// "Recent files are off": opens Windows' Start settings, where they are turned on.
+    RecentOff,
     Account,
     Power,
     Result(usize),
@@ -456,6 +460,8 @@ pub struct StartCtx<'a> {
     pub apps: &'a [Pin],
     pub rows: &'a [ListRow],
     pub recent: &'a [RecentFile],
+    /// Windows tracks recent files ("Show recently opened items" is on).
+    pub recent_enabled: bool,
     pub files: &'a [FileHit],
     /// The results, in display order (the list scrolls).
     pub results: &'a [ResultKind],
@@ -681,6 +687,7 @@ impl StartState {
                     .recent
                     .get(i)
                     .map_or(StartAction::None, |f| StartAction::Open(f.path.clone())),
+                Some(Target::RecentOff) => StartAction::Open(RECENT_SETTINGS_URI.to_string()),
                 Some(Target::Account) => StartAction::Open(ACCOUNT_URI.to_string()),
                 Some(Target::Power) => {
                     let r = ctx.geom.power;
@@ -913,6 +920,13 @@ impl StartState {
                 }
                 if let Some(i) = g.pins.iter().position(|&r| contains(r, pt)) {
                     return (i < ctx.pins_shown()).then_some(Target::Pin(i));
+                }
+                if !ctx.recent_enabled {
+                    return g
+                        .recent
+                        .first()
+                        .is_some_and(|&r| contains(r, pt))
+                        .then_some(Target::RecentOff);
                 }
                 let n = ctx.recent.len().min(g.recent.len());
                 g.recent[..n]
@@ -1386,6 +1400,7 @@ impl StartPanel {
             apps: &data.apps,
             rows: &data.rows,
             recent: &data.recent,
+            recent_enabled: data.recent_enabled,
             files: &self.files,
             results: &self.results,
             lang,
@@ -1461,6 +1476,7 @@ impl StartPanel {
                 apps: &data.apps,
                 rows: &data.rows,
                 recent: &data.recent,
+                recent_enabled: data.recent_enabled,
                 files: &self.files,
                 results: &self.results,
                 lang,
@@ -1780,7 +1796,17 @@ impl StartPanel {
         if !g.recent.is_empty() {
             items.push(self.text(tr(look.lang, Key::Recent), title, 14.0, t, false));
         }
-        if !data.recent_enabled || data.recent.is_empty() {
+        if !data.recent_enabled {
+            // As Windows' own Start: say why the list is empty and lead to the switch.
+            if let Some(r) = g.recent.first() {
+                if let Some(p) = self.hover_plate(Target::RecentOff, *r, look) {
+                    items.push(p);
+                }
+                let inset = self.px(12.0);
+                let line = (r.0 + inset, r.1, r.2 - inset, r.3);
+                items.push(self.text(tr(look.lang, Key::RecentOff), line, 12.0, dim, false));
+            }
+        } else if data.recent.is_empty() {
             if let Some(r) = g.recent.first() {
                 items.push(self.text(tr(look.lang, Key::NoRecent), *r, 12.0, dim, false));
             }
@@ -2171,6 +2197,7 @@ mod tests {
                 apps: &self.apps,
                 rows: &self.rows,
                 recent: &self.recent,
+                recent_enabled: true,
                 files: &self.files,
                 results: &self.results,
                 lang: Lang::En,

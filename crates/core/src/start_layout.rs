@@ -163,7 +163,8 @@ pub fn grid_layout(work_area: Rect, app_count: usize) -> GridLayout {
     }
 }
 
-/// Places the panel centred on `anchor` (the Start button), 12 DIP away from it (above for a
+/// Places the panel with its left edge on `anchor`'s (the Start button: the panel grows out
+/// of the button that opened it, wherever the bar puts it), 12 DIP away from it (above for a
 /// bottom bar, below for a top bar), clamped inside `work_area` with an 8 DIP margin. Too
 /// little room shrinks it, but never below 400x480; if even that does not fit, the panel takes
 /// the work area's size.
@@ -181,12 +182,7 @@ pub fn place_panel(anchor: Rect, position: Position, work_area: Rect) -> Rect {
         .min(work_area.h - 2.0 * EDGE_MARGIN)
         .max(MIN_PANEL_H)
         .min(work_area.h);
-    let x = clamp_into(
-        anchor.x + anchor.w / 2.0 - w / 2.0,
-        work_area.x,
-        work_area.w,
-        w,
-    );
+    let x = clamp_into(anchor.x, work_area.x, work_area.w, w);
     let y_pref = match position {
         Position::Bottom => anchor.y - PANEL_GAP - h,
         Position::Top => anchor.bottom() + PANEL_GAP,
@@ -354,10 +350,14 @@ mod tests {
     }
 
     #[test]
-    fn place_panel_centres_on_anchor_when_room() {
-        let a = rect(900.0, 980.0, 40.0, 40.0);
+    fn place_panel_lines_up_with_the_start_button() {
+        let a = rect(300.0, 980.0, 40.0, 40.0);
         let r = place_panel(a, Position::Bottom, wa());
-        assert_eq!(r.x + r.w / 2.0, 920.0);
+        assert_eq!(r.x, 300.0);
+        // Near the right edge it is pushed back inside.
+        let far = rect(wa().right() - 50.0, 980.0, 40.0, 40.0);
+        let r = place_panel(far, Position::Bottom, wa());
+        assert_eq!(r.right(), wa().right() - 8.0);
     }
 
     #[test]

@@ -31,6 +31,8 @@ pub const THUMB_DIP: f32 = 16.0;
 pub const MORE_SHARE: f32 = 0.4;
 /// Width of a header action button.
 pub const HEADER_ACTION_W_DIP: f32 = 32.0;
+/// Width of an icon-only button next to text buttons (a row of icons only shares it evenly).
+pub const ICON_BUTTON_W_DIP: f32 = 48.0;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Row {
@@ -223,18 +225,22 @@ pub fn layout(rows: &[Row]) -> PanelLayout {
                 },
             )),
             Row::Buttons(btns) if !btns.is_empty() => {
+                let icon = |b: &Button| b.text.is_empty() && b.glyph.is_some();
                 let n = btns.len() as f32;
-                let w = (inner - (n - 1.0) * GAP_DIP) / n;
-                for (i, b) in btns.iter().enumerate() {
-                    parts.push((
-                        Part::Button(b.id),
-                        Rect {
-                            x: PAD_DIP + i as f32 * (w + GAP_DIP),
-                            y,
-                            w,
-                            h,
-                        },
-                    ));
+                let n_icon = btns.iter().filter(|b| icon(b)).count() as f32;
+                let free = inner - (n - 1.0) * GAP_DIP;
+                // Icons next to text keep a fixed width; text buttons share the rest.
+                let (icon_w, text_w) = if n_icon == 0.0 || n_icon == n {
+                    (free / n, free / n)
+                } else {
+                    let iw = ICON_BUTTON_W_DIP;
+                    (iw, ((free - n_icon * iw) / (n - n_icon)).max(0.0))
+                };
+                let mut x = PAD_DIP;
+                for b in btns {
+                    let w = if icon(b) { icon_w } else { text_w };
+                    parts.push((Part::Button(b.id), Rect { x, y, w, h }));
+                    x += w + GAP_DIP;
                 }
             }
             Row::Custom { id, .. } => parts.push((
@@ -304,6 +310,32 @@ pub fn focus_step(l: &PanelLayout, cur: Option<Part>, key: NavKey) -> Option<Par
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn icon_buttons_keep_their_width_next_to_text() {
+        let b = |id: u32, text: &str| Button {
+            id,
+            glyph: Some('x'),
+            text: text.into(),
+        };
+        let l = layout(&[Row::Buttons(vec![b(1, "80%"), b(2, ""), b(3, "")])]);
+        let w = |id| {
+            l.parts
+                .iter()
+                .find(|(p, _)| *p == Part::Button(id))
+                .unwrap()
+                .1
+        };
+        assert_eq!(w(2).w, ICON_BUTTON_W_DIP);
+        assert_eq!(w(3).w, ICON_BUTTON_W_DIP);
+        let inner = WIDTH_DIP - 2.0 * PAD_DIP;
+        assert_eq!(w(1).w, inner - 2.0 * GAP_DIP - 2.0 * ICON_BUTTON_W_DIP);
+        assert_eq!(w(3).right(), PAD_DIP + inner);
+        // Icons alone (media transport) share the row evenly.
+        let l = layout(&[Row::Buttons(vec![b(1, ""), b(2, ""), b(3, "")])]);
+        let w1 = l.parts[0].1.w;
+        assert!(l.parts.iter().all(|(_, r)| r.w == w1));
+    }
 
     fn tile(i: u32) -> Tile {
         Tile {

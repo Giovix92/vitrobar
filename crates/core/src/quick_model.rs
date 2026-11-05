@@ -352,7 +352,7 @@ fn tile_name(t: QuickTile, lang: Lang) -> &'static str {
         match t {
             QuickTile::Wifi => Key::WiFi,
             QuickTile::Bluetooth => Key::QuickBluetooth,
-            QuickTile::EnergySaver => Key::BatterySaver,
+            QuickTile::EnergySaver => Key::EnergySaverShort,
             QuickTile::PowerMode => Key::PowerModeLabel,
             QuickTile::Mute => Key::Mute,
             QuickTile::DarkMode => Key::DarkMode,
@@ -442,7 +442,12 @@ fn edit_rows(i: &QuickInputs, lang: Lang) -> Vec<Row> {
         rows.push(Row::Item {
             id: ITEM_BASE + k as u32,
             glyph: Some(tile_glyph(t, i)),
-            text: tile_name(t, lang).to_string(),
+            // The list has room for the full name.
+            text: match t {
+                QuickTile::EnergySaver => tr(lang, Key::BatterySaver),
+                _ => tile_name(t, lang),
+            }
+            .to_string(),
             detail: None,
             checked: on,
             busy: false,
@@ -561,21 +566,29 @@ fn main_rows(i: &QuickInputs, lang: Lang) -> Vec<Row> {
         });
     }
     rows.push(Row::Separator);
-    let mut buttons = Vec::new();
-    if let Some(b) = i
+    // As the stock Quick Settings: the battery on the left, the pencil and the gear as
+    // icons; without a battery "All settings" keeps its words.
+    let battery = i
         .power
         .battery_label
         .as_deref()
-        .filter(|_| i.power.has_battery)
-    {
-        buttons.push(button(BTN_BATTERY, Some(G_BATTERY), b));
+        .filter(|_| i.power.has_battery);
+    let mut buttons = Vec::new();
+    match battery {
+        Some(b) => {
+            buttons.push(button(BTN_BATTERY, Some(G_BATTERY), b));
+            buttons.push(button(BTN_EDIT, Some(G_EDIT), ""));
+            buttons.push(button(BTN_ALL_SETTINGS, Some(G_SETTINGS), ""));
+        }
+        None => {
+            buttons.push(button(
+                BTN_ALL_SETTINGS,
+                Some(G_SETTINGS),
+                tr(lang, Key::AllSettings),
+            ));
+            buttons.push(button(BTN_EDIT, Some(G_EDIT), ""));
+        }
     }
-    buttons.push(button(
-        BTN_ALL_SETTINGS,
-        Some(G_SETTINGS),
-        tr(lang, Key::AllSettings),
-    ));
-    buttons.push(button(BTN_EDIT, Some(G_EDIT), tr(lang, Key::QuickEdit)));
     rows.push(Row::Buttons(buttons));
     rows
 }
@@ -860,10 +873,10 @@ mod tests {
         let b = buttons(&r);
         assert_eq!(
             b.iter().map(|b| b.id).collect::<Vec<_>>(),
-            vec![BTN_BATTERY, BTN_ALL_SETTINGS, BTN_EDIT]
+            vec![BTN_BATTERY, BTN_EDIT, BTN_ALL_SETTINGS]
         );
         assert_eq!(b[0].text, "80%");
-        assert_eq!(b[1].text, "All settings");
+        assert!(b[1].text.is_empty() && b[2].text.is_empty(), "icons only");
         // The volume slider has the Output chevron.
         assert!(r.iter().any(|x| matches!(
             x,
@@ -885,6 +898,7 @@ mod tests {
             buttons(&r).iter().map(|b| b.id).collect::<Vec<_>>(),
             vec![BTN_ALL_SETTINGS, BTN_EDIT]
         );
+        assert_eq!(buttons(&r)[0].text, "All settings");
     }
 
     #[test]
@@ -1090,7 +1104,7 @@ mod tests {
             vec![
                 "Wi-Fi",
                 "Bluetooth",
-                "Risparmio energia",
+                "Risparmio",
                 "Bilanciato",
                 "Muto",
                 "Tema scuro"
@@ -1107,8 +1121,12 @@ mod tests {
             "Efficienza"
         );
         let b = buttons(&rows(QuickPage::Main, &i, Lang::It));
-        assert_eq!(b[b.len() - 2].text, "Tutte le impostazioni");
-        assert_eq!(b.last().unwrap().text, "Modifica");
+        assert_eq!(b[0].text, "80%");
+        // The editor names the tile in full.
+        let e = items(&rows(QuickPage::Edit, &i, Lang::It));
+        assert!(e.iter().any(|(_, t, _)| t == "Risparmio energia"));
+        let d = buttons(&rows(QuickPage::Main, &desktop(), Lang::It));
+        assert_eq!(d[0].text, "Tutte le impostazioni");
     }
 
     #[test]

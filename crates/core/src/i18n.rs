@@ -173,6 +173,8 @@ pub enum Key {
     QuickPanelSection,
     QuickPanelHint,
     PowerModeLabel,
+    EnergySaverShort,
+    RecentOff,
 }
 
 pub const ALL_KEYS: &[Key] = &[
@@ -331,6 +333,8 @@ pub const ALL_KEYS: &[Key] = &[
     Key::QuickPanelSection,
     Key::QuickPanelHint,
     Key::PowerModeLabel,
+    Key::EnergySaverShort,
+    Key::RecentOff,
 ];
 
 pub fn tr(lang: Lang, key: Key) -> &'static str {
@@ -571,6 +575,10 @@ pub fn tr(lang: Lang, key: Key) -> &'static str {
         (Lang::It, Key::QuickPanelHint) => "Scegli quali riquadri mostra il pannello rapido. Puoi modificarli anche dal pannello stesso.",
         (Lang::En, Key::PowerModeLabel) => "Power mode",
         (Lang::It, Key::PowerModeLabel) => "Modalità di alimentazione",
+        (Lang::En, Key::EnergySaverShort) => "Energy saver",
+        (Lang::It, Key::EnergySaverShort) => "Risparmio",
+        (Lang::En, Key::RecentOff) => "Recent files are off in Windows. Turn them on in Settings ›",
+        (Lang::It, Key::RecentOff) => "I file recenti sono disattivati in Windows. Attivali in Impostazioni ›",
         (Lang::En, Key::BatterySaver) => "Energy saver",
         (Lang::It, Key::BatterySaver) => "Risparmio energia",
         (Lang::En, Key::PowerEfficiency) => "Efficiency",
@@ -681,7 +689,7 @@ mod tests {
             assert!(!tr(Lang::En, k).is_empty());
             assert!(!tr(Lang::It, k).is_empty());
         }
-        assert_eq!(ALL_KEYS.len(), 155);
+        assert_eq!(ALL_KEYS.len(), 157);
     }
     #[test]
     fn italian_differs_from_english() {
