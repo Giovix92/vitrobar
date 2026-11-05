@@ -1802,9 +1802,8 @@ impl StartPanel {
                 if let Some(p) = self.hover_plate(Target::RecentOff, *r, look) {
                     items.push(p);
                 }
-                let inset = self.px(12.0);
-                let line = (r.0 + inset, r.1, r.2 - inset, r.3);
-                items.push(self.text(tr(look.lang, Key::RecentOff), line, 12.0, dim, false));
+                // Aligned with the "Recent" title, as the "no recent files" line is.
+                items.push(self.text(tr(look.lang, Key::RecentOff), *r, 12.0, dim, false));
             }
         } else if data.recent.is_empty() {
             if let Some(r) = g.recent.first() {
