@@ -40,6 +40,7 @@ fn renders_the_page_and_redraws_only_changes() {
         title: "Impostazioni di Vitrobar",
         version: "0.1.0",
         hint: Some((11, "Si applica al prossimo avvio di Vitrobar")),
+        page: vitro_core::settings_ui::Section::Appearance,
     };
     let calm = Interaction::default();
     view.render(&painter, &model, &look, &calm, 0.0, size, 1.0)

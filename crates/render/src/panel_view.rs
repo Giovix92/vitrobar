@@ -241,7 +241,9 @@ fn build_row(ctx: &Ctx, l: &PanelLayout, index: usize, row: &Row) -> Result<RowV
                 };
                 let wr = local(&whole, band.y, s);
                 plate(ctx, &container, wr, TILE_RADIUS_DIP * s, fill)?;
-                let label_w = (local(&a, band.y, s).2 - wr.0) as f32 - 2.0 * PAD_DIP * s;
+                // The label runs under both halves: the chevron sits in the icon row only, so
+                // "Bluetooth" is not cut short next to it.
+                let label_w = (wr.2 - wr.0) as f32 - 2.0 * PAD_DIP * s;
                 let glyph = t.glyph.to_string();
                 texts.add(
                     GLYPH_DIP + 2.0,
@@ -274,15 +276,31 @@ fn build_row(ctx: &Ctx, l: &PanelLayout, index: usize, row: &Row) -> Result<RowV
                     } else {
                         alpha(text, SEP_ALPHA)
                     };
-                    let inset = round(12.0 * s);
+                    // The icon row: 8..32 DIP from the tile's top.
                     plate(
                         ctx,
                         &container,
-                        (mr.0, mr.1 + inset, mr.0 + round(s).max(1), mr.3 - inset),
+                        (
+                            mr.0,
+                            mr.1 + round(10.0 * s),
+                            mr.0 + round(s).max(1),
+                            mr.1 + round(30.0 * s),
+                        ),
                         0.0,
                         line_c,
                     )?;
-                    texts.add(SMALL_FONT_DIP, fg, CHEVRON, FontKind::Glyph, boxf(mr));
+                    texts.add(
+                        SMALL_FONT_DIP,
+                        fg,
+                        CHEVRON,
+                        FontKind::Glyph,
+                        (
+                            mr.0 as f32,
+                            mr.1 as f32 + 8.0 * s,
+                            (mr.2 - mr.0) as f32,
+                            24.0 * s,
+                        ),
+                    );
                 }
             }
         }

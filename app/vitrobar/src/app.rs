@@ -5056,6 +5056,7 @@ impl App {
             title: tr(lang, Key::VitrobarSettings),
             version: env!("CARGO_PKG_VERSION"),
             hint,
+            page: sw.ctl.page,
         };
         if let Err(e) = sw.render(&self.painter, &look) {
             eprintln!("vitrobar: the settings window could not be drawn: {e}");
@@ -5145,6 +5146,7 @@ impl App {
                 }
             }
             SettingsAction::Close => self.close_settings(),
+            SettingsAction::Rebuild => self.settings_sync(),
             SettingsAction::Apply(id, choice) => self.apply_setting(id, choice, dirty),
             SettingsAction::OpenLink(url) => {
                 if self.opts.debug_state {
@@ -5191,8 +5193,10 @@ impl App {
     fn on_settings_key(&mut self, msg: &MSG, dirty: &mut Dirty) {
         // SAFETY: plain query of this thread's keyboard state.
         let shift = unsafe { GetKeyState(i32::from(VK_SHIFT.0)) } < 0;
+        // SAFETY: as above.
+        let ctrl = unsafe { GetKeyState(i32::from(VK_CONTROL.0)) } < 0;
         let vk = msg.wParam.0 as u32;
-        self.settings_input(SettingsInput::Key { vk, shift }, dirty);
+        self.settings_input(SettingsInput::Key { vk, shift, ctrl }, dirty);
     }
 
     /// `WM_MOUSEWHEEL` and Alt+F4 on the settings window; false for anything else.

@@ -4,8 +4,8 @@
 use crate::i18n::Key;
 use crate::layout::Rect;
 use crate::settings::{
-    HoverEffect, IconSize, Material, Position, Settings, Shape, StartStyle, StockTaskbar,
-    ThemeChoice,
+    toggle_tile, HoverEffect, IconSize, Material, Position, QuickTile, Settings, Shape, StartStyle,
+    StockTaskbar, ThemeChoice,
 };
 
 pub const ACCENT_SWATCHES: &[Option<u32>] = &[
@@ -32,20 +32,49 @@ const HEADER_H: f32 = 36.0;
 pub enum Section {
     Appearance,
     Behaviour,
+    QuickPanel,
     Widgets,
     Language,
     About,
 }
+
+/// The window's categories, in the sidebar's order: each is a page of its own.
+pub const SECTIONS: [Section; 6] = [
+    Section::Appearance,
+    Section::Behaviour,
+    Section::QuickPanel,
+    Section::Widgets,
+    Section::Language,
+    Section::About,
+];
 
 impl Section {
     pub fn title(self) -> Key {
         match self {
             Section::Appearance => Key::Appearance,
             Section::Behaviour => Key::Behaviour,
+            Section::QuickPanel => Key::QuickPanelSection,
             Section::Widgets => Key::Widgets,
             Section::Language => Key::Language,
             Section::About => Key::About,
         }
+    }
+
+    /// The sidebar icon (Segoe Fluent Icons).
+    pub fn glyph(self) -> char {
+        match self {
+            Section::Appearance => '\u{E790}',
+            Section::Behaviour => '\u{E713}',
+            Section::QuickPanel => '\u{E8A9}',
+            Section::Widgets => '\u{E9D2}',
+            Section::Language => '\u{E774}',
+            Section::About => '\u{E946}',
+        }
+    }
+
+    /// Its place in [`SECTIONS`].
+    pub fn index(self) -> usize {
+        SECTIONS.iter().position(|s| *s == self).unwrap_or(0)
     }
 }
 
@@ -81,6 +110,9 @@ pub enum ControlId {
     WidgetMusic,
     WidgetClaude,
     ClaudeWidgetHint,
+    QuickPanelHint,
+    /// Shows or hides that tile of the quick panel.
+    QuickTile(QuickTile),
     Language,
     AboutVersion,
     AboutLicense,
@@ -100,6 +132,23 @@ pub struct Control {
 pub struct SettingsModel {
     pub controls: Vec<Control>,
     pub focus: usize,
+    /// The category shown; `None`: every section on one page.
+    pub page: Option<Section>,
+}
+
+/// The label of a quick-panel tile's row.
+pub fn tile_key(t: QuickTile) -> Key {
+    match t {
+        QuickTile::Wifi => Key::WiFi,
+        QuickTile::Bluetooth => Key::QuickBluetooth,
+        QuickTile::EnergySaver => Key::BatterySaver,
+        QuickTile::PowerMode => Key::PowerModeLabel,
+        QuickTile::Mute => Key::Mute,
+        QuickTile::DarkMode => Key::DarkMode,
+        QuickTile::Snip => Key::Snip,
+        QuickTile::Project => Key::Project,
+        QuickTile::Lock => Key::Lock,
+    }
 }
 
 const SHAPES: [Shape; 3] = [Shape::Pill, Shape::Islands, Shape::Full];
@@ -134,13 +183,22 @@ fn language_index(s: &Settings) -> usize {
     }
 }
 
+/// Every section on one page (see [`build_page`]).
+pub fn build_model(s: &Settings, width_dip: f32) -> SettingsModel {
+    build_page(s, width_dip, None)
+}
+
 /// Builds the control list in display order, stacked vertically: 24 DIP padding, a 36 DIP
 /// header before each section, 48 DIP rows. Controls span `width_dip` minus the padding.
-pub fn build_model(s: &Settings, width_dip: f32) -> SettingsModel {
+/// With `page`, only that section's controls (under its header).
+pub fn build_page(s: &Settings, width_dip: f32, page: Option<Section>) -> SettingsModel {
     let mut controls = Vec::new();
     let mut y = PAD;
     let mut last: Option<Section> = None;
     let mut add = |id: ControlId, section: Section, label: Key, kind: ControlKind| {
+        if page.is_some_and(|p| p != section) {
+            return;
+        }
         if last != Some(section) {
             y += HEADER_H;
             last = Some(section);
@@ -280,6 +338,21 @@ pub fn build_model(s: &Settings, width_dip: f32) -> SettingsModel {
     );
 
     add(
+        ControlId::QuickPanelHint,
+        QuickPanel,
+        Key::QuickPanelHint,
+        ControlKind::Text(Key::QuickPanelHint),
+    );
+    for t in QuickTile::ALL {
+        add(
+            ControlId::QuickTile(t),
+            QuickPanel,
+            tile_key(t),
+            ControlKind::Toggle(s.quick_tiles.contains(&t)),
+        );
+    }
+
+    add(
         ControlId::WidgetMusic,
         Widgets,
         Key::MusicWidget,
@@ -327,7 +400,11 @@ pub fn build_model(s: &Settings, width_dip: f32) -> SettingsModel {
         ControlKind::Link(SOURCE_URL),
     );
 
-    SettingsModel { controls, focus: 0 }
+    SettingsModel {
+        controls,
+        focus: 0,
+        page,
+    }
 }
 
 fn set<T: PartialEq + Copy>(slot: &mut T, all: &[T], choice: usize) -> bool {
@@ -371,6 +448,15 @@ pub fn apply(s: &mut Settings, id: ControlId, choice: usize) -> bool {
         ControlId::StockTaskbar => set(&mut s.stock_taskbar, &STOCKS, choice),
         ControlId::WidgetMusic => set_bool(&mut s.widget_music, choice),
         ControlId::WidgetClaude => set_bool(&mut s.widget_claude, choice),
+        ControlId::QuickTile(t) => {
+            let on = choice != 0;
+            if on == s.quick_tiles.contains(&t) {
+                false
+            } else {
+                s.quick_tiles = toggle_tile(&s.quick_tiles, t);
+                true
+            }
+        }
         ControlId::Language => {
             let new = match choice {
                 0 => None,
@@ -386,6 +472,7 @@ pub fn apply(s: &mut Settings, id: ControlId, choice: usize) -> bool {
             }
         }
         ControlId::ClaudeWidgetHint
+        | ControlId::QuickPanelHint
         | ControlId::AboutVersion
         | ControlId::AboutLicense
         | ControlId::AboutSource => false,
@@ -409,6 +496,11 @@ fn step_focus(m: &mut SettingsModel, forward: bool) {
             return;
         }
     }
+}
+
+/// The first control the keyboard can reach (a page may start with a note).
+pub fn first_focusable(m: &SettingsModel) -> usize {
+    m.controls.iter().position(focusable).unwrap_or(0)
 }
 
 /// The Claude widget's hint line: what it does, or why turning it on failed.
@@ -445,6 +537,47 @@ mod tests {
 
     fn find(m: &SettingsModel, id: ControlId) -> &Control {
         m.controls.iter().find(|c| c.id == id).unwrap()
+    }
+
+    #[test]
+    fn a_page_holds_only_its_section_under_one_header() {
+        let s = Settings::default();
+        let all = build_model(&s, 600.0);
+        for sec in SECTIONS {
+            let p = build_page(&s, 600.0, Some(sec));
+            assert!(!p.controls.is_empty(), "{sec:?} is empty");
+            assert!(p.controls.iter().all(|c| c.section == sec));
+            assert_eq!(p.page, Some(sec));
+            let n = all.controls.iter().filter(|c| c.section == sec).count();
+            assert_eq!(p.controls.len(), n);
+            // Every page starts right under the padding and its header.
+            assert_eq!(p.controls[0].rect.y, PAD + HEADER_H);
+            assert_eq!(
+                sec.index(),
+                SECTIONS.iter().position(|x| *x == sec).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn quick_tile_switches_add_and_remove_tiles() {
+        let mut s = Settings::default();
+        let id = ControlId::QuickTile(QuickTile::Lock);
+        assert!(apply(&mut s, id, 1));
+        assert_eq!(s.quick_tiles.last(), Some(&QuickTile::Lock));
+        assert!(!apply(&mut s, id, 1), "already shown");
+        assert!(apply(&mut s, id, 0));
+        assert!(!s.quick_tiles.contains(&QuickTile::Lock));
+        let m = build_page(&s, 600.0, Some(Section::QuickPanel));
+        assert!(matches!(
+            find(&m, ControlId::QuickTile(QuickTile::Wifi)).kind,
+            ControlKind::Toggle(true)
+        ));
+        assert!(matches!(
+            find(&m, ControlId::QuickTile(QuickTile::Lock)).kind,
+            ControlKind::Toggle(false)
+        ));
+        assert_eq!(first_focusable(&m), 1, "the note is skipped");
     }
 
     #[test]
@@ -571,9 +704,9 @@ mod tests {
     fn model_order_and_geometry() {
         let m = build_model(&Settings::default(), 600.0);
         let ids: Vec<_> = m.controls.iter().map(|c| c.id).collect();
-        assert_eq!(ids.len(), 19);
+        assert_eq!(ids.len(), 29, "19 + the quick panel's note and 9 tiles");
         assert_eq!(ids[0], ControlId::Shape);
-        assert_eq!(ids[18], ControlId::AboutSource);
+        assert_eq!(ids[28], ControlId::AboutSource);
         assert_eq!(m.focus, 0);
         // 24 padding, then a 36 header, then 48 rows.
         assert_eq!(m.controls[0].rect.y, 24.0 + 36.0);

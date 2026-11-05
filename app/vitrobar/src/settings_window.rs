@@ -1,5 +1,5 @@
-//! The settings window: one glass page of every setting, applied to the real bar as it is
-//! changed and saved at once (no OK / Cancel, like Windows Settings).
+//! The settings window: a sidebar of categories and a glass page for each, applied to the
+//! real bar as it is changed and saved at once (no OK / Cancel, like Windows Settings).
 //!
 //! [`SettingsCtl`] is the pure controller (pointer, wheel and keys in, a
 //! [`SettingsAction`] out); [`apply_choice`] changes the settings and says what else the
@@ -9,16 +9,16 @@
 
 use vitro_core::settings::Settings;
 use vitro_core::settings_ui::{
-    apply, build_model, focus_next, focus_prev, ControlId, ControlKind, SettingsModel,
-    ACCENT_SWATCHES,
+    apply, build_page, first_focusable, focus_next, focus_prev, ControlId, ControlKind, Section,
+    SettingsModel, ACCENT_SWATCHES, SECTIONS,
 };
 use vitro_core::style::MaterialStyle;
 use vitro_render::compositor::Comp;
 use vitro_render::flyout::PxRect;
 use vitro_render::panel::Panel;
 use vitro_render::settings_view::{
-    close_rect, hit, max_scroll, reveal, viewport_h, Interaction, SettingsLook, SettingsView, Spot,
-    CLOSE_W_DIP, DRAG_DIP, RADIUS_DIP,
+    close_rect, hit, max_scroll, nav_hit, page_w, reveal, viewport_h, Interaction, SettingsLook,
+    SettingsView, Spot, CLOSE_W_DIP, DRAG_DIP, NAV_W_DIP, RADIUS_DIP,
 };
 use vitro_render::surfaces::Painter;
 use windows::core::Result;
@@ -52,6 +52,8 @@ pub enum SettingsInput {
     Key {
         vk: u32,
         shift: bool,
+        /// Ctrl is held (Ctrl+Tab / Ctrl+PageDown switch category).
+        ctrl: bool,
     },
 }
 
@@ -63,6 +65,9 @@ pub enum SettingsAction {
     OpenLink(&'static str),
     Close,
     Redraw,
+    /// Another category was picked: rebuild the page from the settings
+    /// ([`SettingsCtl::rebuild`]), then redraw.
+    Rebuild,
     None,
 }
 
@@ -98,6 +103,8 @@ pub fn effect_of(id: ControlId, s: &Settings) -> Effect {
         // The widget pills appear on or leave the bar.
         | ControlId::WidgetMusic
         | ControlId::WidgetClaude => Effect::Relayout,
+        // Read when the quick panel next opens.
+        ControlId::QuickTile(_) | ControlId::QuickPanelHint => Effect::Saved,
         ControlId::WinKey => Effect::WinKey(s.win_key_opens_start),
         ControlId::StartWithWindows => Effect::Autostart(s.start_with_windows),
         ControlId::StockTaskbar => Effect::NextStart,
@@ -120,6 +127,8 @@ pub fn apply_choice(s: &mut Settings, id: ControlId, choice: usize) -> Option<Ef
 #[derive(Debug, Clone)]
 pub struct SettingsCtl {
     pub model: SettingsModel,
+    /// The category shown.
+    pub page: Section,
     /// Page scroll offset, DIP.
     pub scroll: f32,
     pub hover: Option<Spot>,
@@ -139,8 +148,10 @@ pub struct SettingsCtl {
 
 impl SettingsCtl {
     pub fn new(s: &Settings, scale: f32, width_dip: f32, height_dip: f32) -> Self {
+        let page = SECTIONS[0];
         Self {
-            model: build_model(s, width_dip),
+            model: build_page(s, page_w(width_dip), Some(page)),
+            page,
             scroll: 0.0,
             hover: None,
             pressed: None,
@@ -152,12 +163,29 @@ impl SettingsCtl {
         }
     }
 
-    /// The settings changed: show them (focus and scroll stay).
+    /// The settings changed, or the category did: show them. On the same page focus and
+    /// scroll stay; a new page starts at its top.
     pub fn rebuild(&mut self, s: &Settings) {
+        let same = self.model.page == Some(self.page);
         let focus = self.model.focus;
-        self.model = build_model(s, self.width_dip);
-        self.model.focus = focus.min(self.model.controls.len().saturating_sub(1));
-        self.scroll = self.scroll.clamp(0.0, self.max_scroll());
+        self.model = build_page(s, page_w(self.width_dip), Some(self.page));
+        if same {
+            self.model.focus = focus.min(self.model.controls.len().saturating_sub(1));
+            self.scroll = self.scroll.clamp(0.0, self.max_scroll());
+        } else {
+            self.model.focus = first_focusable(&self.model);
+            self.scroll = 0.0;
+        }
+    }
+
+    /// Shows category `i` of [`SECTIONS`] (wrapping); `Rebuild` if it changed.
+    fn go_page(&mut self, i: usize) -> SettingsAction {
+        let next = SECTIONS[i % SECTIONS.len()];
+        if next == self.page {
+            return SettingsAction::None;
+        }
+        self.page = next;
+        SettingsAction::Rebuild
     }
 
     fn view_h(&self) -> f32 {
@@ -186,12 +214,15 @@ impl SettingsCtl {
         if y < DRAG_DIP {
             return None;
         }
-        hit(&self.model, (x, y - DRAG_DIP + self.scroll))
+        if x < NAV_W_DIP {
+            return nav_hit((x, y)).map(Spot::Nav);
+        }
+        hit(&self.model, (x - NAV_W_DIP, y - DRAG_DIP + self.scroll))
     }
 
     fn control_of(spot: Spot) -> Option<usize> {
         match spot {
-            Spot::Close => None,
+            Spot::Close | Spot::Nav(_) => None,
             Spot::Option { control, .. } | Spot::Toggle(control) | Spot::Link(control) => {
                 Some(control)
             }
@@ -204,6 +235,7 @@ impl SettingsCtl {
         }
         match spot {
             Spot::Close => SettingsAction::Close,
+            Spot::Nav(i) => self.go_page(i),
             Spot::Option { control, choice } => {
                 SettingsAction::Apply(self.model.controls[control].id, choice)
             }
@@ -283,7 +315,15 @@ impl SettingsCtl {
                 let changed = self.set_scroll(self.scroll - step);
                 Self::redraw_if(changed)
             }
-            SettingsInput::Key { vk, shift } => self.key(vk, shift),
+            SettingsInput::Key { vk, shift, ctrl } => {
+                let n = SECTIONS.len();
+                let at = self.page.index();
+                match vk {
+                    VK_TAB | VK_NEXT if ctrl && !(vk == VK_TAB && shift) => self.go_page(at + 1),
+                    VK_TAB | VK_PRIOR if ctrl => self.go_page(at + n - 1),
+                    _ => self.key(vk, shift),
+                }
+            }
         }
     }
 
@@ -466,7 +506,7 @@ mod tests {
             .into_iter()
             .find(|(s, _)| *s == spot)
             .unwrap();
-        let x = (r.x + r.w / 2.0) * c.scale;
+        let x = (r.x + r.w / 2.0 + NAV_W_DIP) * c.scale;
         let y = (r.y + r.h / 2.0 + DRAG_DIP - c.scroll) * c.scale;
         (x.round() as i32, y.round() as i32)
     }
@@ -478,7 +518,71 @@ mod tests {
     }
 
     fn key(c: &mut SettingsCtl, vk: u32) -> SettingsAction {
-        c.handle(SettingsInput::Key { vk, shift: false })
+        c.handle(SettingsInput::Key {
+            vk,
+            shift: false,
+            ctrl: false,
+        })
+    }
+
+    /// Shows category `sec`, as a click on its sidebar row would.
+    fn show(c: &mut SettingsCtl, sec: Section) {
+        let r = vitro_render::settings_view::nav_rect(sec.index());
+        let pt = (
+            ((r.x + r.w / 2.0) * c.scale).round() as i32,
+            ((r.y + r.h / 2.0) * c.scale).round() as i32,
+        );
+        let a = click(c, pt);
+        if sec != c.model.page.unwrap_or(sec) {
+            assert_eq!(a, SettingsAction::Rebuild);
+        }
+        c.rebuild(&Settings::default());
+        assert_eq!(c.model.page, Some(sec));
+    }
+
+    #[test]
+    fn the_sidebar_and_ctrl_tab_switch_category() {
+        let mut c = ctl();
+        assert_eq!(c.model.page, Some(Section::Appearance));
+        show(&mut c, Section::About);
+        assert!(c.model.controls.iter().all(|x| x.section == Section::About));
+        assert_eq!(c.scroll, 0.0);
+        // Ctrl+Tab wraps to the first category, Ctrl+Shift+Tab goes back.
+        let ctrl = |vk, shift| SettingsInput::Key {
+            vk,
+            shift,
+            ctrl: true,
+        };
+        assert_eq!(c.handle(ctrl(VK_TAB, false)), SettingsAction::Rebuild);
+        assert_eq!(c.page, Section::Appearance);
+        assert_eq!(c.handle(ctrl(VK_TAB, true)), SettingsAction::Rebuild);
+        assert_eq!(c.page, Section::About);
+        assert_eq!(c.handle(ctrl(VK_PRIOR, false)), SettingsAction::Rebuild);
+        assert_eq!(c.page, Section::Language);
+        // Clicking the current category does nothing.
+        c.rebuild(&Settings::default());
+        let r = vitro_render::settings_view::nav_rect(Section::Language.index());
+        let pt = ((r.x + 20.0) as i32 * 3 / 2, ((r.y + 10.0) * 1.5) as i32);
+        assert_eq!(click(&mut c, pt), SettingsAction::None);
+    }
+
+    #[test]
+    fn the_quick_panel_page_switches_tiles() {
+        let mut c = ctl();
+        show(&mut c, Section::QuickPanel);
+        let i = index(
+            &c,
+            ControlId::QuickTile(vitro_core::settings::QuickTile::Lock),
+        );
+        let pt = point_of(&c, Spot::Toggle(i));
+        assert_eq!(
+            click(&mut c, pt),
+            SettingsAction::Apply(
+                ControlId::QuickTile(vitro_core::settings::QuickTile::Lock),
+                1
+            )
+        );
+        assert_eq!(c.model.focus, i);
     }
 
     #[test]
@@ -566,6 +670,7 @@ mod tests {
     #[test]
     fn space_on_the_windows_key_toggle_disables_the_hook() {
         let mut c = ctl();
+        show(&mut c, Section::Behaviour);
         let mut s = Settings::default();
         assert!(s.win_key_opens_start);
         c.model.focus = index(&c, ControlId::WinKey);
@@ -654,17 +759,15 @@ mod tests {
         assert_eq!(c.interaction().ring, Some(0));
         key(&mut c, VK_TAB);
         assert_eq!(c.model.focus, 1);
-        c.handle(SettingsInput::Key {
+        let shift_tab = SettingsInput::Key {
             vk: VK_TAB,
             shift: true,
-        });
-        c.handle(SettingsInput::Key {
-            vk: VK_TAB,
-            shift: true,
-        });
-        // Wrapped to the last control (a link at the bottom of the page): scrolled down.
-        assert_eq!(c.model.controls[c.model.focus].id, ControlId::AboutSource);
-        assert!(c.scroll > 0.0);
+            ctrl: false,
+        };
+        c.handle(shift_tab);
+        c.handle(shift_tab);
+        // Wrapped to the last control of the page, shown whole.
+        assert_eq!(c.model.controls[c.model.focus].id, ControlId::Accent);
         let r = c.model.controls[c.model.focus].rect;
         assert!(r.bottom() <= c.scroll + viewport_h(c.height_dip));
         // A click hides the ring.
@@ -674,7 +777,9 @@ mod tests {
 
     #[test]
     fn enter_opens_links_and_the_wheel_scrolls_within_bounds() {
-        let mut c = ctl();
+        // Short enough for the About page to scroll.
+        let mut c = SettingsCtl::new(&Settings::default(), 1.5, WINDOW_W_DIP, 200.0);
+        show(&mut c, Section::About);
         c.model.focus = index(&c, ControlId::AboutLicense);
         assert!(matches!(
             key(&mut c, VK_RETURN),

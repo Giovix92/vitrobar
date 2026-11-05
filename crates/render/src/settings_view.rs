@@ -12,7 +12,7 @@
 
 use vitro_core::i18n::{tr, Key, Lang};
 use vitro_core::layout::Rect;
-use vitro_core::settings_ui::{Control, ControlKind, SettingsModel};
+use vitro_core::settings_ui::{Control, ControlKind, Section, SettingsModel, SECTIONS};
 use vitro_core::style::{MaterialStyle, Rgba};
 use windows::core::Result;
 
@@ -21,7 +21,16 @@ use crate::panel::Panel;
 use crate::start_view::{Item, Layer, Part, StartView};
 use crate::surfaces::{FontKind, Painter};
 
-pub const WINDOW_W_DIP: f32 = 720.0;
+/// The category sidebar on the left, under the caption.
+pub const NAV_W_DIP: f32 = 200.0;
+/// One category's row in the sidebar.
+pub const NAV_ROW_DIP: f32 = 40.0;
+const NAV_PAD_DIP: f32 = 8.0;
+const NAV_TEXT_DIP: f32 = 14.0;
+const NAV_GLYPH_DIP: f32 = 16.0;
+/// The page column right of the sidebar.
+pub const PAGE_W_DIP: f32 = 720.0;
+pub const WINDOW_W_DIP: f32 = NAV_W_DIP + PAGE_W_DIP;
 pub const WINDOW_H_DIP: f32 = 640.0;
 /// The caption band at the top: drags the window.
 pub const DRAG_DIP: f32 = 40.0;
@@ -68,6 +77,31 @@ pub enum Spot {
     Toggle(usize),
     /// A link control.
     Link(usize),
+    /// The sidebar's category `i` (see [`SECTIONS`]).
+    Nav(usize),
+}
+
+/// The page column's width in a window `window_w_dip` wide.
+pub fn page_w(window_w_dip: f32) -> f32 {
+    (window_w_dip - NAV_W_DIP).max(0.0)
+}
+
+/// The sidebar row of category `i` (window DIP).
+pub fn nav_rect(i: usize) -> Rect {
+    Rect {
+        x: NAV_PAD_DIP,
+        y: DRAG_DIP + NAV_PAD_DIP + NAV_ROW_DIP * i as f32,
+        w: NAV_W_DIP - 2.0 * NAV_PAD_DIP,
+        h: NAV_ROW_DIP - 4.0,
+    }
+}
+
+/// The sidebar category under `pt` (window DIP).
+pub fn nav_hit(pt: (f32, f32)) -> Option<usize> {
+    (0..SECTIONS.len()).find(|&i| {
+        let r = nav_rect(i);
+        pt.0 >= r.x && pt.0 < r.right() && pt.1 >= r.y && pt.1 < r.bottom()
+    })
 }
 
 /// Width of one segment of a Choice of `n` options.
@@ -249,6 +283,8 @@ pub struct SettingsLook<'a> {
     pub system_accent: Rgba,
     pub lang: Lang,
     pub title: &'a str,
+    /// The category shown (highlighted in the sidebar).
+    pub page: Section,
     /// The text of the About section's version row.
     pub version: &'a str,
     /// A note under the label of a control: (control index, text).
@@ -305,6 +341,70 @@ pub fn items(
             centred: false,
         },
     });
+    // The sidebar: a row per category; the current one has a plate and an accent mark.
+    for (i, sec) in SECTIONS.iter().enumerate() {
+        let r = nav_rect(i);
+        let current = *sec == look.page;
+        let hot = ui.hover == Some(Spot::Nav(i));
+        let down = hot && ui.pressed == Some(Spot::Nav(i));
+        let plate = match (current, hot) {
+            (true, _) => Some(alpha(text, if down { 0x22 } else { 0x1A })),
+            (false, true) => Some(alpha(text, if down { 0x18 } else { 0x0F })),
+            _ => None,
+        };
+        if let Some(color) = plate {
+            chrome.push(Item {
+                rect: px(r),
+                part: Part::Plate {
+                    color,
+                    radius_px: 6.0 * scale,
+                },
+            });
+        }
+        if current {
+            chrome.push(Item {
+                rect: px(Rect {
+                    x: r.x,
+                    y: r.y + r.h / 2.0 - 8.0,
+                    w: 3.0,
+                    h: 16.0,
+                }),
+                part: Part::Plate {
+                    color: look.accent,
+                    radius_px: 1.5 * scale,
+                },
+            });
+        }
+        chrome.push(Item {
+            rect: px(Rect {
+                x: r.x + 12.0,
+                w: 20.0,
+                ..r
+            }),
+            part: Part::Text {
+                text: sec.glyph().to_string(),
+                font: FontKind::Glyph,
+                size_px: font(NAV_GLYPH_DIP),
+                color: text,
+                centred: true,
+            },
+        });
+        chrome.push(Item {
+            rect: px(Rect {
+                x: r.x + 44.0,
+                w: (r.w - 52.0).max(0.0),
+                ..r
+            }),
+            part: Part::Text {
+                text: tr(look.lang, sec.title()).to_string(),
+                font: FontKind::Text,
+                size_px: font(NAV_TEXT_DIP),
+                color: if current { text } else { alpha(text, 0xD0) },
+                centred: false,
+            },
+        });
+    }
+
     let close_hot = ui.hover == Some(Spot::Close);
     if close_hot {
         let pressed = ui.pressed == Some(Spot::Close);
@@ -634,8 +734,9 @@ impl SettingsView {
         let (chrome, page) = items(m, look, ui, size_px.0 as f32 / scale, scale);
         self.view.set_layer(Layer::Chrome, painter, chrome)?;
         let top = (DRAG_DIP * scale).round() as i32;
+        let left = (NAV_W_DIP * scale).round() as i32;
         self.view
-            .set_viewport(Some((0, top, size_px.0, size_px.1)))?;
+            .set_viewport(Some((left, top, size_px.0, size_px.1)))?;
         self.view.set_scroll(scroll_dip * scale)?;
         self.view.set_layer(Layer::List, painter, page)
     }
@@ -723,6 +824,7 @@ mod tests {
             title: "Vitrobar settings",
             version: "0.1.0",
             hint: None,
+            page: vitro_core::settings_ui::Section::Appearance,
         };
         let calm = items(&m, &look, &Interaction::default(), WINDOW_W_DIP, 1.0);
         let rings = |v: &[Item]| {
@@ -764,7 +866,21 @@ mod tests {
             .collect();
         assert_eq!(
             titles,
-            ["Appearance", "Behaviour", "Widgets", "Language", "About"]
+            [
+                "Appearance",
+                "Behaviour",
+                "Quick panel",
+                "Widgets",
+                "Language",
+                "About"
+            ]
         );
+        // The sidebar names every category too (in the caption layer).
+        let nav = calm
+            .0
+            .iter()
+            .filter(|it| matches!(&it.part, Part::Text { size_px, .. } if *size_px == NAV_TEXT_DIP))
+            .count();
+        assert_eq!(nav, SECTIONS.len());
     }
 }
