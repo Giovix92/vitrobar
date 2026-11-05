@@ -6,12 +6,20 @@
 
 use std::sync::OnceLock;
 
+use windows::core::PCWSTR;
 use windows::core::{s, w, Result, GUID};
-use windows::Win32::Foundation::{HANDLE, HWND};
+use windows::Win32::Foundation::{LocalFree, ERROR_SUCCESS, HANDLE, HLOCAL, HWND};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Power::{
     GetSystemPowerStatus, RegisterPowerSettingNotification, UnregisterPowerSettingNotification,
     HPOWERNOTIFY, SYSTEM_POWER_STATUS,
+};
+use windows::Win32::System::Power::{
+    PowerGetActiveScheme, PowerReadDCValueIndex, PowerSetActiveScheme, PowerWriteDCValueIndex,
+};
+use windows::Win32::System::Registry::{
+    RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_DWORD,
+    RRF_RT_REG_DWORD,
 };
 use windows::Win32::System::SystemServices::{
     GUID_ACDC_POWER_SOURCE, GUID_BATTERY_PERCENTAGE_REMAINING, GUID_POWER_SAVING_STATUS,
@@ -38,6 +46,8 @@ pub struct PowerSnapshot {
     pub charging: bool,
     /// Battery saver is on.
     pub saver: bool,
+    /// Running on mains power (also true on a desktop).
+    pub on_ac: bool,
     /// `None` when the overlay API is missing or the scheme is not one of the three.
     pub mode: Option<PowerMode>,
 }
@@ -68,13 +78,21 @@ pub fn mode_from_guid(guid: &GUID) -> Option<PowerMode> {
 
 /// Pure interpretation of the `GetSystemPowerStatus` fields.
 /// `flag` bit 128 = no system battery, bit 8 = charging, 255 = unknown; `life` 255 = unknown.
-pub fn interpret_status(flag: u8, life: u8, saver: u8, mode: Option<PowerMode>) -> PowerSnapshot {
+/// `ac` is `ACLineStatus`: 0 = on battery, 1 = on mains, 255 = unknown (taken as mains).
+pub fn interpret_status(
+    ac: u8,
+    flag: u8,
+    life: u8,
+    saver: u8,
+    mode: Option<PowerMode>,
+) -> PowerSnapshot {
     let has_battery = flag != 255 && flag & 128 == 0;
     PowerSnapshot {
         has_battery,
         percent: (has_battery && life <= 100).then_some(life),
         charging: has_battery && flag & 8 != 0,
         saver: saver & 1 != 0,
+        on_ac: !has_battery || ac != 0,
         mode,
     }
 }
@@ -98,9 +116,10 @@ pub fn snapshot() -> PowerSnapshot {
     let mut st = SYSTEM_POWER_STATUS::default();
     // SAFETY: plain query into a local struct.
     if unsafe { GetSystemPowerStatus(&mut st) }.is_err() {
-        return interpret_status(255, 255, 0, current_mode());
+        return interpret_status(255, 255, 255, 0, current_mode());
     }
     interpret_status(
+        st.ACLineStatus,
         st.BatteryFlag,
         st.BatteryLifePercent,
         st.SystemStatusFlag,
@@ -151,6 +170,138 @@ pub fn set_mode(mode: PowerMode) -> bool {
     let g = overlay_guid(mode);
     // SAFETY: the GUID is a documented overlay scheme.
     (unsafe { set(g) }) == 0
+}
+
+/// `SUB_ENERGYSAVER` / `ESBATTTHRESHOLD`: the charge level (percent) at or below which
+/// Windows turns battery saver on by itself while on battery. 100 means "always", which is
+/// what Windows' own Settings writes for "Always use energy saver".
+const SUB_ENERGYSAVER: GUID = GUID::from_u128(0xde830923_a562_41af_a086_e3a2c6bad2da);
+const ESBATTTHRESHOLD: GUID = GUID::from_u128(0xe69653ca_cf7f_4f05_aa73_cb833fa90ad4);
+/// Windows' default threshold, for a toggle-off with nothing remembered.
+pub const DEFAULT_SAVER_THRESHOLD: u32 = 20;
+const SAVED_KEY: PCWSTR = w!("Software\\Vitrobar");
+const SAVED_VALUE: PCWSTR = w!("SaverThreshold");
+
+/// The threshold to put back when the saver is switched off: the user's own one, unless it
+/// is 100 already (then saver was "always on" before Vitrobar touched it, and the default is
+/// the sensible way off).
+pub fn threshold_after_off(saved: Option<u32>) -> u32 {
+    saved
+        .filter(|t| *t < 100)
+        .unwrap_or(DEFAULT_SAVER_THRESHOLD)
+}
+
+fn read_saved_threshold() -> Option<u32> {
+    let mut v = 0u32;
+    let mut n = size_of::<u32>() as u32;
+    // SAFETY: a DWORD read into a local of the stated size.
+    let r = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            SAVED_KEY,
+            SAVED_VALUE,
+            RRF_RT_REG_DWORD,
+            None,
+            Some((&mut v as *mut u32).cast()),
+            Some(&mut n),
+        )
+    };
+    (r == ERROR_SUCCESS).then_some(v)
+}
+
+fn write_saved_threshold(t: Option<u32>) {
+    // SAFETY: plain registry calls with static names and a local DWORD.
+    unsafe {
+        match t {
+            Some(t) => {
+                let _ = RegSetKeyValueW(
+                    HKEY_CURRENT_USER,
+                    SAVED_KEY,
+                    SAVED_VALUE,
+                    REG_DWORD.0,
+                    Some((&t as *const u32).cast()),
+                    size_of::<u32>() as u32,
+                );
+            }
+            None => {
+                let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, SAVED_KEY, SAVED_VALUE);
+            }
+        }
+    }
+}
+
+fn with_active_scheme<T>(f: impl FnOnce(&GUID) -> T) -> Option<T> {
+    let mut p: *mut GUID = std::ptr::null_mut();
+    // SAFETY: PowerGetActiveScheme allocates the GUID with LocalAlloc; freed below.
+    unsafe {
+        if PowerGetActiveScheme(None, &mut p) != ERROR_SUCCESS || p.is_null() {
+            return None;
+        }
+        let out = f(&*p);
+        let _ = LocalFree(Some(HLOCAL(p.cast())));
+        Some(out)
+    }
+}
+
+/// The on-battery saver threshold of the active power scheme.
+fn dc_threshold() -> Option<u32> {
+    with_active_scheme(|scheme| {
+        let mut v = 0u32;
+        // SAFETY: reads one DWORD of the active scheme into a local.
+        let r = unsafe {
+            PowerReadDCValueIndex(
+                None,
+                Some(scheme),
+                Some(&SUB_ENERGYSAVER),
+                Some(&ESBATTTHRESHOLD),
+                &mut v,
+            )
+        };
+        (r == ERROR_SUCCESS.0).then_some(v)
+    })
+    .flatten()
+}
+
+fn write_dc_threshold(t: u32) -> bool {
+    with_active_scheme(|scheme| {
+        // SAFETY: writes one documented, user-writable value of the active scheme, then
+        // re-applies the scheme so the change takes effect at once (as Settings does).
+        unsafe {
+            PowerWriteDCValueIndex(
+                None,
+                scheme,
+                Some(&SUB_ENERGYSAVER),
+                Some(&ESBATTTHRESHOLD),
+                t,
+            ) == ERROR_SUCCESS.0
+                && PowerSetActiveScheme(None, Some(scheme)) == ERROR_SUCCESS
+        }
+    })
+    .unwrap_or(false)
+}
+
+/// Turns battery saver on or off while on battery, the way Windows' "Always use energy
+/// saver" does it: by raising its threshold to 100 % (the user's own threshold is kept in
+/// `HKCU\Software\Vitrobar\SaverThreshold` and put back on the way off). Windows has no
+/// public switch for saver on mains power; there the caller opens Settings instead.
+/// `false` when Windows refused.
+pub fn set_saver(on: bool) -> bool {
+    if on {
+        let Some(cur) = dc_threshold() else {
+            return false;
+        };
+        if cur < 100 {
+            write_saved_threshold(Some(cur));
+        }
+        write_dc_threshold(100)
+    } else {
+        let back = threshold_after_off(read_saved_threshold());
+        let ok = write_dc_threshold(back);
+        if ok {
+            write_saved_threshold(None);
+        }
+        ok
+    }
 }
 
 /// The registration of the three power settings on a window; unregisters on drop.
@@ -219,6 +370,7 @@ mod tests {
             percent: pct,
             charging,
             saver: false,
+            on_ac: true,
             mode: None,
         }
     }
@@ -248,16 +400,28 @@ mod tests {
     #[test]
     fn status_interpretation() {
         // Desktop: no system battery.
-        let s = interpret_status(128, 255, 0, None);
-        assert!(!s.has_battery && s.percent.is_none() && !s.charging);
+        let s = interpret_status(1, 128, 255, 0, None);
+        assert!(!s.has_battery && s.percent.is_none() && !s.charging && s.on_ac);
         // Laptop charging at 80 %, saver on.
-        let s = interpret_status(8, 80, 1, Some(PowerMode::Balanced));
-        assert!(s.has_battery && s.charging && s.saver);
+        let s = interpret_status(1, 8, 80, 1, Some(PowerMode::Balanced));
+        assert!(s.has_battery && s.charging && s.saver && s.on_ac);
         assert_eq!(s.percent, Some(80));
+        // On battery.
+        assert!(!interpret_status(0, 1, 50, 0, None).on_ac);
         // Unknown percentage.
-        assert_eq!(interpret_status(1, 255, 0, None).percent, None);
+        assert_eq!(interpret_status(1, 1, 255, 0, None).percent, None);
         // Unknown flags.
-        assert!(!interpret_status(255, 255, 0, None).has_battery);
+        assert!(!interpret_status(255, 255, 255, 0, None).has_battery);
+        // A desktop is always "on mains", whatever the AC field says.
+        assert!(interpret_status(0, 128, 255, 0, None).on_ac);
+    }
+
+    #[test]
+    fn saver_off_puts_the_users_threshold_back() {
+        assert_eq!(threshold_after_off(Some(30)), 30);
+        assert_eq!(threshold_after_off(Some(0)), 0);
+        assert_eq!(threshold_after_off(Some(100)), DEFAULT_SAVER_THRESHOLD);
+        assert_eq!(threshold_after_off(None), DEFAULT_SAVER_THRESHOLD);
     }
 
     /// Read-only: changes nothing.

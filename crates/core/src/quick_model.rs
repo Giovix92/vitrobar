@@ -5,6 +5,8 @@
 
 use crate::i18n::{tr, Key, Lang};
 use crate::panel_kit::{Button, Part, Row, Tile};
+use crate::settings::QuickTile;
+use crate::style::Rgba;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum QuickPage {
@@ -13,6 +15,8 @@ pub enum QuickPage {
     Wifi,
     Bluetooth,
     Output,
+    /// Which tiles the main page shows.
+    Edit,
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -125,6 +129,10 @@ pub struct QuickInputs {
     /// `None`: airplane mode cannot be controlled (the tile hides).
     pub airplane: Option<bool>,
     pub ui: QuickUi,
+    /// The tiles the user picked, in order; `None`: [`QuickTile::DEFAULT`].
+    pub tiles: Option<Vec<QuickTile>>,
+    /// Windows' dark mode; `None` hides its tile (unreadable).
+    pub dark_mode: Option<bool>,
 }
 
 // ---- ids --------------------------------------------------------------------------------------
@@ -134,6 +142,11 @@ pub const TILE_BT: u32 = 2;
 pub const TILE_AIRPLANE: u32 = 3;
 pub const TILE_SAVER: u32 = 4;
 pub const TILE_POWER: u32 = 5;
+pub const TILE_MUTE: u32 = 6;
+pub const TILE_DARK: u32 = 7;
+pub const TILE_SNIP: u32 = 8;
+pub const TILE_PROJECT: u32 = 9;
+pub const TILE_LOCK: u32 = 10;
 pub const SLIDER_VOLUME: u32 = 20;
 /// The volume slider's trailing chevron (the Output page).
 pub const OUTPUT_CHEVRON: u32 = 21;
@@ -143,6 +156,10 @@ pub const BTN_MORE: u32 = 32;
 pub const BTN_BACK: u32 = 33;
 pub const BTN_CONNECT: u32 = 34;
 pub const BTN_CANCEL: u32 = 35;
+/// The main page's pencil: opens the tile editor.
+pub const BTN_EDIT: u32 = 36;
+pub const BTN_DONE: u32 = 37;
+pub const BTN_RESET: u32 = 38;
 /// A sub-page's radio switch row.
 pub const ITEM_RADIO: u32 = 40;
 /// The Wi-Fi password box (a Custom row the app draws into).
@@ -161,7 +178,6 @@ pub const SLIDER_STEP: f32 = 0.02;
 const G_WIFI: char = '\u{E701}';
 const G_WIFI_BARS: [char; 4] = ['\u{E872}', '\u{E873}', '\u{E874}', '\u{E701}'];
 const G_BT: char = '\u{E702}';
-const G_AIRPLANE: char = '\u{E709}';
 const G_SAVER: char = '\u{EBBF}';
 const G_POWER: char = '\u{E945}';
 const G_BRIGHTNESS: char = '\u{E706}';
@@ -173,6 +189,23 @@ const G_BATTERY: char = '\u{EBA7}';
 const G_BACK: char = '\u{E72B}';
 const G_HEADPHONE: char = '\u{E7F6}';
 const G_SPEAKER: char = '\u{E7F5}';
+const G_MOON: char = '\u{E708}';
+const G_SNIP: char = '\u{E8C6}';
+const G_PROJECT: char = '\u{E7F4}';
+const G_LOCK: char = '\u{E72E}';
+const G_EDIT: char = '\u{E70F}';
+const G_DONE: char = '\u{E73E}';
+const G_RESET: char = '\u{E72C}';
+
+/// The power tile's colour per mode: green for efficiency, blue for balanced, orange for
+/// performance. White text reads on all three in both themes.
+pub fn mode_tint(m: PowerMode) -> Rgba {
+    match m {
+        PowerMode::BestEfficiency => Rgba(0x1E, 0x8E, 0x4E, 255),
+        PowerMode::Balanced => Rgba(0x2D, 0x6F, 0xD6, 255),
+        PowerMode::BestPerformance => Rgba(0xD6, 0x5A, 0x16, 255),
+    }
+}
 
 /// What a click (or Enter) on a part means.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -180,9 +213,16 @@ pub enum Action {
     ToggleWifi,
     ToggleBt,
     ToggleAirplane,
-    /// Battery saver has no public switch: Windows' battery settings open.
+    /// Battery saver on or off (on mains power Windows has no public switch: the app opens
+    /// its battery settings instead).
     BatterySaver,
     CyclePowerMode,
+    ToggleMute,
+    ToggleDarkMode,
+    Lock,
+    /// Shows or hides a tile (the editor).
+    ToggleTile(QuickTile),
+    ResetTiles,
     Open(QuickPage),
     Back,
     /// The Wi-Fi or Bluetooth radio switch on that page.
@@ -235,6 +275,14 @@ pub fn action(page: QuickPage, part: Part) -> Option<Action> {
         Part::Tile(TILE_AIRPLANE) => Action::ToggleAirplane,
         Part::Tile(TILE_SAVER) => Action::BatterySaver,
         Part::Tile(TILE_POWER) => Action::CyclePowerMode,
+        Part::Tile(TILE_MUTE) => Action::ToggleMute,
+        Part::Tile(TILE_DARK) => Action::ToggleDarkMode,
+        Part::Tile(TILE_SNIP) => Action::Settings("ms-screenclip:"),
+        Part::Tile(TILE_PROJECT) => Action::Settings("ms-settings-displays-topology:"),
+        Part::Tile(TILE_LOCK) => Action::Lock,
+        Part::Button(BTN_EDIT) => Action::Open(QuickPage::Edit),
+        Part::Button(BTN_DONE) => Action::Back,
+        Part::Button(BTN_RESET) => Action::ResetTiles,
         Part::Slider(SLIDER_VOLUME) => Action::Volume,
         Part::SliderTrailing(OUTPUT_CHEVRON) => Action::Open(QuickPage::Output),
         Part::Slider(id) if (BRIGHTNESS_BASE..ITEM_BASE).contains(&id) => {
@@ -246,7 +294,7 @@ pub fn action(page: QuickPage, part: Part) -> Option<Action> {
             QuickPage::Wifi => Action::Settings("ms-settings:network-wifi"),
             QuickPage::Bluetooth => Action::Settings("ms-settings:bluetooth"),
             QuickPage::Output => Action::Settings("ms-settings:sound"),
-            QuickPage::Main => return None,
+            QuickPage::Main | QuickPage::Edit => return None,
         },
         Part::Button(BTN_BACK) => Action::Back,
         Part::Button(BTN_CONNECT) => Action::Connect,
@@ -258,6 +306,7 @@ pub fn action(page: QuickPage, part: Part) -> Option<Action> {
                 QuickPage::Wifi => Action::Network(i),
                 QuickPage::Bluetooth => Action::Device(i),
                 QuickPage::Output => Action::Output(i),
+                QuickPage::Edit => Action::ToggleTile(*QuickTile::ALL.get(i)?),
                 QuickPage::Main => return None,
             }
         }
@@ -271,7 +320,140 @@ pub fn rows(page: QuickPage, i: &QuickInputs, lang: Lang) -> Vec<Row> {
         QuickPage::Wifi => wifi_rows(i, lang),
         QuickPage::Bluetooth => bt_rows(i, lang),
         QuickPage::Output => output_rows(i, lang),
+        QuickPage::Edit => edit_rows(i, lang),
     }
+}
+
+/// The tiles shown, in order.
+pub fn shown_tiles(i: &QuickInputs) -> &[QuickTile] {
+    i.tiles.as_deref().unwrap_or(&QuickTile::DEFAULT)
+}
+
+fn tile_glyph(t: QuickTile, i: &QuickInputs) -> char {
+    match t {
+        QuickTile::Wifi => G_WIFI,
+        QuickTile::Bluetooth => G_BT,
+        QuickTile::EnergySaver => G_SAVER,
+        QuickTile::PowerMode => G_POWER,
+        QuickTile::Mute => i
+            .audio
+            .as_ref()
+            .map_or(G_MUTED, |a| volume_glyph(a.volume, true)),
+        QuickTile::DarkMode => G_MOON,
+        QuickTile::Snip => G_SNIP,
+        QuickTile::Project => G_PROJECT,
+        QuickTile::Lock => G_LOCK,
+    }
+}
+
+fn tile_name(t: QuickTile, lang: Lang) -> &'static str {
+    tr(
+        lang,
+        match t {
+            QuickTile::Wifi => Key::WiFi,
+            QuickTile::Bluetooth => Key::QuickBluetooth,
+            QuickTile::EnergySaver => Key::BatterySaver,
+            QuickTile::PowerMode => Key::PowerModeLabel,
+            QuickTile::Mute => Key::Mute,
+            QuickTile::DarkMode => Key::DarkMode,
+            QuickTile::Snip => Key::Snip,
+            QuickTile::Project => Key::Project,
+            QuickTile::Lock => Key::Lock,
+        },
+    )
+}
+
+/// The tile `t` as the main page shows it; `None` when this PC cannot show it (no adapter,
+/// no battery, a state Windows will not tell).
+fn tile_of(t: QuickTile, i: &QuickInputs, lang: Lang) -> Option<Tile> {
+    let plain = |id: u32, on: bool| Tile {
+        id,
+        glyph: tile_glyph(t, i),
+        label: tile_name(t, lang).to_string(),
+        on,
+        more: false,
+        tint: None,
+    };
+    Some(match t {
+        QuickTile::Wifi => {
+            let w = i.wifi.as_ref()?;
+            Tile {
+                label: w
+                    .connected
+                    .clone()
+                    .filter(|_| w.radio_on != Some(false))
+                    .unwrap_or_else(|| tr(lang, Key::WiFi).to_string()),
+                more: true,
+                ..plain(TILE_WIFI, w.radio_on == Some(true))
+            }
+        }
+        QuickTile::Bluetooth => {
+            let b = bt_present(i)?;
+            Tile {
+                more: true,
+                ..plain(TILE_BT, b.radio_on == Some(true))
+            }
+        }
+        QuickTile::EnergySaver => {
+            if !i.power.has_battery {
+                return None;
+            }
+            plain(TILE_SAVER, i.power.saver)
+        }
+        QuickTile::PowerMode => {
+            let m = i.power.mode?;
+            Tile {
+                label: mode_label(m, lang).to_string(),
+                tint: Some(mode_tint(m)),
+                ..plain(TILE_POWER, false)
+            }
+        }
+        QuickTile::Mute => {
+            let a = i.audio.as_ref()?;
+            Tile {
+                glyph: volume_glyph(a.volume, a.muted),
+                ..plain(TILE_MUTE, a.muted)
+            }
+        }
+        QuickTile::DarkMode => plain(TILE_DARK, i.dark_mode?),
+        QuickTile::Snip => plain(TILE_SNIP, false),
+        QuickTile::Project => plain(TILE_PROJECT, false),
+        QuickTile::Lock => plain(TILE_LOCK, false),
+    })
+}
+
+/// The editor: every tile, the shown ones first (in their order), each with a check.
+fn edit_rows(i: &QuickInputs, lang: Lang) -> Vec<Row> {
+    let shown = shown_tiles(i);
+    let mut rows = vec![
+        Row::Header {
+            text: tr(lang, Key::QuickEditTitle).to_string(),
+            trailing: None,
+            actions: Vec::new(),
+        },
+        Row::Text(tr(lang, Key::QuickEditHint).to_string()),
+    ];
+    let hidden = QuickTile::ALL.iter().filter(|t| !shown.contains(t));
+    for &t in shown.iter().chain(hidden) {
+        let Some(k) = QuickTile::ALL.iter().position(|x| *x == t) else {
+            continue;
+        };
+        let on = shown.contains(&t);
+        rows.push(Row::Item {
+            id: ITEM_BASE + k as u32,
+            glyph: Some(tile_glyph(t, i)),
+            text: tile_name(t, lang).to_string(),
+            detail: None,
+            checked: on,
+            busy: false,
+        });
+    }
+    rows.push(Row::Separator);
+    rows.push(Row::Buttons(vec![
+        button(BTN_RESET, Some(G_RESET), tr(lang, Key::QuickReset)),
+        button(BTN_DONE, Some(G_DONE), tr(lang, Key::Done)),
+    ]));
+    rows
 }
 
 fn mode_label(m: PowerMode, lang: Lang) -> &'static str {
@@ -346,56 +528,10 @@ fn bt_present(i: &QuickInputs) -> Option<&BtInputs> {
 
 fn main_rows(i: &QuickInputs, lang: Lang) -> Vec<Row> {
     let mut rows = Vec::new();
-    let mut tiles = Vec::new();
-    if let Some(w) = &i.wifi {
-        tiles.push(Tile {
-            id: TILE_WIFI,
-            glyph: G_WIFI,
-            label: w
-                .connected
-                .clone()
-                .filter(|_| w.radio_on != Some(false))
-                .unwrap_or_else(|| tr(lang, Key::WiFi).to_string()),
-            on: w.radio_on == Some(true),
-            more: true,
-        });
-    }
-    if let Some(b) = bt_present(i) {
-        tiles.push(Tile {
-            id: TILE_BT,
-            glyph: G_BT,
-            label: tr(lang, Key::QuickBluetooth).to_string(),
-            on: b.radio_on == Some(true),
-            more: true,
-        });
-    }
-    if let Some(on) = i.airplane {
-        tiles.push(Tile {
-            id: TILE_AIRPLANE,
-            glyph: G_AIRPLANE,
-            label: tr(lang, Key::AirplaneMode).to_string(),
-            on,
-            more: false,
-        });
-    }
-    if i.power.has_battery {
-        tiles.push(Tile {
-            id: TILE_SAVER,
-            glyph: G_SAVER,
-            label: tr(lang, Key::BatterySaver).to_string(),
-            on: i.power.saver,
-            more: false,
-        });
-    }
-    if let Some(m) = i.power.mode {
-        tiles.push(Tile {
-            id: TILE_POWER,
-            glyph: G_POWER,
-            label: mode_label(m, lang).to_string(),
-            on: false,
-            more: false,
-        });
-    }
+    let tiles: Vec<Tile> = shown_tiles(i)
+        .iter()
+        .filter_map(|&t| tile_of(t, i, lang))
+        .collect();
     if !tiles.is_empty() {
         rows.push(Row::Tiles(tiles));
     }
@@ -439,6 +575,7 @@ fn main_rows(i: &QuickInputs, lang: Lang) -> Vec<Row> {
         Some(G_SETTINGS),
         tr(lang, Key::AllSettings),
     ));
+    buttons.push(button(BTN_EDIT, Some(G_EDIT), tr(lang, Key::QuickEdit)));
     rows.push(Row::Buttons(buttons));
     rows
 }
@@ -689,6 +826,8 @@ mod tests {
             },
             airplane: Some(false),
             ui: QuickUi::default(),
+            tiles: None,
+            dark_mode: Some(false),
         }
     }
 
@@ -709,16 +848,19 @@ mod tests {
         let r = rows(QuickPage::Main, &laptop(), Lang::En);
         assert_eq!(
             tile_ids(&r),
-            vec![TILE_WIFI, TILE_BT, TILE_AIRPLANE, TILE_SAVER, TILE_POWER]
+            vec![TILE_WIFI, TILE_BT, TILE_SAVER, TILE_POWER, TILE_MUTE, TILE_DARK]
         );
         let t = tiles(&r);
         assert!(t[0].more && t[1].more && !t[2].more);
+        // The power tile wears its mode's colour; the others do not.
+        assert_eq!(t[3].tint, Some(mode_tint(PowerMode::Balanced)));
+        assert!(t.iter().filter(|t| t.tint.is_some()).count() == 1);
         assert_eq!(sliders(&r), vec![BRIGHTNESS_BASE, SLIDER_VOLUME]);
         assert!(r.contains(&Row::Separator));
         let b = buttons(&r);
         assert_eq!(
             b.iter().map(|b| b.id).collect::<Vec<_>>(),
-            vec![BTN_BATTERY, BTN_ALL_SETTINGS]
+            vec![BTN_BATTERY, BTN_ALL_SETTINGS, BTN_EDIT]
         );
         assert_eq!(b[0].text, "80%");
         assert_eq!(b[1].text, "All settings");
@@ -741,7 +883,7 @@ mod tests {
         assert!(!tile_ids(&r).contains(&TILE_SAVER));
         assert_eq!(
             buttons(&r).iter().map(|b| b.id).collect::<Vec<_>>(),
-            vec![BTN_ALL_SETTINGS]
+            vec![BTN_ALL_SETTINGS, BTN_EDIT]
         );
     }
 
@@ -769,12 +911,70 @@ mod tests {
     }
 
     #[test]
-    fn airplane_none_hides_the_tile() {
+    fn the_picked_tiles_show_in_their_order() {
         let i = QuickInputs {
-            airplane: None,
+            tiles: Some(vec![QuickTile::Lock, QuickTile::PowerMode, QuickTile::Wifi]),
             ..laptop()
         };
-        assert!(!tile_ids(&rows(QuickPage::Main, &i, Lang::En)).contains(&TILE_AIRPLANE));
+        assert_eq!(
+            tile_ids(&rows(QuickPage::Main, &i, Lang::En)),
+            vec![TILE_LOCK, TILE_POWER, TILE_WIFI]
+        );
+        let none = QuickInputs {
+            tiles: Some(Vec::new()),
+            ..laptop()
+        };
+        assert!(tiles(&rows(QuickPage::Main, &none, Lang::En)).is_empty());
+    }
+
+    #[test]
+    fn power_modes_have_three_distinct_colours() {
+        let c = [
+            mode_tint(PowerMode::BestEfficiency),
+            mode_tint(PowerMode::Balanced),
+            mode_tint(PowerMode::BestPerformance),
+        ];
+        assert!(c[0] != c[1] && c[1] != c[2] && c[0] != c[2]);
+    }
+
+    #[test]
+    fn the_editor_lists_shown_tiles_first_and_toggles_them() {
+        let i = QuickInputs {
+            tiles: Some(vec![QuickTile::Mute, QuickTile::Wifi]),
+            ..laptop()
+        };
+        let r = rows(QuickPage::Edit, &i, Lang::En);
+        let it = items(&r);
+        assert_eq!(it.len(), QuickTile::ALL.len());
+        assert_eq!(it[0].1, "Mute");
+        assert_eq!(it[1].1, "Wi-Fi");
+        assert!(it[0].2 && it[1].2 && !it[2].2);
+        // Every item maps back to its own tile.
+        for (id, _, _) in &it {
+            let a = action(QuickPage::Edit, Part::Item(*id));
+            let k = (*id - ITEM_BASE) as usize;
+            assert_eq!(a, Some(Action::ToggleTile(QuickTile::ALL[k])));
+        }
+        assert_eq!(
+            action(QuickPage::Edit, Part::Button(BTN_DONE)),
+            Some(Action::Back)
+        );
+        assert_eq!(
+            action(QuickPage::Main, Part::Button(BTN_EDIT)),
+            Some(Action::Open(QuickPage::Edit))
+        );
+    }
+
+    #[test]
+    fn mute_and_dark_mode_tiles_follow_the_system() {
+        let mut i = laptop();
+        i.dark_mode = None;
+        assert!(!tile_ids(&rows(QuickPage::Main, &i, Lang::En)).contains(&TILE_DARK));
+        i.dark_mode = Some(true);
+        i.audio.as_mut().unwrap().muted = true;
+        let t = tiles(&rows(QuickPage::Main, &i, Lang::En));
+        let on = |id| t.iter().find(|t| t.id == id).unwrap().on;
+        assert!(on(TILE_DARK) && on(TILE_MUTE));
     }
 
     #[test]
@@ -793,7 +993,7 @@ mod tests {
         assert!(sliders(&r).is_empty());
         assert_eq!(
             buttons(&r).iter().map(|b| b.id).collect::<Vec<_>>(),
-            vec![BTN_ALL_SETTINGS]
+            vec![BTN_ALL_SETTINGS, BTN_EDIT]
         );
     }
 
@@ -868,10 +1068,9 @@ mod tests {
     fn tiles_reflect_the_state() {
         let mut i = laptop();
         i.power.saver = true;
-        i.airplane = Some(true);
         let t = tiles(&rows(QuickPage::Main, &i, Lang::En));
         let on = |id| t.iter().find(|t| t.id == id).unwrap().on;
-        assert!(on(TILE_WIFI) && !on(TILE_BT) && on(TILE_AIRPLANE) && on(TILE_SAVER));
+        assert!(on(TILE_WIFI) && !on(TILE_BT) && on(TILE_SAVER));
         // Connected: the Wi-Fi tile names the network.
         let i = QuickInputs {
             wifi: Some(wifi()),
@@ -891,23 +1090,25 @@ mod tests {
             vec![
                 "Wi-Fi",
                 "Bluetooth",
-                "Modalità aereo",
                 "Risparmio energia",
-                "Bilanciato"
+                "Bilanciato",
+                "Muto",
+                "Tema scuro"
             ]
         );
         i.power.mode = Some(PowerMode::BestPerformance);
         assert_eq!(
-            tiles(&rows(QuickPage::Main, &i, Lang::It))[4].label,
+            tiles(&rows(QuickPage::Main, &i, Lang::It))[3].label,
             "Prestazioni"
         );
         i.power.mode = Some(PowerMode::BestEfficiency);
         assert_eq!(
-            tiles(&rows(QuickPage::Main, &i, Lang::It))[4].label,
+            tiles(&rows(QuickPage::Main, &i, Lang::It))[3].label,
             "Efficienza"
         );
         let b = buttons(&rows(QuickPage::Main, &i, Lang::It));
-        assert_eq!(b.last().unwrap().text, "Tutte le impostazioni");
+        assert_eq!(b[b.len() - 2].text, "Tutte le impostazioni");
+        assert_eq!(b.last().unwrap().text, "Modifica");
     }
 
     #[test]

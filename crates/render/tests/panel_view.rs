@@ -12,6 +12,7 @@ use windows::Win32::UI::WindowsAndMessaging::{IsWindow, IsWindowVisible};
 
 fn tile(id: u32, on: bool, more: bool) -> Tile {
     Tile {
+        tint: None,
         id,
         glyph: '\u{E701}',
         label: format!("Tile {id}"),

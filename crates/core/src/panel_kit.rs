@@ -75,6 +75,9 @@ pub struct Tile {
     pub on: bool,
     /// A chevron half that opens a sub-page, like the stock Quick Settings.
     pub more: bool,
+    /// Drawn filled in this colour (white text) instead of the accent or the plain plate:
+    /// a tile whose state is a choice among several (the power mode) rather than on/off.
+    pub tint: Option<crate::style::Rgba>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -304,6 +307,7 @@ mod tests {
 
     fn tile(i: u32) -> Tile {
         Tile {
+            tint: None,
             id: i,
             glyph: 'a',
             label: format!("t{i}"),

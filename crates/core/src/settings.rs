@@ -52,6 +52,67 @@ setting_enum!(ThemeChoice {
     Dark
 });
 
+/// A tile the quick panel can show. The user picks which and in what order
+/// ([`Settings::quick_tiles`]); a tile whose hardware is missing (no Wi-Fi adapter, no
+/// battery) stays hidden whatever the list says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum QuickTile {
+    Wifi,
+    Bluetooth,
+    EnergySaver,
+    PowerMode,
+    Mute,
+    DarkMode,
+    Snip,
+    Project,
+    Lock,
+}
+
+impl QuickTile {
+    /// Every tile, in the order the editor lists the hidden ones.
+    pub const ALL: [QuickTile; 9] = [
+        QuickTile::Wifi,
+        QuickTile::Bluetooth,
+        QuickTile::EnergySaver,
+        QuickTile::PowerMode,
+        QuickTile::Mute,
+        QuickTile::DarkMode,
+        QuickTile::Snip,
+        QuickTile::Project,
+        QuickTile::Lock,
+    ];
+    /// What a new install shows (the stock Quick Settings' first row, more or less).
+    pub const DEFAULT: [QuickTile; 6] = [
+        QuickTile::Wifi,
+        QuickTile::Bluetooth,
+        QuickTile::EnergySaver,
+        QuickTile::PowerMode,
+        QuickTile::Mute,
+        QuickTile::DarkMode,
+    ];
+}
+
+/// `list` without repeats (first one wins).
+pub fn dedup_tiles(list: Vec<QuickTile>) -> Vec<QuickTile> {
+    let mut out: Vec<QuickTile> = Vec::with_capacity(list.len());
+    for t in list {
+        if !out.contains(&t) {
+            out.push(t);
+        }
+    }
+    out
+}
+
+/// `tiles` with `t` shown (appended at the end) or hidden.
+pub fn toggle_tile(tiles: &[QuickTile], t: QuickTile) -> Vec<QuickTile> {
+    if tiles.contains(&t) {
+        tiles.iter().copied().filter(|x| *x != t).collect()
+    } else {
+        tiles.iter().copied().chain(Some(t)).collect()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct Pin {
@@ -99,6 +160,8 @@ pub struct Settings {
     /// The `statusLine` entry of Claude Code's settings that the Claude widget replaced, kept
     /// so turning the widget off puts it back exactly (`None` = there was none).
     pub claude_prev_statusline: Option<String>,
+    /// The quick panel's tiles, in order (see [`QuickTile`]).
+    pub quick_tiles: Vec<QuickTile>,
 }
 
 impl Default for Settings {
@@ -128,6 +191,7 @@ impl Default for Settings {
             widget_music: false,
             widget_claude: false,
             claude_prev_statusline: None,
+            quick_tiles: QuickTile::DEFAULT.to_vec(),
         }
     }
 }
@@ -230,6 +294,11 @@ fn from_table(t: &toml::Table) -> Settings {
         widget_music: get(t, "widget-music", d.widget_music),
         widget_claude: get(t, "widget-claude", d.widget_claude),
         claude_prev_statusline: get(t, "claude-prev-statusline", d.claude_prev_statusline),
+        // Missing: the default set. Present: what the user picked, even nothing at all.
+        quick_tiles: match t.get("quick-tiles") {
+            None => d.quick_tiles,
+            Some(_) => dedup_tiles(get_list(t, "quick-tiles")),
+        },
     }
 }
 
@@ -287,6 +356,30 @@ pub fn save(path: &Path, s: &Settings) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn quick_tiles_default_keep_order_and_drop_unknowns() {
+        let parse = |text: &str| from_table(&text.parse::<toml::Table>().unwrap());
+        assert_eq!(parse("").quick_tiles, QuickTile::DEFAULT.to_vec());
+        assert_eq!(parse("quick-tiles = []").quick_tiles, Vec::new());
+        assert_eq!(
+            parse(r#"quick-tiles = ["lock", "wifi", "nonsense", "lock"]"#).quick_tiles,
+            vec![QuickTile::Lock, QuickTile::Wifi]
+        );
+        let s = Settings::default();
+        let back = parse(&toml::to_string_pretty(&s).unwrap());
+        assert_eq!(back.quick_tiles, s.quick_tiles);
+    }
+
+    #[test]
+    fn toggling_a_tile_hides_it_or_appends_it() {
+        let t = [QuickTile::Wifi, QuickTile::Mute];
+        assert_eq!(toggle_tile(&t, QuickTile::Wifi), vec![QuickTile::Mute]);
+        assert_eq!(
+            toggle_tile(&t, QuickTile::Lock),
+            vec![QuickTile::Wifi, QuickTile::Mute, QuickTile::Lock]
+        );
+    }
 
     #[test]
     fn missing_file_gives_defaults() {
@@ -360,6 +453,7 @@ mod tests {
             widget_music: true,
             widget_claude: true,
             claude_prev_statusline: Some(r#"{"type":"command"}"#.into()),
+            quick_tiles: vec![QuickTile::Lock, QuickTile::Wifi],
         };
         let d0 = Settings::default();
         assert_ne!(original.hover, d0.hover);

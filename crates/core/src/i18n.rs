@@ -161,6 +161,18 @@ pub enum Key {
     ClaudeWeekly,
     ResetsNow,
     AutostartQuestion,
+    QuickEdit,
+    QuickEditTitle,
+    QuickEditHint,
+    QuickReset,
+    Done,
+    Mute,
+    DarkMode,
+    Snip,
+    Project,
+    QuickPanelSection,
+    QuickPanelHint,
+    PowerModeLabel,
 }
 
 pub const ALL_KEYS: &[Key] = &[
@@ -307,6 +319,18 @@ pub const ALL_KEYS: &[Key] = &[
     Key::ClaudeWeekly,
     Key::ResetsNow,
     Key::AutostartQuestion,
+    Key::QuickEdit,
+    Key::QuickEditTitle,
+    Key::QuickEditHint,
+    Key::QuickReset,
+    Key::Done,
+    Key::Mute,
+    Key::DarkMode,
+    Key::Snip,
+    Key::Project,
+    Key::QuickPanelSection,
+    Key::QuickPanelHint,
+    Key::PowerModeLabel,
 ];
 
 pub fn tr(lang: Lang, key: Key) -> &'static str {
@@ -523,7 +547,31 @@ pub fn tr(lang: Lang, key: Key) -> &'static str {
         (Lang::It, Key::QuickBluetooth) => "Bluetooth",
         (Lang::En, Key::AirplaneMode) => "Airplane mode",
         (Lang::It, Key::AirplaneMode) => "Modalità aereo",
-        (Lang::En, Key::BatterySaver) => "Battery saver",
+        (Lang::En, Key::QuickEdit) => "Edit",
+        (Lang::It, Key::QuickEdit) => "Modifica",
+        (Lang::En, Key::QuickEditTitle) => "Quick settings tiles",
+        (Lang::It, Key::QuickEditTitle) => "Riquadri delle impostazioni rapide",
+        (Lang::En, Key::QuickEditHint) => "Pick the tiles to show. A tile you add goes to the end.",
+        (Lang::It, Key::QuickEditHint) => "Scegli i riquadri da mostrare. Un riquadro aggiunto va in fondo.",
+        (Lang::En, Key::QuickReset) => "Reset to default",
+        (Lang::It, Key::QuickReset) => "Ripristina predefiniti",
+        (Lang::En, Key::Done) => "Done",
+        (Lang::It, Key::Done) => "Fine",
+        (Lang::En, Key::Mute) => "Mute",
+        (Lang::It, Key::Mute) => "Muto",
+        (Lang::En, Key::DarkMode) => "Dark mode",
+        (Lang::It, Key::DarkMode) => "Tema scuro",
+        (Lang::En, Key::Snip) => "Snip",
+        (Lang::It, Key::Snip) => "Cattura",
+        (Lang::En, Key::Project) => "Project",
+        (Lang::It, Key::Project) => "Proietta",
+        (Lang::En, Key::QuickPanelSection) => "Quick panel",
+        (Lang::It, Key::QuickPanelSection) => "Pannello rapido",
+        (Lang::En, Key::QuickPanelHint) => "Choose which tiles the quick panel shows. You can also edit them from the panel itself.",
+        (Lang::It, Key::QuickPanelHint) => "Scegli quali riquadri mostra il pannello rapido. Puoi modificarli anche dal pannello stesso.",
+        (Lang::En, Key::PowerModeLabel) => "Power mode",
+        (Lang::It, Key::PowerModeLabel) => "Modalità di alimentazione",
+        (Lang::En, Key::BatterySaver) => "Energy saver",
         (Lang::It, Key::BatterySaver) => "Risparmio energia",
         (Lang::En, Key::PowerEfficiency) => "Efficiency",
         (Lang::It, Key::PowerEfficiency) => "Efficienza",
@@ -633,7 +681,7 @@ mod tests {
             assert!(!tr(Lang::En, k).is_empty());
             assert!(!tr(Lang::It, k).is_empty());
         }
-        assert_eq!(ALL_KEYS.len(), 143);
+        assert_eq!(ALL_KEYS.len(), 155);
     }
     #[test]
     fn italian_differs_from_english() {

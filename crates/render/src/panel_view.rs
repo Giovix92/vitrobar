@@ -231,11 +231,13 @@ fn build_row(ctx: &Ctx, l: &PanelLayout, index: usize, row: &Row) -> Result<RowV
                     w: a.w + more.map_or(0.0, |m| m.w),
                     ..a
                 };
-                let fg = if t.on { WHITE } else { text };
-                let fill = if t.on {
-                    ctx.accent
-                } else {
-                    alpha(text, TILE_ALPHA)
+                // A tinted tile (the power mode) is always "filled", in its own colour.
+                let filled = t.on || t.tint.is_some();
+                let fg = if filled { WHITE } else { text };
+                let fill = match t.tint {
+                    Some(c) => c,
+                    None if t.on => ctx.accent,
+                    None => alpha(text, TILE_ALPHA),
                 };
                 let wr = local(&whole, band.y, s);
                 plate(ctx, &container, wr, TILE_RADIUS_DIP * s, fill)?;
@@ -267,7 +269,7 @@ fn build_row(ctx: &Ctx, l: &PanelLayout, index: usize, row: &Row) -> Result<RowV
                 );
                 if let Some(m) = more {
                     let mr = local(&m, band.y, s);
-                    let line_c = if t.on {
+                    let line_c = if filled {
                         alpha(WHITE, 90)
                     } else {
                         alpha(text, SEP_ALPHA)

@@ -1,4 +1,5 @@
-//! Windows colour mode, accent, transparency and animation settings (read-only).
+//! Windows colour mode, accent, transparency and animation settings (read-only, except the
+//! dark-mode switch of the quick panel).
 
 use vitro_core::style::Theme;
 use windows::core::{w, BOOL, PCWSTR};
@@ -71,6 +72,60 @@ pub fn read_system_theme() -> SystemTheme {
         transparency: personalize_dword(w!("EnableTransparency")).unwrap_or(1) != 0,
         animations: animations(),
     }
+}
+
+/// Windows' dark mode (apps and system both dark); `None` when the value cannot be read.
+pub fn dark_mode() -> Option<bool> {
+    let apps = personalize_dword(w!("AppsUseLightTheme"))?;
+    let system = personalize_dword(w!("SystemUsesLightTheme")).unwrap_or(apps);
+    Some(apps == 0 && system == 0)
+}
+
+/// Switches apps and system to dark (or light), as Settings › Personalization › Colors does:
+/// both values, then the `ImmersiveColorSet` broadcast every window listens for. The
+/// broadcast runs on its own short-lived thread (a hung window would block it for its
+/// timeout). `false` when the values could not be written.
+pub fn set_dark_mode(on: bool) -> bool {
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::System::Registry::{RegSetKeyValueW, REG_DWORD};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SendMessageTimeoutW, HWND_BROADCAST, SMTO_ABORTIFHUNG, WM_SETTINGCHANGE,
+    };
+    let v: u32 = u32::from(!on);
+    let mut ok = true;
+    for name in [w!("AppsUseLightTheme"), w!("SystemUsesLightTheme")] {
+        // SAFETY: a DWORD write under the user's own Personalize key.
+        let r = unsafe {
+            RegSetKeyValueW(
+                HKEY_CURRENT_USER,
+                PERSONALIZE,
+                name,
+                REG_DWORD.0,
+                Some((&v as *const u32).cast()),
+                size_of::<u32>() as u32,
+            )
+        };
+        ok &= r.is_ok();
+    }
+    let _ = std::thread::Builder::new()
+        .name("vitro-theme-broadcast".into())
+        .spawn(|| {
+            let topic: Vec<u16> = "ImmersiveColorSet\0".encode_utf16().collect();
+            // SAFETY: `topic` is NUL-terminated and outlives the call; the broadcast waits at
+            // most 1 s per window and skips hung ones.
+            unsafe {
+                SendMessageTimeoutW(
+                    HWND_BROADCAST,
+                    WM_SETTINGCHANGE,
+                    WPARAM(0),
+                    LPARAM(topic.as_ptr() as isize),
+                    SMTO_ABORTIFHUNG,
+                    1000,
+                    None,
+                );
+            }
+        });
+    ok
 }
 
 /// The Windows display language as a locale tag ("it-IT"), `None` if it cannot be read.

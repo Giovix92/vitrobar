@@ -20,7 +20,7 @@ use vitro_core::quick_model::{
     PowerInputs, QuickInputs, QuickPage, QuickUi, WifiInputs, WifiNet, CUSTOM_PASSWORD,
     SLIDER_VOLUME,
 };
-use vitro_core::settings::Position;
+use vitro_core::settings::{toggle_tile, Position, QuickTile};
 use vitro_core::style::{MaterialStyle, Rgba};
 use vitro_core::text_input::TextInput;
 use vitro_render::compositor::Comp;
@@ -32,6 +32,7 @@ use vitro_win::audio::{self, Audio, AudioSnapshot};
 use vitro_win::bluetooth::{self, Bluetooth, BtError, BtSnapshot, PENDING_MAX};
 use vitro_win::brightness::{Brightness, BrightnessKind, Display};
 use vitro_win::power_status::{self, PowerMode, PowerRegistration, PowerSnapshot};
+use vitro_win::system_theme;
 use vitro_win::wifi::{self, NetKind, Wifi, WifiError, WifiSnapshot};
 use windows::core::Result;
 use windows::Win32::Foundation::HWND;
@@ -70,6 +71,10 @@ pub enum Outcome {
     Close,
     /// Close the panel and open this Windows Settings page.
     Open(String),
+    /// The user changed which tiles show: save them (the panel already shows them).
+    SaveTiles(Vec<QuickTile>),
+    /// Close the panel and lock the PC.
+    Lock,
 }
 
 /// What the panel draws with (owned by the app).
@@ -119,6 +124,9 @@ pub struct QuickPanel {
     can_switch: bool,
     displays: Vec<Display>,
     power: PowerSnapshot,
+    /// The tiles the user picked (settings), edited live on the Edit page.
+    tiles: Vec<QuickTile>,
+    dark_mode: Option<bool>,
     ui: QuickUi,
     password: TextInput,
     /// First masked character shown in the password box (scrolled so the caret stays inside).
@@ -296,6 +304,8 @@ struct Snaps<'a> {
     can_switch: bool,
     displays: &'a [Display],
     power: &'a PowerSnapshot,
+    tiles: &'a [QuickTile],
+    dark_mode: Option<bool>,
 }
 
 fn inputs_of(s: Snaps, ui: &QuickUi, drag: Option<Drag>, lang: Lang) -> QuickInputs {
@@ -316,6 +326,8 @@ fn inputs_of(s: Snaps, ui: &QuickUi, drag: Option<Drag>, lang: Lang) -> QuickInp
         // Ruling S3-3, shipped hidden: no set of controllable radios is detected yet.
         airplane: None,
         ui: ui.clone(),
+        tiles: Some(s.tiles.to_vec()),
+        dark_mode: s.dark_mode,
     }
 }
 
@@ -345,6 +357,7 @@ impl QuickPanel {
         accent: Rgba,
         lang: Lang,
         notify: HWND,
+        tiles: Vec<QuickTile>,
     ) -> Result<Self> {
         let report = |what: &str, e: &windows::core::Error| {
             eprintln!("vitrobar: quick panel: no {what}: {e}");
@@ -376,6 +389,7 @@ impl QuickPanel {
             .map(Brightness::displays)
             .unwrap_or_default();
         let power = power_status::snapshot();
+        let dark_mode = system_theme::dark_mode();
         let ui = QuickUi::default();
         let rows = quick_model::rows(
             QuickPage::Main,
@@ -387,6 +401,8 @@ impl QuickPanel {
                     can_switch,
                     displays: &displays,
                     power: &power,
+                    tiles: &tiles,
+                    dark_mode,
                 },
                 &ui,
                 None,
@@ -414,6 +430,8 @@ impl QuickPanel {
             can_switch,
             displays,
             power,
+            tiles,
+            dark_mode,
             ui,
             password: TextInput::new(),
             pw_first: 0,
@@ -501,6 +519,8 @@ impl QuickPanel {
                 can_switch: self.can_switch,
                 displays: &self.displays,
                 power: &self.power,
+                tiles: &self.tiles,
+                dark_mode: self.dark_mode,
             },
             &self.ui,
             self.drag.or(self.hold.map(|(d, _)| d)),
@@ -883,7 +903,43 @@ impl QuickPanel {
             },
             // Never shown (airplane = None, ruling S3-3).
             Action::ToggleAirplane => Outcome::None,
-            Action::BatterySaver => Outcome::Open("ms-settings:batterysaver".into()),
+            Action::BatterySaver => {
+                // Windows has no public switch for saver on mains power: its page opens.
+                if self.power.on_ac {
+                    return Outcome::Open("ms-settings:batterysaver".into());
+                }
+                if !power_status::set_saver(!self.power.saver) {
+                    eprintln!("vitrobar: Windows did not change battery saver");
+                    return Outcome::Open("ms-settings:batterysaver".into());
+                }
+                // The status change also arrives as a power notification; show it now.
+                self.power = power_status::snapshot();
+                self.render_or_close(g)
+            }
+            Action::ToggleMute => self.toggle_mute(g),
+            Action::ToggleDarkMode => {
+                if let Some(on) = self.dark_mode {
+                    if system_theme::set_dark_mode(!on) {
+                        self.dark_mode = Some(!on);
+                    }
+                }
+                self.render_or_close(g)
+            }
+            Action::Lock => Outcome::Lock,
+            Action::ToggleTile(t) => {
+                self.tiles = toggle_tile(&self.tiles, t);
+                match self.render_or_close(g) {
+                    Outcome::None => Outcome::SaveTiles(self.tiles.clone()),
+                    o => o,
+                }
+            }
+            Action::ResetTiles => {
+                self.tiles = QuickTile::DEFAULT.to_vec();
+                match self.render_or_close(g) {
+                    Outcome::None => Outcome::SaveTiles(self.tiles.clone()),
+                    o => o,
+                }
+            }
             Action::CyclePowerMode => {
                 if let Some(m) = self.power.mode {
                     if !power_status::set_mode(win_mode(next_mode(core_mode(m)))) {
@@ -1000,7 +1056,7 @@ impl QuickPanel {
             }
             QuickPage::Bluetooth => self.read_bt(),
             QuickPage::Output => self.read_audio(),
-            QuickPage::Main => {}
+            QuickPage::Main | QuickPage::Edit => {}
         }
         if let Outcome::Close = self.render_or_close(g) {
             return Outcome::Close;
@@ -1453,6 +1509,7 @@ mod tests {
                 percent: Some(42),
                 charging: false,
                 saver: true,
+                on_ac: false,
                 mode: None,
             },
             Lang::En,

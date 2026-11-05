@@ -4571,6 +4571,7 @@ impl App {
                 accent,
                 lang,
                 self.notify.hwnd,
+                self.settings.quick_tiles.clone(),
             ),
             None => Err(Error::new(E_FAIL, "no quick button on the bar")),
         };
@@ -4632,6 +4633,17 @@ impl App {
             QuickOutcome::Open(uri) => {
                 self.close_quick();
                 self.launcher.launch(Job::Open(uri));
+            }
+            QuickOutcome::SaveTiles(tiles) => {
+                self.settings.quick_tiles = tiles;
+                self.save_settings();
+                self.settings_sync();
+            }
+            QuickOutcome::Lock => {
+                self.close_quick();
+                if let Err(e) = vitro_win::power::perform(vitro_win::power::PowerAction::Lock) {
+                    eprintln!("vitrobar: could not lock: {e}");
+                }
             }
         }
     }
