@@ -238,8 +238,52 @@ pub fn stock_taskbar_visible() -> bool {
     primary_tray().is_some_and(|h| unsafe { IsWindowVisible(h) }.as_bool())
 }
 
+/// Clips a taskbar window to nothing (`hide`) or gives it its full shape back. Explorer's
+/// auto-hide slides a hidden taskbar back in when the cursor touches its screen edge (right
+/// under Vitrobar's bar) and nothing can stop it from doing so; clipped to an empty region
+/// it is neither drawn nor hit-tested, so that slide-in is invisible instead of a flash
+/// until the next re-hide. Explorer recreates its windows when it restarts, so a region
+/// left by a process that died never outlives the next sign-in (and the watchdog clears it
+/// sooner).
+fn set_tray_clipped(h: HWND, hide: bool) {
+    use windows::Win32::Graphics::Gdi::{CreateRectRgn, DeleteObject, SetWindowRgn, HRGN};
+    use windows::Win32::UI::WindowsAndMessaging::IsHungAppWindow;
+    // SAFETY: plain calls. SetWindowRgn waits for Explorer's thread, so a hung one is
+    // skipped (it is hidden anyway, and a show is retried by the next restore). On success
+    // the system owns the region; on failure it is ours to delete.
+    unsafe {
+        if IsHungAppWindow(h).as_bool() {
+            return;
+        }
+        if hide {
+            let rgn = CreateRectRgn(0, 0, 0, 0);
+            if !rgn.is_invalid() && SetWindowRgn(h, Some(rgn), false) == 0 {
+                let _ = DeleteObject(rgn.into());
+            }
+        } else {
+            SetWindowRgn(h, None::<HRGN>, true);
+        }
+    }
+}
+
+/// Explorer's main taskbar window is clipped to nothing (see [`set_tray_clipped`]).
+pub fn stock_taskbar_clipped() -> bool {
+    use windows::Win32::Graphics::Gdi::{CreateRectRgn, DeleteObject, GetWindowRgn, NULLREGION};
+    let Some(h) = primary_tray() else {
+        return false;
+    };
+    // SAFETY: GetWindowRgn copies into a region we own and delete.
+    unsafe {
+        let probe = CreateRectRgn(0, 0, 0, 0);
+        let kind = GetWindowRgn(h, probe);
+        let _ = DeleteObject(probe.into());
+        kind == NULLREGION
+    }
+}
+
 fn set_tray_visible(show: bool) {
     for h in tray_windows() {
+        set_tray_clipped(h, !show);
         // SAFETY: plain calls. Async, so a hung Explorer can never block the caller.
         unsafe {
             // A show is always posted: a hide posted earlier (by a bar that just died, say)

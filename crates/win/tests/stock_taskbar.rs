@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 use vitro_core::settings::StockTaskbar;
 use vitro_win::stock_taskbar::{
     autohide_now, delete_runonce, restore_stock_taskbar, runonce_exists, show_stock_taskbar,
-    stock_taskbar_visible, take_over_stock_taskbar, RestoreRecord, ShellLock,
+    stock_taskbar_clipped, stock_taskbar_visible, take_over_stock_taskbar, RestoreRecord,
+    ShellLock,
 };
 
 fn temp_record(name: &str) -> PathBuf {
@@ -101,8 +102,10 @@ fn restore_twice_is_safe() {
         eventually(|| !stock_taskbar_visible()),
         "Hidden mode leaves the stock taskbar visible"
     );
+    assert!(stock_taskbar_clipped(), "an auto-hide slide-in would flash");
     restore_stock_taskbar(&p).unwrap();
     restore_stock_taskbar(&p).unwrap();
+    assert!(!stock_taskbar_clipped());
     assert!(!p.exists());
     assert_eq!(autohide_now(), original);
     assert!(!runonce_exists());
