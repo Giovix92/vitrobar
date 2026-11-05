@@ -76,12 +76,56 @@ impl RoundRect {
 
     pub(crate) fn set(&self, r: PxRect, radius: f32, c: Rgba) -> Result<()> {
         let (w, h) = ((r.2 - r.0).max(0) as f32, (r.3 - r.1).max(0) as f32);
+        let _ = self.visual.StopAnimation(windows::core::h!("Offset"));
+        let _ = self.geom.StopAnimation(windows::core::h!("Size"));
         self.visual
             .SetOffset(Vector3::new(r.0 as f32, r.1 as f32, 0.0))?;
         self.visual.SetSize(Vector2::new(w, h))?;
         self.geom.SetSize(Vector2::new(w, h))?;
         self.geom.SetCornerRadius(Vector2::new(radius, radius))?;
         self.brush.SetColor(color(c))
+    }
+
+    /// Like [`RoundRect::set`], but slides there over `ms` from wherever it is now (a hover
+    /// highlight gliding from one item to the next).
+    pub(crate) fn glide(&self, r: PxRect, radius: f32, c: Rgba, ms: u32) -> Result<()> {
+        use windows::core::h;
+        let (w, h) = ((r.2 - r.0).max(0) as f32, (r.3 - r.1).max(0) as f32);
+        let comp = self.visual.Compositor()?;
+        let ease =
+            comp.CreateCubicBezierEasingFunction(Vector2::new(0.1, 0.9), Vector2::new(0.2, 1.0))?;
+        let span =
+            windows::Foundation::TimeSpan::from(std::time::Duration::from_millis(u64::from(ms)));
+        let to_off = Vector3::new(r.0 as f32, r.1 as f32, 0.0);
+        let off = comp.CreateVector3KeyFrameAnimation()?;
+        off.InsertExpressionKeyFrame(0.0, h!("this.StartingValue"))?;
+        off.InsertKeyFrameWithEasingFunction(1.0, to_off, &ease)?;
+        off.SetDuration(span)?;
+        let size = comp.CreateVector2KeyFrameAnimation()?;
+        size.InsertExpressionKeyFrame(0.0, h!("this.StartingValue"))?;
+        size.InsertKeyFrameWithEasingFunction(1.0, Vector2::new(w, h), &ease)?;
+        size.SetDuration(span)?;
+        // The visual's own size only clips: it takes the larger of the two at once.
+        let cur = self.visual.Size()?;
+        self.visual
+            .SetSize(Vector2::new(cur.X.max(w), cur.Y.max(h)))?;
+        self.visual.StartAnimation(h!("Offset"), &off)?;
+        self.geom.StartAnimation(h!("Size"), &size)?;
+        self.geom.SetCornerRadius(Vector2::new(radius, radius))?;
+        self.brush.SetColor(color(c))
+    }
+
+    /// Fades the shape to `to` (0..=1) over `ms`.
+    pub(crate) fn fade(&self, to: f32, ms: u32) -> Result<()> {
+        use windows::core::h;
+        let comp = self.visual.Compositor()?;
+        let a = comp.CreateScalarKeyFrameAnimation()?;
+        a.InsertExpressionKeyFrame(0.0, h!("this.StartingValue"))?;
+        a.InsertKeyFrame(1.0, to)?;
+        a.SetDuration(windows::Foundation::TimeSpan::from(
+            std::time::Duration::from_millis(u64::from(ms)),
+        ))?;
+        self.visual.StartAnimation(h!("Opacity"), &a)
     }
 }
 

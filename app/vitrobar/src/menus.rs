@@ -206,6 +206,9 @@ impl Drop for ForegroundWatch {
     }
 }
 
+/// A menu's pop-in.
+const MENU_OPEN_MS: u32 = 110;
+
 /// Shows `entries` at `at` (screen px) and runs the menu until it ends: the chosen command's
 /// id, or 0 when it was dismissed. `owner` is the window the menu belongs to; a panel (Start)
 /// gets the foreground back afterwards.
@@ -217,6 +220,11 @@ fn run(owner: HWND, ctx: &MenuCtx, at: (i32, i32), entries: &[Entry]) -> u32 {
             return 0;
         }
     };
+    if vitro_render::panel_view::animations() {
+        if let Err(e) = view.animate_open(MENU_OPEN_MS) {
+            eprintln!("vitrobar: the menu could not animate in: {e}");
+        }
+    }
     let me = view.hwnd();
     let _ = take_deactivated_of(me);
     // Without the foreground nothing would tell us about a click elsewhere: take the mouse

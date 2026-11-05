@@ -338,109 +338,19 @@ impl Panel {
     /// Opens the panel over `ms` with `motion`: a composition animation (the compositor runs
     /// it, no timer). Call right after `show`.
     pub fn animate_open(&self, ms: u32, motion: Motion) -> Result<()> {
-        let comp = self.root.Compositor()?;
-        let ease =
-            comp.CreateCubicBezierEasingFunction(Vector2::new(0.1, 0.9), Vector2::new(0.2, 1.0))?;
-        let span = duration(ms);
-        let fade = comp.CreateScalarKeyFrameAnimation()?;
-        fade.InsertKeyFrame(0.0, 0.0)?;
-        fade.InsertKeyFrameWithEasingFunction(1.0, 1.0, &ease)?;
-        fade.SetDuration(span)?;
-        let mv = self.motion_animation(&comp, motion, true, &ease, span)?;
-        self.root.SetOpacity(0.0)?;
-        // Once the root is transparent, any failure must put it back: an invisible panel
-        // that still takes the foreground would hold the keyboard with nothing on screen.
-        or_restore(
-            || {
-                self.root.StartAnimation(h!("Opacity"), &fade)?;
-                self.root.StartAnimation(mv.0, &mv.1)
-            },
-            || self.show_static(),
-        )
+        animate_open(&self.root, self.scale, ms, motion)
     }
 
-    /// The reverse of [`Panel::animate_open`]: fades the panel out over `ms` while it slides
-    /// back / shrinks, starting from what is on screen now (a close during the open
-    /// animation does not pop). The window still takes mouse input while it fades: the owner
-    /// drops it on the first click ([`take_panel_clicks`]) and once `ms` has passed.
+    /// The reverse of [`Panel::animate_open`] (see [`animate_close`]). The window still takes
+    /// mouse input while it fades: the owner drops it on the first click
+    /// ([`take_panel_clicks`]) and once `ms` has passed.
     pub fn animate_close(&self, ms: u32, motion: Motion) -> Result<()> {
-        // Stop the open animation where it is; the close starts from that state.
-        let _ = self.root.StopAnimation(h!("Opacity"));
-        let _ = self.root.StopAnimation(h!("Scale"));
-        let _ = self.root.StopAnimation(h!("Offset"));
-        let opacity = self.root.Opacity()?;
-        let comp = self.root.Compositor()?;
-        let ease =
-            comp.CreateCubicBezierEasingFunction(Vector2::new(0.4, 0.0), Vector2::new(1.0, 1.0))?;
-        let span = duration(ms);
-        let fade = comp.CreateScalarKeyFrameAnimation()?;
-        fade.InsertKeyFrame(0.0, opacity)?;
-        fade.InsertKeyFrameWithEasingFunction(1.0, 0.0, &ease)?;
-        fade.SetDuration(span)?;
-        let mv = self.motion_animation(&comp, motion, false, &ease, span)?;
-        self.root.StartAnimation(h!("Opacity"), &fade)?;
-        self.root.StartAnimation(mv.0, &mv.1)
+        animate_close(&self.root, self.scale, ms, motion)
     }
 
-    /// The position / scale animation of `motion`, opening (`opening`) or closing, with the
-    /// property it drives.
-    fn motion_animation(
-        &self,
-        comp: &Compositor,
-        motion: Motion,
-        opening: bool,
-        ease: &CubicBezierEasingFunction,
-        span: TimeSpan,
-    ) -> Result<(&'static HSTRING, Vector3KeyFrameAnimation)> {
-        let anim = comp.CreateVector3KeyFrameAnimation()?;
-        let (prop, rest, away) = match motion {
-            Motion::Grow => {
-                let size = self.root.Size()?;
-                self.root
-                    .SetCenterPoint(Vector3::new(size.X / 2.0, size.Y / 2.0, 0.0))?;
-                (
-                    h!("Scale"),
-                    Vector3::new(1.0, 1.0, 1.0),
-                    Vector3::new(0.98, 0.98, 1.0),
-                )
-            }
-            Motion::Rise { from } => {
-                // The root never sits anywhere but 0 (as `show_static` assumes).
-                let (dx, dy) = rise_offset(from, self.scale);
-                (
-                    h!("Offset"),
-                    Vector3::new(0.0, 0.0, 0.0),
-                    Vector3::new(dx, dy, 0.0),
-                )
-            }
-        };
-        let (start, end) = if opening {
-            (away, rest)
-        } else {
-            // From the current state (an open animation may have been cut short).
-            let now = if prop == h!("Scale") {
-                self.root.Scale()?
-            } else {
-                self.root.Offset()?
-            };
-            (now, away)
-        };
-        anim.InsertKeyFrame(0.0, start)?;
-        anim.InsertKeyFrameWithEasingFunction(1.0, end, ease)?;
-        anim.SetDuration(span)?;
-        Ok((prop, anim))
-    }
-
-    /// Puts the panel in its final, fully visible state: animations stopped, opacity 1,
-    /// scale 1, offset 0 (the root never sits anywhere else). Best effort (each step is
-    /// tried even if an earlier one fails).
+    /// Puts the panel in its final, fully visible state (see [`show_static`]).
     pub fn show_static(&self) {
-        let _ = self.root.StopAnimation(h!("Opacity"));
-        let _ = self.root.StopAnimation(h!("Scale"));
-        let _ = self.root.StopAnimation(h!("Offset"));
-        let _ = self.root.SetOpacity(1.0);
-        let _ = self.root.SetScale(Vector3::new(1.0, 1.0, 1.0));
-        let _ = self.root.SetOffset(Vector3::new(0.0, 0.0, 0.0));
+        show_static(&self.root)
     }
 
     /// Makes the top `dip` band of the panel a window caption (drag to move). Default 0.
@@ -542,6 +452,114 @@ impl Panel {
 /// Runs `attempt`; if it fails, runs `restore` before handing the error back.
 fn or_restore<T>(attempt: impl FnOnce() -> Result<T>, restore: impl FnOnce()) -> Result<T> {
     attempt().inspect_err(|_| restore())
+}
+
+/// Opens a window's `root` visual over `ms` with `motion` (`scale` px per DIP): it fades in
+/// while it rises from the bar's side or grows. A composition animation: the compositor runs
+/// it, no timer. Shared by the panels and the flyouts.
+pub fn animate_open(root: &ContainerVisual, scale: f32, ms: u32, motion: Motion) -> Result<()> {
+    let comp = root.Compositor()?;
+    let ease =
+        comp.CreateCubicBezierEasingFunction(Vector2::new(0.1, 0.9), Vector2::new(0.2, 1.0))?;
+    let span = duration(ms);
+    let fade = comp.CreateScalarKeyFrameAnimation()?;
+    fade.InsertKeyFrame(0.0, 0.0)?;
+    fade.InsertKeyFrameWithEasingFunction(1.0, 1.0, &ease)?;
+    fade.SetDuration(span)?;
+    let mv = motion_animation(root, scale, &comp, motion, true, &ease, span)?;
+    root.SetOpacity(0.0)?;
+    // Once the root is transparent, any failure must put it back: an invisible panel
+    // that still takes the foreground would hold the keyboard with nothing on screen.
+    or_restore(
+        || {
+            root.StartAnimation(h!("Opacity"), &fade)?;
+            root.StartAnimation(mv.0, &mv.1)
+        },
+        || show_static(root),
+    )
+}
+
+/// The reverse of [`animate_open`]: fades `root` out over `ms` while it slides back /
+/// shrinks, starting from what is on screen now (a close during the open animation does not
+/// pop).
+pub fn animate_close(root: &ContainerVisual, scale: f32, ms: u32, motion: Motion) -> Result<()> {
+    // Stop the open animation where it is; the close starts from that state.
+    let _ = root.StopAnimation(h!("Opacity"));
+    let _ = root.StopAnimation(h!("Scale"));
+    let _ = root.StopAnimation(h!("Offset"));
+    let opacity = root.Opacity()?;
+    let comp = root.Compositor()?;
+    let ease =
+        comp.CreateCubicBezierEasingFunction(Vector2::new(0.4, 0.0), Vector2::new(1.0, 1.0))?;
+    let span = duration(ms);
+    let fade = comp.CreateScalarKeyFrameAnimation()?;
+    fade.InsertKeyFrame(0.0, opacity)?;
+    fade.InsertKeyFrameWithEasingFunction(1.0, 0.0, &ease)?;
+    fade.SetDuration(span)?;
+    let mv = motion_animation(root, scale, &comp, motion, false, &ease, span)?;
+    root.StartAnimation(h!("Opacity"), &fade)?;
+    root.StartAnimation(mv.0, &mv.1)
+}
+
+/// The position / scale animation of `motion`, opening (`opening`) or closing, with the
+/// property it drives.
+fn motion_animation(
+    root: &ContainerVisual,
+    scale: f32,
+    comp: &Compositor,
+    motion: Motion,
+    opening: bool,
+    ease: &CubicBezierEasingFunction,
+    span: TimeSpan,
+) -> Result<(&'static HSTRING, Vector3KeyFrameAnimation)> {
+    let anim = comp.CreateVector3KeyFrameAnimation()?;
+    let (prop, rest, away) = match motion {
+        Motion::Grow => {
+            let size = root.Size()?;
+            root.SetCenterPoint(Vector3::new(size.X / 2.0, size.Y / 2.0, 0.0))?;
+            (
+                h!("Scale"),
+                Vector3::new(1.0, 1.0, 1.0),
+                Vector3::new(0.98, 0.98, 1.0),
+            )
+        }
+        Motion::Rise { from } => {
+            // The root never sits anywhere but 0 (as `show_static` assumes).
+            let (dx, dy) = rise_offset(from, scale);
+            (
+                h!("Offset"),
+                Vector3::new(0.0, 0.0, 0.0),
+                Vector3::new(dx, dy, 0.0),
+            )
+        }
+    };
+    let (start, end) = if opening {
+        (away, rest)
+    } else {
+        // From the current state (an open animation may have been cut short).
+        let now = if prop == h!("Scale") {
+            root.Scale()?
+        } else {
+            root.Offset()?
+        };
+        (now, away)
+    };
+    anim.InsertKeyFrame(0.0, start)?;
+    anim.InsertKeyFrameWithEasingFunction(1.0, end, ease)?;
+    anim.SetDuration(span)?;
+    Ok((prop, anim))
+}
+
+/// Puts `root` in its final, fully visible state: animations stopped, opacity 1, scale 1,
+/// offset 0 (the root never sits anywhere else). Best effort (each step is tried even if an
+/// earlier one fails).
+pub fn show_static(root: &ContainerVisual) {
+    let _ = root.StopAnimation(h!("Opacity"));
+    let _ = root.StopAnimation(h!("Scale"));
+    let _ = root.StopAnimation(h!("Offset"));
+    let _ = root.SetOpacity(1.0);
+    let _ = root.SetScale(Vector3::new(1.0, 1.0, 1.0));
+    let _ = root.SetOffset(Vector3::new(0.0, 0.0, 0.0));
 }
 
 impl Drop for Panel {

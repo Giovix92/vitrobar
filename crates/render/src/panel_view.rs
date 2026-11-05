@@ -63,6 +63,24 @@ fn round(v: f32) -> i32 {
     v.round() as i32
 }
 
+/// Windows' "Animation effects" setting, as the app last read it: off, every highlight and
+/// panel appears at once.
+static ANIMATIONS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Follows Windows' "Animation effects" (the app calls it at start-up and on a change).
+pub fn set_animations(on: bool) {
+    ANIMATIONS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether panels animate (see [`set_animations`]).
+pub fn animations() -> bool {
+    ANIMATIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The hover highlight's glide from one part to the next, and its fade.
+const GLIDE_MS: u32 = 140;
+const FADE_MS: u32 = 110;
+
 /// What drawing a row needs.
 struct Ctx<'a> {
     comp: &'a Compositor,
@@ -549,6 +567,8 @@ pub struct PanelView {
     // Field order = drop order: the visuals before the flyout (window) they live in.
     ring: Ring,
     hot_plate: RoundRect,
+    /// The hover plate is showing (it glides to the next part instead of jumping).
+    hot_shown: std::cell::Cell<bool>,
     rows: Vec<RowVis>,
     rows_layer: ContainerVisual,
     content: ContainerVisual,
@@ -606,6 +626,7 @@ impl PanelView {
         let mut view = Self {
             ring,
             hot_plate,
+            hot_shown: std::cell::Cell::new(false),
             rows: Vec::new(),
             rows_layer,
             content,
@@ -806,10 +827,30 @@ impl PanelView {
                     Part::Tile(_) | Part::TileMore(_) => TILE_RADIUS_DIP,
                     _ => PLATE_RADIUS_DIP,
                 };
-                self.hot_plate.set(px(&r), radius * s, alpha(text, a))?;
+                let c = alpha(text, a);
+                if !animations() {
+                    self.hot_plate.set(px(&r), radius * s, c)?;
+                    self.hot_plate.visual.SetOpacity(1.0)?;
+                } else if self.hot_shown.get() {
+                    self.hot_plate.glide(px(&r), radius * s, c, GLIDE_MS)?;
+                    self.hot_plate.fade(1.0, FADE_MS)?;
+                } else {
+                    // From nothing: it appears in place and fades in.
+                    self.hot_plate.set(px(&r), radius * s, c)?;
+                    self.hot_plate.visual.SetOpacity(0.0)?;
+                    self.hot_plate.fade(1.0, FADE_MS)?;
+                }
                 self.hot_plate.visual.SetIsVisible(true)?;
+                self.hot_shown.set(true);
             }
-            None => self.hot_plate.visual.SetIsVisible(false)?,
+            None => {
+                if self.hot_shown.get() && animations() {
+                    self.hot_plate.fade(0.0, FADE_MS)?;
+                } else {
+                    self.hot_plate.visual.SetIsVisible(false)?;
+                }
+                self.hot_shown.set(false);
+            }
         }
         match self
             .focus
@@ -824,6 +865,16 @@ impl PanelView {
             }
             None => self.ring.visual.SetIsVisible(false),
         }
+    }
+
+    /// Fades the panel in, rising from the bar's side.
+    pub fn animate_open(&self, ms: u32, from: Position) -> Result<()> {
+        self.flyout.animate_open(ms, from)
+    }
+
+    /// Fades the panel out towards the bar (the owner keeps it for `ms`, then drops it).
+    pub fn animate_close(&self, ms: u32, from: Position) -> Result<()> {
+        self.flyout.animate_close(ms, from)
     }
 
     /// Highlights `p` (hover); only the plate moves.

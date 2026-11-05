@@ -175,6 +175,16 @@ impl MenuView {
         })
     }
 
+    /// Fades the menu in while it grows from 98 % (a quick pop, as Windows' own menus).
+    pub fn animate_open(&self, ms: u32) -> Result<()> {
+        crate::panel::animate_open(
+            self.flyout.root(),
+            self.flyout.scale(),
+            ms,
+            crate::panel::Motion::Grow,
+        )
+    }
+
     pub fn hwnd(&self) -> HWND {
         self.flyout.hwnd()
     }

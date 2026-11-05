@@ -416,6 +416,28 @@ impl Flyout {
         &self.root
     }
 
+    /// Fades the flyout in while it rises from the bar's side (see
+    /// [`crate::panel::animate_open`]). Call right after `show`.
+    pub fn animate_open(&self, ms: u32, from: Position) -> Result<()> {
+        crate::panel::animate_open(
+            &self.root,
+            self.scale,
+            ms,
+            crate::panel::Motion::Rise { from },
+        )
+    }
+
+    /// Fades the flyout out towards the bar. It still takes input meanwhile: the owner keeps
+    /// it only for the fade and routes nothing to it.
+    pub fn animate_close(&self, ms: u32, from: Position) -> Result<()> {
+        crate::panel::animate_close(
+            &self.root,
+            self.scale,
+            ms,
+            crate::panel::Motion::Rise { from },
+        )
+    }
+
     /// Makes the flyout the foreground window (it then hears keys, and a click elsewhere
     /// deactivates it: see [`take_deactivated`]). Only allowed right after the user clicked
     /// one of our windows; false if Windows refused.

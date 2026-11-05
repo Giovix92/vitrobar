@@ -37,6 +37,9 @@ const VK_UP: u32 = 0x26;
 const VK_RIGHT: u32 = 0x27;
 const VK_DOWN: u32 = 0x28;
 
+/// The window's grow-in.
+const OPEN_MS: u32 = 180;
+
 /// One wheel notch (120) scrolls this far.
 const WHEEL_STEP_DIP: f32 = 48.0;
 
@@ -419,6 +422,12 @@ impl SettingsWindow {
         settings: &Settings,
     ) -> Result<Self> {
         let mut panel = Panel::show(comp, rect_px, dpi, style, RADIUS_DIP, title, true)?;
+        if vitro_render::panel_view::animations() {
+            if let Err(e) = panel.animate_open(OPEN_MS, vitro_render::panel::Motion::Grow) {
+                eprintln!("vitrobar: the settings window could not animate in: {e}");
+                panel.show_static();
+            }
+        }
         panel.set_drag_height(DRAG_DIP);
         panel.set_drag_exclude_right(CLOSE_W_DIP);
         let view = SettingsView::new(&panel)?;

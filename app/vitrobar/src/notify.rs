@@ -110,6 +110,8 @@ pub const TIMER_TRAY_TIP: usize = 0x5707;
 pub const TIMER_START_PREFETCH: usize = 0x5708;
 /// One-shot after the Start panel's close animation: the fading panel can be destroyed.
 pub const TIMER_START_CLOSED: usize = 0x5709;
+/// One-shot after a flyout's close animation: the faded flyouts can be destroyed.
+pub const TIMER_FADED: usize = 0x5720;
 /// One-shot: a Wi-Fi scan's deadline passed (the quick panel re-reads the list).
 pub const TIMER_QUICK_SCAN: usize = 0x570A;
 /// One-shot: a Bluetooth connect / disconnect may have expired unconfirmed.

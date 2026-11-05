@@ -116,9 +116,9 @@ use crate::launcher::{Job, Launcher};
 use crate::menus::{app_menu, bar_menu, power_menu, start_item_menu, MenuChoice, MenuCtx};
 use crate::notify::{
     inbox_pending, take_inbox, Inbox, NotifyWindow, TIMER_CALENDAR_MIDNIGHT, TIMER_CLAUDE_MINUTE,
-    TIMER_CLAUDE_STALE, TIMER_CLOCK, TIMER_GPU_RETRY, TIMER_HOVER_HIDE, TIMER_HOVER_SHOW,
-    TIMER_IME, TIMER_MARGIN_COLLAPSE, TIMER_QUICK_BT, TIMER_QUICK_SCAN, TIMER_REASSERT,
-    TIMER_START_CLOSED, TIMER_START_PREFETCH, TIMER_TRAY_TIP, WM_APP_TAKE_OVER,
+    TIMER_CLAUDE_STALE, TIMER_CLOCK, TIMER_FADED, TIMER_GPU_RETRY, TIMER_HOVER_HIDE,
+    TIMER_HOVER_SHOW, TIMER_IME, TIMER_MARGIN_COLLAPSE, TIMER_QUICK_BT, TIMER_QUICK_SCAN,
+    TIMER_REASSERT, TIMER_START_CLOSED, TIMER_START_PREFETCH, TIMER_TRAY_TIP, WM_APP_TAKE_OVER,
 };
 use crate::quick::{Gfx, Outcome as QuickOutcome, QuickPanel};
 use crate::settings_window::{apply_choice, Effect, SettingsAction, SettingsInput, SettingsWindow};
@@ -184,6 +184,9 @@ const GRID_OPEN_MS: u32 = 180;
 const GRID_CLOSE_MS: u32 = 130;
 /// How long past its close animation a fading panel lives before the timer destroys it.
 const START_CLOSED_SLACK_MS: u32 = 30;
+/// The bar's flyouts (quick, calendar, music, Claude): a shorter rise than Start's.
+const FLYOUT_OPEN_MS: u32 = 150;
+const FLYOUT_CLOSE_MS: u32 = 100;
 
 /// Debug hook for live tests of the Start panel's power menu: `1` makes every power action a
 /// dry run (recorded, never carried out). Honoured only together with `--debug-state`.
@@ -629,6 +632,9 @@ struct App {
     strip: Option<Strip>,
     /// The open Start panel (its visuals and window go before the compositor and GPU).
     start: Option<StartPanel>,
+    /// Flyouts fading out after a close (quick, calendar, music, Claude): kept only until
+    /// their animation ends ([`TIMER_FADED`]); nothing is routed to them.
+    fading: Vec<Box<dyn std::any::Any>>,
     /// The Start panel that is fading out (no longer `start`: it takes no input). Dropped by
     /// `TIMER_START_CLOSED`, by the next `open_start` or by any close that must be immediate.
     start_closing: Option<StartPanel>,
@@ -757,6 +763,7 @@ impl App {
             .ok_or_else(|| Error::new(E_FAIL, "no monitor"))?
             .id();
         let sys = read_system_theme();
+        vitro_render::panel_view::set_animations(sys.animations);
         let notify = NotifyWindow::create()?;
         // Carry 10: after the UI thread's own CoInitializeEx.
         let desktops = Desktops::new()?;
@@ -773,6 +780,7 @@ impl App {
             overflow: None,
             strip: None,
             start: None,
+            fading: Vec::new(),
             start_closing: None,
             start_closing_until: Instant::now(),
             start_data: StartData::new(),
@@ -1934,6 +1942,7 @@ impl App {
                 self.kill_timer(TIMER_TRAY_TIP);
                 self.show_tooltip();
             }
+            TIMER_FADED => self.drop_fading(),
             TIMER_START_CLOSED => {
                 // A timer of an earlier panel, queued before it was re-armed, is not this
                 // panel's: only the deadline of the panel now fading counts.
@@ -2360,6 +2369,10 @@ impl App {
             &self.style,
         )
         .and_then(|flyout| {
+            if self.sys.animations {
+                // A failed animation puts the flyout back as it is (never invisible).
+                let _ = flyout.animate_open(FLYOUT_OPEN_MS, self.settings.position);
+            }
             let mut grid = TrayGrid::new(&flyout)?;
             grid.set(&self.painter, slot, &images, self.style.text)?;
             Ok(Overflow {
@@ -2848,6 +2861,9 @@ impl App {
             .collect();
         let raw: Vec<HWND> = windows.iter().map(|(h, _)| *h).collect();
         let size = ThumbnailStrip::size_dip(&raw);
+        // A strip that replaces another (the pointer moved to the next app) does not rise
+        // again: only the first one animates.
+        let rise = self.sys.animations && self.strip.is_none();
         let opened = Flyout::show(
             &self.comp,
             anchor,
@@ -2857,6 +2873,10 @@ impl App {
             &self.style,
         )
         .and_then(|flyout| {
+            if rise {
+                // A failed animation puts the flyout back as it is (never invisible).
+                let _ = flyout.animate_open(FLYOUT_OPEN_MS, self.settings.position);
+            }
             let thumbs = ThumbnailStrip::show(&flyout, &self.painter, self.style.text, &windows)?;
             Ok(Strip {
                 thumbs,
@@ -3493,6 +3513,29 @@ impl App {
         true
     }
 
+    /// Keeps a closed flyout until its fade-out has run.
+    fn keep_fading(&mut self, panel: Box<dyn std::any::Any>) {
+        self.fading.push(panel);
+        // SAFETY: one-shot timer on our own window (killed when it fires); setting it again
+        // waits for the newest fade.
+        unsafe {
+            SetTimer(
+                Some(self.notify.hwnd),
+                TIMER_FADED,
+                FLYOUT_CLOSE_MS + START_CLOSED_SLACK_MS,
+                None,
+            )
+        };
+    }
+
+    /// Destroys every flyout that was fading out.
+    fn drop_fading(&mut self) {
+        if !self.fading.is_empty() {
+            self.fading.clear();
+            self.kill_timer(TIMER_FADED);
+        }
+    }
+
     /// Destroys the Start panel that is fading out, if any.
     fn drop_start_closing(&mut self) {
         if self.start_closing.take().is_some() {
@@ -3846,6 +3889,11 @@ impl App {
         match opened {
             Ok(mut c) => {
                 c.fg_at_open = fg;
+                if self.sys.animations {
+                    if let Err(e) = c.animate_open(FLYOUT_OPEN_MS, self.settings.position) {
+                        eprintln!("vitrobar: the calendar panel could not animate in: {e}");
+                    }
+                }
                 if !c.activate() {
                     eprintln!("vitrobar: the calendar panel could not take the foreground");
                 }
@@ -3884,8 +3932,15 @@ impl App {
         };
         if hand_back {
             let _ = self.hand_back_foreground(c.hwnd(), c.fg_at_open);
+            if self.sys.animations
+                && c.animate_close(FLYOUT_CLOSE_MS, self.settings.position)
+                    .is_ok()
+            {
+                self.keep_fading(Box::new(c));
+            }
+        } else {
+            drop(c);
         }
-        drop(c);
         if self.opts.debug_state {
             eprintln!("vitrobar-calendar-closed");
         }
@@ -4110,6 +4165,11 @@ impl App {
         match opened {
             Ok(mut p) => {
                 p.fg_at_open = fg;
+                if self.sys.animations {
+                    if let Err(e) = p.animate_open(FLYOUT_OPEN_MS, self.settings.position) {
+                        eprintln!("vitrobar: the music panel could not animate in: {e}");
+                    }
+                }
                 if !p.activate() {
                     eprintln!("vitrobar: the music panel could not take the foreground");
                 }
@@ -4157,8 +4217,15 @@ impl App {
         };
         if hand_back {
             let _ = self.hand_back_foreground(p.hwnd(), p.fg_at_open);
+            if self.sys.animations
+                && p.animate_close(FLYOUT_CLOSE_MS, self.settings.position)
+                    .is_ok()
+            {
+                self.keep_fading(Box::new(p));
+            }
+        } else {
+            drop(p);
         }
-        drop(p);
         // A late artwork is not kept.
         if let Some(m) = &self.music {
             let _ = m.take_thumbnail();
@@ -4412,6 +4479,11 @@ impl App {
         match opened {
             Ok(mut p) => {
                 p.fg_at_open = fg;
+                if self.sys.animations {
+                    if let Err(e) = p.animate_open(FLYOUT_OPEN_MS, self.settings.position) {
+                        eprintln!("vitrobar: the Claude panel could not animate in: {e}");
+                    }
+                }
                 if !p.activate() {
                     eprintln!("vitrobar: the Claude panel could not take the foreground");
                 }
@@ -4444,8 +4516,15 @@ impl App {
         };
         if hand_back {
             let _ = self.hand_back_foreground(p.hwnd(), p.fg_at_open);
+            if self.sys.animations
+                && p.animate_close(FLYOUT_CLOSE_MS, self.settings.position)
+                    .is_ok()
+            {
+                self.keep_fading(Box::new(p));
+            }
+        } else {
+            drop(p);
         }
-        drop(p);
         self.kill_timer(TIMER_CLAUDE_MINUTE);
         if self.opts.debug_state {
             eprintln!("vitrobar-claude-closed");
@@ -4578,6 +4657,11 @@ impl App {
         match opened {
             Ok(mut q) => {
                 q.fg_at_open = fg;
+                if self.sys.animations {
+                    if let Err(e) = q.animate_open(FLYOUT_OPEN_MS, self.settings.position) {
+                        eprintln!("vitrobar: the quick panel could not animate in: {e}");
+                    }
+                }
                 if !q.activate() {
                     eprintln!("vitrobar: the quick panel could not take the foreground");
                 }
@@ -4616,8 +4700,15 @@ impl App {
         };
         if hand_back {
             let _ = self.hand_back_foreground(q.hwnd(), q.fg_at_open);
+            if self.sys.animations
+                && q.animate_close(FLYOUT_CLOSE_MS, self.settings.position)
+                    .is_ok()
+            {
+                self.keep_fading(Box::new(q));
+            }
+        } else {
+            drop(q);
         }
-        drop(q);
         if self.opts.debug_state {
             eprintln!("vitrobar-quick-closed");
         }
@@ -5265,6 +5356,7 @@ impl App {
 
     fn on_device_removed(&mut self, dirty: &mut Dirty) {
         // Its surfaces belonged to the lost device.
+        self.drop_fading();
         self.close_start_now();
         self.close_quick_now();
         self.close_calendar_now();
@@ -5505,6 +5597,7 @@ impl App {
             let sys = read_system_theme();
             let style = style_for(&self.settings, &sys);
             if sys != self.sys || style != self.style {
+                vitro_render::panel_view::set_animations(sys.animations);
                 self.sys = sys;
                 self.style = style;
                 redraw = true;

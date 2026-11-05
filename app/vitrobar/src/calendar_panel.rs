@@ -159,6 +159,16 @@ impl CalendarPanel {
         Ok(p)
     }
 
+    /// Fades the panel in, rising from the bar's side.
+    pub fn animate_open(&self, ms: u32, from: Position) -> windows::core::Result<()> {
+        self.view.animate_open(ms, from)
+    }
+
+    /// Fades the panel out towards the bar; the app keeps it for `ms`, then drops it.
+    pub fn animate_close(&self, ms: u32, from: Position) -> windows::core::Result<()> {
+        self.view.animate_close(ms, from)
+    }
+
     pub fn hwnd(&self) -> HWND {
         self.view.hwnd()
     }
