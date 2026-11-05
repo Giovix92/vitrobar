@@ -643,8 +643,8 @@ pub fn tr(lang: Lang, key: Key) -> &'static str {
         (Lang::It, Key::ClaudeSetupFailed) => {
             "Impossibile configurare la riga di stato di Claude Code."
         }
-        (Lang::En, Key::ClaudeUpdatedHint) => "Updated while you use Claude Code.",
-        (Lang::It, Key::ClaudeUpdatedHint) => "Si aggiorna mentre usi Claude Code.",
+        (Lang::En, Key::ClaudeUpdatedHint) => "Refreshed only while Claude Code runs.",
+        (Lang::It, Key::ClaudeUpdatedHint) => "Si aggiorna solo mentre Claude Code è in uso.",
         (Lang::En, Key::ClaudeFiveHour) => "5-hour limit",
         (Lang::It, Key::ClaudeFiveHour) => "Limite di 5 ore",
         (Lang::En, Key::ClaudeWeekly) => "Weekly limit",

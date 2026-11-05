@@ -88,6 +88,42 @@ pub fn today_and_midnight_ms() -> ((i32, u8, u8), u64) {
     )
 }
 
+/// `epoch_secs` as the user reads it: the local short time, with the short date before it
+/// when it is not today ("05/11/2026 14:05"); empty if it cannot be converted.
+pub fn local_stamp(epoch_secs: i64, now_secs: i64) -> String {
+    let (Some(then), Some(now)) = (local_systemtime(epoch_secs), local_systemtime(now_secs)) else {
+        return String::new();
+    };
+    let (time, date) = clock_lines_at(&then);
+    let same_day = (then.wYear, then.wMonth, then.wDay) == (now.wYear, now.wMonth, now.wDay);
+    if same_day {
+        time
+    } else {
+        format!("{date} {time}")
+    }
+}
+
+fn local_systemtime(epoch_secs: i64) -> Option<SYSTEMTIME> {
+    // FILETIME: 100 ns ticks since 1601-01-01.
+    const EPOCH_DIFF_S: i64 = 11_644_473_600;
+    let ticks = epoch_secs
+        .checked_add(EPOCH_DIFF_S)
+        .and_then(|s| s.checked_mul(10_000_000))
+        .filter(|t| *t >= 0)?;
+    let ft = FILETIME {
+        dwLowDateTime: ticks as u32,
+        dwHighDateTime: (ticks >> 32) as u32,
+    };
+    let mut utc = SYSTEMTIME::default();
+    let mut local = SYSTEMTIME::default();
+    // SAFETY: locals passed by reference; a null time zone means the current one.
+    let ok = unsafe {
+        FileTimeToSystemTime(&ft, &mut utc).is_ok()
+            && SystemTimeToTzSpecificLocalTime(None, &utc, &mut local).is_ok()
+    };
+    ok.then_some(local)
+}
+
 /// The local short time (no seconds) of `epoch_secs`, in the user's format; empty if it cannot
 /// be converted.
 pub fn local_short_time(epoch_secs: i64) -> String {

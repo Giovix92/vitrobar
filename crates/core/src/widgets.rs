@@ -192,8 +192,29 @@ pub struct ClaudeUsage {
     pub at: i64,
 }
 
-/// Saved data older than this is marked "old" on the pill.
-pub const STALE_AFTER_S: i64 = 6 * 3600;
+/// Saved data older than this shows its age on the pill ("· 3 h ago"): the limits are shared
+/// with claude.ai and the Claude apps, and only a running Claude Code brings new numbers.
+pub const STALE_AFTER_S: i64 = 3600;
+
+/// "3 h ago" / "2 d ago" (whole hours under a day, whole days after).
+pub fn age_text(secs: i64, lang: Lang) -> String {
+    let h = secs.max(0) / 3600;
+    let (n, unit) = if h < 24 {
+        (h.max(1), "h")
+    } else {
+        (
+            h / 24,
+            match lang {
+                Lang::En => "d",
+                Lang::It => "g",
+            },
+        )
+    };
+    match lang {
+        Lang::En => format!("{n} {unit} ago"),
+        Lang::It => format!("{n} {unit} fa"),
+    }
+}
 /// The Claude pill's cap.
 pub const CLAUDE_PILL_MAX_DIP: f32 = 200.0;
 /// Segoe Fluent Icons "AreaChart".
@@ -300,7 +321,8 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 }
 
 /// "5h 42% · 7d 18%"; one window → only that one; a window whose reset time has passed shows
-/// 0 %; data older than [`STALE_AFTER_S`] gets " · old"; no data → "Claude: no data".
+/// 0 %; data older than [`STALE_AFTER_S`] gets its age (" · 3 h ago"); no data → "Claude: no
+/// data".
 pub fn claude_pill_text(u: Option<&ClaudeUsage>, now: i64, lang: Lang) -> String {
     let no_data = || tr(lang, Key::ClaudeNoData).to_string();
     let Some(u) = u else {
@@ -314,7 +336,7 @@ pub fn claude_pill_text(u: Option<&ClaudeUsage>, now: i64, lang: Lang) -> String
         return no_data();
     }
     if now - u.at > STALE_AFTER_S {
-        parts.push(tr(lang, Key::Stale).to_string());
+        parts.push(age_text(now - u.at, lang));
     }
     parts.join(" · ")
 }
@@ -327,11 +349,18 @@ fn shown_used(w: &Window, now: i64) -> f32 {
     }
 }
 
-/// The next moment the pill's text changes by itself: a window resets (it then reads 0 %) or
-/// the data turns "old". `None` when nothing is ahead of `now`.
+/// The next moment the pill's text changes by itself: a window resets (it then reads 0 %),
+/// the data turns stale, or its age ticks over (hourly, daily after a day). `None` when
+/// nothing is ahead of `now`.
 pub fn next_pill_change(u: &ClaudeUsage, now: i64) -> Option<i64> {
     // The first second at which `claude_pill_text` reads differently.
-    let stale = u.at.saturating_add(STALE_AFTER_S + 1);
+    let age = now - u.at;
+    let stale = if age <= STALE_AFTER_S {
+        u.at.saturating_add(STALE_AFTER_S + 1)
+    } else {
+        let step = if age < 86_400 { 3600 } else { 86_400 };
+        u.at.saturating_add((age / step + 1) * step)
+    };
     [u.five_hour, u.seven_day]
         .into_iter()
         .flatten()
@@ -546,11 +575,24 @@ mod claude_tests {
             at: NOW - STALE_AFTER_S - 1,
             ..one
         };
-        assert_eq!(claude_pill_text(Some(&old), NOW, Lang::En), "7d 18% · old");
+        assert_eq!(
+            claude_pill_text(Some(&old), NOW, Lang::En),
+            "7d 18% · 1 h ago"
+        );
         assert_eq!(
             claude_pill_text(Some(&old), NOW, Lang::It),
-            "7d 18% · vecchio"
+            "7d 18% · 1 h fa"
         );
+        let older = ClaudeUsage {
+            at: NOW - 3 * 86_400 - 5,
+            ..one
+        };
+        assert_eq!(
+            claude_pill_text(Some(&older), NOW, Lang::En),
+            "7d 18% · 3 d ago"
+        );
+        assert_eq!(age_text(5 * 3600 + 59, Lang::It), "5 h fa");
+        assert_eq!(age_text(26 * 3600, Lang::It), "1 g fa");
         assert_eq!(claude_pill_text(None, NOW, Lang::En), "Claude: no data");
         assert_eq!(claude_pill_text(None, NOW, Lang::It), "Claude: nessun dato");
     }
@@ -576,17 +618,27 @@ mod claude_tests {
         };
         // The 5-hour reset comes first.
         assert_eq!(next_pill_change(&u, NOW), Some(NOW + 600));
-        // After it: the stale moment (at + 6 h) comes before the weekly reset.
+        // After it: the stale moment (at + 1 h) comes before the weekly reset.
         assert_eq!(
             next_pill_change(&u, NOW + 600),
             Some(NOW - 60 + STALE_AFTER_S + 1)
         );
-        // Past everything but the weekly reset.
+        // Stale: the age ticks every hour ...
         assert_eq!(
-            next_pill_change(&u, NOW + STALE_AFTER_S),
-            Some(NOW + 86_400)
+            next_pill_change(&u, NOW + 2 * 3600),
+            Some(NOW - 60 + 3 * 3600)
         );
-        assert_eq!(next_pill_change(&u, NOW + 86_400), None);
+        // ... and every day after a day (the weekly reset comes first here).
+        assert_eq!(
+            next_pill_change(&u, NOW + 86_400 - 30),
+            Some(NOW + 86_400 - 60 + 60)
+        );
+        let old = ClaudeUsage {
+            five_hour: None,
+            seven_day: Some(win(1.0, None)),
+            at: NOW - 3 * 86_400,
+        };
+        assert_eq!(next_pill_change(&old, NOW), Some(NOW + 86_400));
         let none = ClaudeUsage {
             five_hour: None,
             seven_day: Some(win(1.0, None)),
@@ -651,13 +703,13 @@ mod claude_tests {
         assert!(rows.contains(&Row::Text("as of 17:59".into())));
         assert_eq!(
             rows.last(),
-            Some(&Row::Text("Updated while you use Claude Code.".into()))
+            Some(&Row::Text(tr(Lang::En, Key::ClaudeUpdatedHint).into()))
         );
         let none = claude_rows(None, NOW, "", Lang::It);
         assert_eq!(none[0], Row::Text("Claude: nessun dato".into()));
         assert_eq!(
             none.last(),
-            Some(&Row::Text("Si aggiorna mentre usi Claude Code.".into()))
+            Some(&Row::Text(tr(Lang::It, Key::ClaudeUpdatedHint).into()))
         );
     }
 

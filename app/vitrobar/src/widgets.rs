@@ -556,7 +556,7 @@ const TRACK_ALPHA: u8 = 40;
 
 fn claude_rows_now(usage: Option<&ClaudeUsage>, lang: Lang) -> Vec<Row> {
     let at = usage
-        .map(|u| time_format::local_short_time(u.at))
+        .map(|u| time_format::local_stamp(u.at, now_s()))
         .unwrap_or_default();
     claude_rows(usage, now_s(), &at, lang)
 }
