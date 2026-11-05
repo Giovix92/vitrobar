@@ -21,6 +21,9 @@
 //! - Stuck-key safety: a key-up is swallowed exactly when its key-down was, unless that
 //!   down is older than [`SWALLOW_TTL_MS`] (its up was lost) or the session switched.
 //! - A mouse button anywhere ends focus mode ([`HookState::on_mouse_down`]).
+//! - Input forwarded to another computer (a software KVM such as Mouse Without Borders has
+//!   the cursor on another PC and sends it the keys): the hook behaves as disabled, so the
+//!   Windows key and its shortcuts reach that other PC ([`Held::forwarded`]).
 //! - Hung-UI fallback: when an output has waited more than [`UI_STALL_MS`] for the UI thread
 //!   to drain it, the hook behaves as disabled (Windows' own Start and shortcuts, no focus
 //!   mode) until the UI drains again ([`HookState::ui_drained`]). Pairs already in flight are
@@ -94,6 +97,10 @@ pub enum HookOutput {
 pub struct Held {
     pub win: bool,
     pub modifier: bool,
+    /// Keys typed now go to another computer (a software KVM is forwarding them): decide as
+    /// if disabled. Read on each key-down and kept until the next one, so the Windows-key
+    /// up of a forwarded press is forwarded too.
+    pub forwarded: bool,
 }
 
 /// An output the UI thread has not drained for this long (ms) means the UI is hung or busy:
@@ -176,6 +183,8 @@ pub struct HookState {
     mods: VkSet,
     /// Event time of the oldest output the UI thread has not drained yet.
     pending_since: Option<u32>,
+    /// The last key-down was forwarded to another computer ([`Held::forwarded`]).
+    forwarded: bool,
 }
 
 impl HookState {
@@ -190,6 +199,7 @@ impl HookState {
             swallowed_at: [0; 256],
             mods: VkSet::default(),
             pending_since: None,
+            forwarded: false,
         }
     }
 
@@ -229,6 +239,7 @@ impl HookState {
     /// Only ever forgets: a key the hook saw go up stays up, and a key it never saw go down
     /// is not invented.
     pub fn sync_held(&mut self, held: Held) {
+        self.forwarded = held.forwarded;
         if !held.win {
             self.wins.clear();
             self.other_pressed = false;
@@ -280,7 +291,7 @@ impl HookState {
     /// caller queues the output (if any) for the UI thread and calls [`Self::ui_drained`]
     /// whenever the UI takes the queue.
     pub fn on_event_at(&mut self, ev: KeyEv, now: u32) -> (HookDecision, Option<HookOutput>) {
-        if self.ui_stalled(now) {
+        if self.ui_stalled(now) || self.forwarded {
             return self.on_event_stalled(ev, now);
         }
         let r = self.decide(ev, now);
@@ -290,7 +301,8 @@ impl HookState {
         r
     }
 
-    /// The UI is not draining: decide as if disabled (stock), but finish in-flight pairs.
+    /// The UI is not draining, or the keys go to another computer: decide as if disabled
+    /// (stock), but finish in-flight pairs.
     fn on_event_stalled(&mut self, ev: KeyEv, now: u32) -> (HookDecision, Option<HookOutput>) {
         // Focus mode would eat the navigation keys for a UI that cannot act on them.
         let left_focus = std::mem::take(&mut self.focus_mode);
@@ -657,6 +669,7 @@ mod tests {
         h.sync_held(Held {
             win: false,
             modifier: false,
+            forwarded: false,
         });
         assert_eq!(tap(&mut h, 0x33), [(Pass, None), (Pass, None)]);
         // A stray Win up later is harmless.
@@ -672,6 +685,7 @@ mod tests {
         h.sync_held(Held {
             win: true,
             modifier: false,
+            forwarded: false,
         });
         h.on_event(Down(VK_LWIN));
         assert_eq!(h.on_event(Down(0x31)), (Swallow, Some(LaunchNth(1))));
@@ -839,6 +853,50 @@ mod tests {
             h.ui_drained();
         }
         assert!(!h.ui_stalled(100_000));
+    }
+
+    fn forwarded(on: bool) -> Held {
+        Held {
+            win: true,
+            modifier: false,
+            forwarded: on,
+        }
+    }
+
+    #[test]
+    fn keys_forwarded_to_another_pc_are_stock() {
+        // Mouse Without Borders has the cursor on the other PC: a Win tap and Win+3 are its.
+        let mut h = HookState::new(true);
+        h.sync_held(forwarded(true));
+        assert_eq!(h.on_event(Down(VK_LWIN)), (Pass, None));
+        assert_eq!(h.on_event(Up(VK_LWIN)), (Pass, None));
+        h.sync_held(forwarded(true));
+        h.on_event(Down(VK_LWIN));
+        h.sync_held(forwarded(true));
+        assert_eq!(h.on_event(Down(0x33)), (Pass, None));
+        assert_eq!(h.on_event(Up(0x33)), (Pass, None));
+        assert_eq!(h.on_event(Up(VK_LWIN)), (Pass, None));
+        // Back on this PC: ours again.
+        h.sync_held(forwarded(false));
+        h.on_event(Down(VK_LWIN));
+        assert_eq!(h.on_event(Up(VK_LWIN)), (PassAndMask, Some(OpenStart(0))));
+        assert!(h.enabled(), "forwarding never changes the setting");
+    }
+
+    #[test]
+    fn a_forwarded_press_ends_focus_mode() {
+        let mut h = HookState::new(true);
+        h.on_event(Down(VK_LWIN));
+        h.on_event(Down(0x54));
+        h.on_event(Up(0x54));
+        h.on_event(Up(VK_LWIN));
+        assert!(h.focus_mode());
+        h.sync_held(Held {
+            forwarded: true,
+            ..Held::default()
+        });
+        assert_eq!(h.on_event(Down(VK_LEFT)), (Pass, Some(ExitFocus)));
+        assert!(!h.focus_mode());
     }
 
     #[test]

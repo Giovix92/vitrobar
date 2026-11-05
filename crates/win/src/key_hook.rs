@@ -113,6 +113,47 @@ fn physical_held() -> Held {
     Held {
         win: down(VK_LWIN) || down(VK_RWIN),
         modifier: down(VK_SHIFT) || down(VK_CONTROL) || down(VK_MENU),
+        forwarded: forwarding_to_another_pc(),
+    }
+}
+
+/// Mouse Without Borders (the Microsoft Garage app and the PowerToys module share the code)
+/// parks this PC's cursor while it drives another one: at the centre column of the primary
+/// screen, at y = 4 ("hide mouse at screen edge") or at its centre row. Its window titles
+/// are stable across both builds.
+const MWB_WINDOWS: [&str; 2] = [
+    "Mouse without Borders Helper",
+    "Mouse without Borders Application",
+];
+
+/// `(x, y)` is where Mouse Without Borders parks the cursor on a `w` x `h` primary screen
+/// (a pixel or two of slack for odd sizes and scaled, DPI-unaware coordinates).
+pub fn is_mwb_park_point(x: i32, y: i32, w: i32, h: i32) -> bool {
+    (x - w / 2).abs() <= 2 && ((0..=8).contains(&y) || (y - h / 2).abs() <= 2)
+}
+
+/// The keys typed now go to another computer through Mouse Without Borders. Cheap enough
+/// for the hook: two metrics and the cursor position, and the window lookup (no messages
+/// are sent) only while the cursor sits on the park point.
+fn forwarding_to_another_pc() -> bool {
+    use windows::core::HSTRING;
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, GetCursorPos, GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN,
+    };
+    let mut p = POINT::default();
+    // SAFETY: plain queries; FindWindowW compares titles without messaging the windows.
+    unsafe {
+        if GetCursorPos(&mut p).is_err() {
+            return false;
+        }
+        let (w, h) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+        if !is_mwb_park_point(p.x, p.y, w, h) {
+            return false;
+        }
+        MWB_WINDOWS
+            .iter()
+            .any(|t| FindWindowW(None, &HSTRING::from(*t)).is_ok_and(|w| !w.is_invalid()))
     }
 }
 
@@ -458,6 +499,21 @@ mod tests {
         assert_eq!(key_event(WM_KEYUP, 0x5C), Some(KeyEv::Up(0x5C)));
         assert_eq!(key_event(WM_SYSKEYUP, 0x31), Some(KeyEv::Up(0x31)));
         assert_eq!(key_event(WM_APP, 0x31), None);
+    }
+
+    #[test]
+    fn mwb_park_points() {
+        // Hide-mouse-at-edge parks at (centre, 4); otherwise at the screen's centre.
+        assert!(is_mwb_park_point(960, 4, 1920, 1080));
+        assert!(is_mwb_park_point(960, 6, 1920, 1080), "4 at 150 % scale");
+        assert!(is_mwb_park_point(960, 540, 1920, 1080));
+        assert!(is_mwb_park_point(1280, 720, 2560, 1440));
+        assert!(!is_mwb_park_point(960, 300, 1920, 1080));
+        assert!(!is_mwb_park_point(100, 4, 1920, 1080));
+        assert!(
+            !is_mwb_park_point(960, 1070, 1920, 1080),
+            "the bottom bar, centred"
+        );
     }
 
     #[test]
