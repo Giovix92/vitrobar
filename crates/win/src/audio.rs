@@ -1,8 +1,10 @@
-//! Output volume, mute and the default playback device (spec §5.5, the quick panel's volume
-//! slider and output page).
+//! Output volume, mute, the default playback device and each app's own volume (spec §5.5,
+//! the quick panel's volume slider and output page with its volume mixer).
 //!
 //! Event-driven: `IMMNotificationClient` (devices added / removed / default changed) and
-//! `IAudioEndpointVolumeCallback` (volume / mute changed, from any source) run on COM threads
+//! `IAudioEndpointVolumeCallback` (volume / mute changed, from any source),
+//! `IAudioSessionNotification` (an app started playing) and `IAudioSessionEvents` (an app's
+//! volume, mute or state changed) run on COM threads
 //! and only queue a [`Change`] and post a payload-free wake-up (see `event_queue`); the UI
 //! thread calls [`Audio::drain_changes`] when the message arrives and then reads
 //! [`Audio::snapshot`]. Nothing polls.
@@ -11,24 +13,37 @@
 //! panel logic are tested with a fake that never touches the real mixer.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::Arc;
 
-use windows::core::{implement, interface, Result, GUID, HRESULT, PCWSTR, PWSTR};
+use windows::core::{
+    implement, interface, Interface, Ref, Result, BOOL, GUID, HRESULT, PCWSTR, PWSTR,
+};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
+use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::Foundation::{HWND, LPARAM, PROPERTYKEY, WPARAM};
 use windows::Win32::Media::Audio::Endpoints::{
     IAudioEndpointVolume, IAudioEndpointVolumeCallback, IAudioEndpointVolumeCallback_Impl,
 };
 use windows::Win32::Media::Audio::{
-    eConsole, eMultimedia, eRender, EDataFlow, ERole, IMMDevice, IMMDeviceEnumerator,
-    IMMNotificationClient, IMMNotificationClient_Impl, MMDeviceEnumerator,
+    eConsole, eMultimedia, eRender, AudioSessionDisconnectReason, AudioSessionState,
+    AudioSessionStateExpired, EDataFlow, ERole, IAudioSessionControl, IAudioSessionControl2,
+    IAudioSessionEvents, IAudioSessionEvents_Impl, IAudioSessionManager2,
+    IAudioSessionNotification, IAudioSessionNotification_Impl, IMMDevice, IMMDeviceEnumerator,
+    IMMNotificationClient, IMMNotificationClient_Impl, ISimpleAudioVolume, MMDeviceEnumerator,
     AUDIO_VOLUME_NOTIFICATION_DATA, DEVICE_STATE, DEVICE_STATE_ACTIVE,
+};
+use windows::Win32::Storage::FileSystem::{
+    GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW,
 };
 use windows::Win32::System::Com::StructuredStorage::{PropVariantToStringAlloc, PROPVARIANT};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_APARTMENTTHREADED,
     STGM_READ,
+};
+use windows::Win32::System::Threading::{
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
@@ -41,6 +56,21 @@ pub struct OutputDevice {
     pub name: String,
 }
 
+/// One app's own volume on the default playback device (its sessions grouped, as the
+/// Windows volume mixer shows them).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AppVolume {
+    /// Identifies the app across snapshots: its executable's path (lower case).
+    pub key: String,
+    /// The app's name; empty for Windows' system sounds (the UI names them).
+    pub name: String,
+    /// Windows' "System sounds".
+    pub system: bool,
+    /// 0.0..=1.0.
+    pub volume: f32,
+    pub muted: bool,
+}
+
 /// Everything the quick panel shows about audio.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AudioSnapshot {
@@ -50,6 +80,8 @@ pub struct AudioSnapshot {
     /// Active playback devices: the default first, then by name.
     pub devices: Vec<OutputDevice>,
     pub default_id: Option<String>,
+    /// Apps with audio on the default device: by name, the system sounds last.
+    pub apps: Vec<AppVolume>,
 }
 
 /// Clamps a requested volume to 0.0..=1.0 (NaN counts as 0).
@@ -76,6 +108,17 @@ pub trait AudioBackend {
     /// Called with the drained changes: the real backend re-attaches its volume callback
     /// when the default device changed. Fakes ignore it.
     fn on_changes(&self, _changes: &[Change]) {}
+    /// Apps with audio on the default device, in any order.
+    fn apps(&self) -> Vec<AppVolume> {
+        Vec::new()
+    }
+    fn set_app_volume(&self, _key: &str, _v: f32) {}
+    fn set_app_muted(&self, _key: &str, _m: bool) {}
+}
+
+/// Apps by name (case-insensitive), the system sounds last.
+pub fn sort_apps(apps: &mut [AppVolume]) {
+    apps.sort_by_cached_key(|a| (a.system, a.name.to_lowercase()));
 }
 
 /// What a COM callback reports.
@@ -87,6 +130,10 @@ pub enum Change {
     Devices,
     /// The default playback device changed.
     DefaultDevice,
+    /// An app's volume or mute changed.
+    AppVolume,
+    /// An app started or stopped having audio.
+    Apps,
 }
 
 /// Audio state for the quick panel. Create it when the panel opens, drop it when it closes
@@ -147,12 +194,27 @@ impl Audio {
             let d = devices.remove(i);
             devices.insert(0, d);
         }
+        let mut apps = self.backend.apps();
+        for a in &mut apps {
+            a.volume = clamp_volume(a.volume);
+        }
+        sort_apps(&mut apps);
         AudioSnapshot {
             volume: clamp_volume(self.backend.volume()),
             muted: self.backend.muted(),
             devices,
             default_id,
+            apps,
         }
+    }
+
+    /// Sets the volume of every session of the app `key` (see [`AppVolume::key`]).
+    pub fn set_app_volume(&self, key: &str, v: f32) {
+        self.backend.set_app_volume(key, clamp_volume(v));
+    }
+
+    pub fn set_app_muted(&self, key: &str, muted: bool) {
+        self.backend.set_app_muted(key, muted);
     }
 
     pub fn set_volume(&self, v: f32) {
@@ -278,6 +340,153 @@ impl IAudioEndpointVolumeCallback_Impl for VolumeEvents_Impl {
     }
 }
 
+#[implement(IAudioSessionNotification)]
+struct SessionCreated(Arc<Waker>);
+
+impl IAudioSessionNotification_Impl for SessionCreated_Impl {
+    fn OnSessionCreated(&self, _session: Ref<IAudioSessionControl>) -> Result<()> {
+        self.0.wake(Change::Apps);
+        Ok(())
+    }
+}
+
+/// One object registered on every session.
+#[implement(IAudioSessionEvents)]
+struct SessionEvents(Arc<Waker>);
+
+impl IAudioSessionEvents_Impl for SessionEvents_Impl {
+    fn OnDisplayNameChanged(&self, _name: &PCWSTR, _ctx: *const GUID) -> Result<()> {
+        self.0.wake(Change::Apps);
+        Ok(())
+    }
+    fn OnIconPathChanged(&self, _path: &PCWSTR, _ctx: *const GUID) -> Result<()> {
+        Ok(())
+    }
+    fn OnSimpleVolumeChanged(&self, _v: f32, _mute: BOOL, _ctx: *const GUID) -> Result<()> {
+        self.0.wake(Change::AppVolume);
+        Ok(())
+    }
+    fn OnChannelVolumeChanged(
+        &self,
+        _count: u32,
+        _volumes: *const f32,
+        _changed: u32,
+        _ctx: *const GUID,
+    ) -> Result<()> {
+        Ok(())
+    }
+    fn OnGroupingParamChanged(&self, _param: *const GUID, _ctx: *const GUID) -> Result<()> {
+        Ok(())
+    }
+    fn OnStateChanged(&self, _state: AudioSessionState) -> Result<()> {
+        self.0.wake(Change::Apps);
+        Ok(())
+    }
+    fn OnSessionDisconnected(&self, _why: AudioSessionDisconnectReason) -> Result<()> {
+        self.0.wake(Change::Apps);
+        Ok(())
+    }
+}
+
+/// The default device's sessions, with our callbacks registered on the manager and on each.
+struct Sessions {
+    manager: IAudioSessionManager2,
+    controls: Vec<IAudioSessionControl>,
+}
+
+/// The executable path of process `pid`.
+fn exe_path(pid: u32) -> Option<String> {
+    // SAFETY: query-only open; the handle is closed below.
+    let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let mut buf = vec![0u16; 1024];
+    let mut len = buf.len() as u32;
+    // SAFETY: `buf` holds `len` u16; `len` comes back as the written length.
+    let ok = unsafe {
+        QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len)
+    }
+    .is_ok();
+    // SAFETY: the handle came from OpenProcess.
+    let _ = unsafe { CloseHandle(h) };
+    ok.then(|| String::from_utf16_lossy(&buf[..len as usize]))
+}
+
+/// The "File description" of an executable (what Task Manager and the mixer show).
+fn file_description(path: &str) -> Option<String> {
+    let wide: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
+    // SAFETY: version-info calls on a NUL-terminated path into a buffer of the reported
+    // size; the pointers VerQueryValueW returns point into that buffer.
+    unsafe {
+        let n = GetFileVersionInfoSizeW(PCWSTR(wide.as_ptr()), None);
+        if n == 0 {
+            return None;
+        }
+        let mut data = vec![0u8; n as usize];
+        GetFileVersionInfoW(PCWSTR(wide.as_ptr()), None, n, data.as_mut_ptr().cast()).ok()?;
+        let mut p: *mut c_void = std::ptr::null_mut();
+        let mut len = 0u32;
+        let langs = if VerQueryValueW(
+            data.as_ptr().cast(),
+            windows::core::w!("\\VarFileInfo\\Translation"),
+            &mut p,
+            &mut len,
+        )
+        .as_bool()
+            && len >= 4
+        {
+            let pairs = std::slice::from_raw_parts(p as *const u16, (len / 2) as usize);
+            pairs
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| format!("{:04x}{:04x}", c[0], c[1]))
+                .collect()
+        } else {
+            vec!["040904b0".to_string()]
+        };
+        for l in langs {
+            let key: Vec<u16> = format!("\\StringFileInfo\\{l}\\FileDescription")
+                .encode_utf16()
+                .chain(Some(0))
+                .collect();
+            if VerQueryValueW(data.as_ptr().cast(), PCWSTR(key.as_ptr()), &mut p, &mut len)
+                .as_bool()
+                && len > 1
+            {
+                let s = std::slice::from_raw_parts(p as *const u16, len as usize);
+                let s = String::from_utf16_lossy(s);
+                let s = s.trim_end_matches('\0').trim();
+                if !s.is_empty() {
+                    return Some(s.to_string());
+                }
+            }
+        }
+        None
+    }
+}
+
+/// "spotify" from "C:\\…\\Spotify.exe" when the file has no description.
+fn exe_stem(path: &str) -> String {
+    let file = path.rsplit(['\\', '/']).next().unwrap_or(path);
+    file.strip_suffix(".exe")
+        .or_else(|| file.strip_suffix(".EXE"))
+        .unwrap_or(file)
+        .to_string()
+}
+
+/// The name a session's own display name gives, when it is a plain name (an
+/// `@dll,-id` resource reference is not).
+fn plain_display_name(c: &IAudioSessionControl) -> Option<String> {
+    // SAFETY: GetDisplayName returns a CoTaskMem string we free after copying.
+    let name = unsafe {
+        let p = c.GetDisplayName().ok()?;
+        let s = p.to_string().ok();
+        CoTaskMemFree(Some(p.0 as *const c_void));
+        s
+    }?;
+    let name = name.trim().to_string();
+    (!name.is_empty() && !name.starts_with('@')).then_some(name)
+}
+
 // ---- the real mixer -------------------------------------------------------------------------
 
 struct ComBackend {
@@ -288,6 +497,11 @@ struct ComBackend {
     volume_client: IAudioEndpointVolumeCallback,
     /// The default endpoint's volume interface with `volume_client` registered on it.
     endpoint: RefCell<Option<IAudioEndpointVolume>>,
+    session_client: IAudioSessionNotification,
+    session_events: IAudioSessionEvents,
+    sessions: RefCell<Option<Sessions>>,
+    /// App names by key: reading version info once per app is enough.
+    names: RefCell<HashMap<String, String>>,
 }
 
 impl ComBackend {
@@ -303,6 +517,8 @@ impl ComBackend {
             unsafe { CoCreateInstance(&CLSID_POLICY_CONFIG, None, CLSCTX_ALL) }.ok();
         let device_client: IMMNotificationClient = DeviceEvents(waker.clone()).into();
         let volume_client: IAudioEndpointVolumeCallback = VolumeEvents(waker.clone()).into();
+        let session_client: IAudioSessionNotification = SessionCreated(waker.clone()).into();
+        let session_events: IAudioSessionEvents = SessionEvents(waker.clone()).into();
         // SAFETY: the client object outlives the registration (unregistered in Drop).
         unsafe { enumerator.RegisterEndpointNotificationCallback(&device_client) }?;
         let me = Self {
@@ -312,8 +528,13 @@ impl ComBackend {
             device_client,
             volume_client,
             endpoint: RefCell::new(None),
+            session_client,
+            session_events,
+            sessions: RefCell::new(None),
+            names: RefCell::new(HashMap::new()),
         };
         me.attach_volume_callback();
+        me.attach_sessions();
         Ok(me)
     }
 
@@ -338,6 +559,94 @@ impl ComBackend {
             // SAFETY: undoes the registration made in `attach_volume_callback`.
             let _ = unsafe { ep.UnregisterControlChangeNotify(&self.volume_client) };
         }
+    }
+
+    /// (Re-)reads the default device's sessions and registers the session callbacks on its
+    /// manager and on each session (a new or expired session re-runs this).
+    fn attach_sessions(&self) {
+        self.detach_sessions();
+        let Some(dev) = self.default_device() else {
+            return;
+        };
+        // SAFETY: activation of a standard interface on a live endpoint; the callback
+        // objects live as long as this backend and are unregistered in `detach_sessions`.
+        unsafe {
+            let Ok(manager) = dev.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None) else {
+                return;
+            };
+            let _ = manager.RegisterSessionNotification(&self.session_client);
+            // Windows only starts the "session created" notifications once the sessions
+            // have been enumerated.
+            let mut controls = Vec::new();
+            if let Ok(list) = manager.GetSessionEnumerator() {
+                for i in 0..list.GetCount().unwrap_or(0) {
+                    if let Ok(c) = list.GetSession(i) {
+                        if c.RegisterAudioSessionNotification(&self.session_events)
+                            .is_ok()
+                        {
+                            controls.push(c);
+                        }
+                    }
+                }
+            }
+            *self.sessions.borrow_mut() = Some(Sessions { manager, controls });
+        }
+    }
+
+    fn detach_sessions(&self) {
+        if let Some(s) = self.sessions.borrow_mut().take() {
+            // SAFETY: undoes the registrations made in `attach_sessions`.
+            unsafe {
+                for c in &s.controls {
+                    let _ = c.UnregisterAudioSessionNotification(&self.session_events);
+                }
+                let _ = s
+                    .manager
+                    .UnregisterSessionNotification(&self.session_client);
+            }
+        }
+    }
+
+    /// Every live session of the default device with the key of its app.
+    fn app_sessions(&self) -> Vec<(String, bool, IAudioSessionControl)> {
+        let sessions = self.sessions.borrow();
+        let Some(s) = sessions.as_ref() else {
+            return Vec::new();
+        };
+        s.controls
+            .iter()
+            .filter_map(|c| {
+                // SAFETY: plain getters on a live session.
+                unsafe {
+                    if c.GetState().ok()? == AudioSessionStateExpired {
+                        return None;
+                    }
+                    let c2: IAudioSessionControl2 = c.cast().ok()?;
+                    if c2.IsSystemSoundsSession() == windows::Win32::Foundation::S_OK {
+                        return Some(("#system".to_string(), true, c.clone()));
+                    }
+                    let pid = c2.GetProcessId().ok()?;
+                    let key = exe_path(pid)
+                        .map(|p| p.to_lowercase())
+                        .unwrap_or_else(|| format!("#pid{pid}"));
+                    Some((key, false, c.clone()))
+                }
+            })
+            .collect()
+    }
+
+    /// The name of the app `key` (cached).
+    fn app_name(&self, key: &str, c: &IAudioSessionControl) -> String {
+        if let Some(n) = self.names.borrow().get(key) {
+            return n.clone();
+        }
+        let name = plain_display_name(c)
+            .or_else(|| file_description(key))
+            .unwrap_or_else(|| exe_stem(key));
+        self.names
+            .borrow_mut()
+            .insert(key.to_string(), name.clone());
+        name
     }
 
     /// The volume interface of the current default endpoint.
@@ -444,12 +753,70 @@ impl AudioBackend for ComBackend {
         if changes.contains(&Change::DefaultDevice) {
             self.attach_volume_callback();
         }
+        if changes.contains(&Change::DefaultDevice) || changes.contains(&Change::Apps) {
+            self.attach_sessions();
+        }
+    }
+
+    fn apps(&self) -> Vec<AppVolume> {
+        let mut out: Vec<AppVolume> = Vec::new();
+        for (key, system, c) in self.app_sessions() {
+            if out.iter().any(|a| a.key == key) {
+                continue;
+            }
+            let Ok(v) = c.cast::<ISimpleAudioVolume>() else {
+                continue;
+            };
+            // SAFETY: plain getters.
+            let (volume, muted) = unsafe {
+                (
+                    v.GetMasterVolume().unwrap_or(1.0),
+                    v.GetMute().map(|b| b.as_bool()).unwrap_or(false),
+                )
+            };
+            let name = if system {
+                String::new()
+            } else {
+                self.app_name(&key, &c)
+            };
+            out.push(AppVolume {
+                key,
+                name,
+                system,
+                volume,
+                muted,
+            });
+        }
+        out
+    }
+
+    fn set_app_volume(&self, key: &str, v: f32) {
+        for (k, _, c) in self.app_sessions() {
+            if k == key {
+                if let Ok(sv) = c.cast::<ISimpleAudioVolume>() {
+                    // SAFETY: a null event context, as for the master volume.
+                    let _ = unsafe { sv.SetMasterVolume(v, std::ptr::null()) };
+                }
+            }
+        }
+    }
+
+    fn set_app_muted(&self, key: &str, m: bool) {
+        for (k, _, c) in self.app_sessions() {
+            if k == key {
+                if let Ok(sv) = c.cast::<ISimpleAudioVolume>() {
+                    // SAFETY: as in `set_app_volume`.
+                    let _ = unsafe { sv.SetMute(m, std::ptr::null()) };
+                }
+            }
+        }
     }
 }
 
 impl Drop for ComBackend {
     fn drop(&mut self) {
         self.detach_volume_callback();
+        self.detach_sessions();
         // SAFETY: undoes the registration made in `new`.
         let _ = unsafe {
             self.enumerator
@@ -522,6 +889,31 @@ mod tests {
     }
 
     #[test]
+    fn apps_by_name_with_system_sounds_last() {
+        let app = |name: &str, system: bool| AppVolume {
+            key: name.to_lowercase(),
+            name: name.into(),
+            system,
+            volume: 1.0,
+            muted: false,
+        };
+        let mut v = vec![app("", true), app("spotify", false), app("Discord", false)];
+        sort_apps(&mut v);
+        let names: Vec<_> = v.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["Discord", "spotify", ""]);
+    }
+
+    #[test]
+    fn exe_stem_drops_folder_and_extension() {
+        assert_eq!(
+            exe_stem("c:\\program files\\spotify\\spotify.exe"),
+            "spotify"
+        );
+        assert_eq!(exe_stem("C:/x/App.EXE"), "App");
+        assert_eq!(exe_stem("plain"), "plain");
+    }
+
+    #[test]
     fn clamp_handles_range_and_nan() {
         assert_eq!(clamp_volume(-0.5), 0.0);
         assert_eq!(clamp_volume(1.7), 1.0);
@@ -588,7 +980,14 @@ mod tests {
     fn real_snapshot_is_in_range() {
         // A null notify window: no wake-ups are posted.
         let audio = Audio::open(HWND::default(), 0).expect("audio");
-        let v = audio.snapshot().volume;
+        let snap = audio.snapshot();
+        let v = snap.volume;
         assert!((0.0..=1.0).contains(&v), "{v}");
+        for a in &snap.apps {
+            eprintln!(
+                "app {:?} {:?} {:.2} muted={}",
+                a.key, a.name, a.volume, a.muted
+            );
+        }
     }
 }

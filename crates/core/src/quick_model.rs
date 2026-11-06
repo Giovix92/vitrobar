@@ -62,8 +62,18 @@ pub struct AudioInputs {
     pub devices: Vec<String>,
     /// Index of the default device in `devices`.
     pub default: Option<usize>,
-    /// The default device can be changed (the Output page is offered).
+    /// The default device can be changed (the Output page lists the devices).
     pub can_switch: bool,
+    /// Apps with their own volume (the Output page's volume mixer), in the order shown.
+    pub apps: Vec<AppVolumeInput>,
+}
+
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct AppVolumeInput {
+    pub name: String,
+    /// 0..=1.
+    pub volume: f32,
+    pub muted: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -169,6 +179,8 @@ pub const PASSWORD_H_DIP: f32 = 36.0;
 pub const BRIGHTNESS_BASE: u32 = 100;
 /// List item `i` of a sub-page (network, device, output) is `ITEM_BASE + i`.
 pub const ITEM_BASE: u32 = 1000;
+/// The volume slider of app `i` in the volume mixer is `APP_VOLUME_BASE + i`.
+pub const APP_VOLUME_BASE: u32 = 2000;
 
 /// One keyboard or wheel step of a slider.
 pub const SLIDER_STEP: f32 = 0.02;
@@ -227,6 +239,8 @@ pub enum Action {
     /// The Wi-Fi or Bluetooth radio switch on that page.
     ToggleRadio,
     Volume,
+    /// The volume mixer's slider of app `i` (Enter mutes it, like the main slider).
+    AppVolume(usize),
     Brightness(usize),
     Network(usize),
     Device(usize),
@@ -283,6 +297,9 @@ pub fn action(page: QuickPage, part: Part) -> Option<Action> {
         Part::Button(BTN_DONE) => Action::Back,
         Part::Button(BTN_RESET) => Action::ResetTiles,
         Part::Slider(SLIDER_VOLUME) => Action::Volume,
+        Part::Slider(id) if id >= APP_VOLUME_BASE => {
+            Action::AppVolume((id - APP_VOLUME_BASE) as usize)
+        }
         Part::SliderTrailing(OUTPUT_CHEVRON) => Action::Open(QuickPage::Output),
         Part::Slider(id) if (BRIGHTNESS_BASE..ITEM_BASE).contains(&id) => {
             Action::Brightness((id - BRIGHTNESS_BASE) as usize)
@@ -561,7 +578,8 @@ fn main_rows(i: &QuickInputs, lang: Lang) -> Vec<Row> {
             id: SLIDER_VOLUME,
             glyph: volume_glyph(a.volume, a.muted),
             value: a.volume,
-            trailing: a.can_switch.then_some((OUTPUT_CHEVRON, G_CHEVRON)),
+            // The Output page: devices (when they can be switched) and the volume mixer.
+            trailing: Some((OUTPUT_CHEVRON, G_CHEVRON)),
         });
     }
     rows.push(Row::Separator);
@@ -709,8 +727,13 @@ fn output_rows(i: &QuickInputs, lang: Lang) -> Vec<Row> {
         actions: Vec::new(),
     }];
     notice(&mut rows, i, lang);
-    let devices = i.audio.as_ref().map_or(&[][..], |a| &a.devices[..]);
-    if devices.is_empty() {
+    let can_switch = i.audio.as_ref().is_some_and(|a| a.can_switch);
+    let devices = i
+        .audio
+        .as_ref()
+        .filter(|_| can_switch)
+        .map_or(&[][..], |a| &a.devices[..]);
+    if can_switch && devices.is_empty() {
         rows.push(Row::Text(tr(lang, Key::NoOutputs).to_string()));
     }
     let default = i.audio.as_ref().and_then(|a| a.default);
@@ -723,6 +746,28 @@ fn output_rows(i: &QuickInputs, lang: Lang) -> Vec<Row> {
             checked: default == Some(k),
             busy: false,
         });
+    }
+    // As the stock Quick Settings: each app with audio gets its own slider; its speaker
+    // mutes it.
+    let apps = i.audio.as_ref().map_or(&[][..], |a| &a.apps[..]);
+    if !apps.is_empty() {
+        if !devices.is_empty() {
+            rows.push(Row::Separator);
+        }
+        rows.push(Row::Header {
+            text: tr(lang, Key::VolumeMixer).to_string(),
+            trailing: None,
+            actions: Vec::new(),
+        });
+        for (k, a) in apps.iter().enumerate() {
+            rows.push(Row::Text(a.name.clone()));
+            rows.push(Row::Slider {
+                id: APP_VOLUME_BASE + k as u32,
+                glyph: volume_glyph(a.volume, a.muted),
+                value: a.volume,
+                trailing: None,
+            });
+        }
     }
     footer(&mut rows, Key::MoreSoundSettings, lang);
     rows
@@ -825,6 +870,7 @@ mod tests {
                 devices: vec!["Speakers".into(), "Headphones".into()],
                 default: Some(0),
                 can_switch: true,
+                apps: Vec::new(),
             }),
             displays: vec![DisplayInput {
                 name: String::new(),
@@ -1041,7 +1087,7 @@ mod tests {
     }
 
     #[test]
-    fn no_audio_no_volume_and_no_switch_no_chevron() {
+    fn no_audio_no_volume_and_no_switch_still_a_chevron_for_the_mixer() {
         let i = QuickInputs {
             audio: None,
             ..laptop()
@@ -1054,10 +1100,54 @@ mod tests {
             x,
             Row::Slider {
                 id: SLIDER_VOLUME,
-                trailing: None,
+                trailing: Some((OUTPUT_CHEVRON, _)),
                 ..
             }
         )));
+        // Without switching the page lists no devices.
+        let out = rows(QuickPage::Output, &i, Lang::En);
+        assert!(!out
+            .iter()
+            .any(|x| matches!(x, Row::Item { id, .. } if *id >= ITEM_BASE)));
+    }
+
+    #[test]
+    fn output_page_has_a_volume_mixer() {
+        let mut i = laptop();
+        i.audio.as_mut().unwrap().apps = vec![
+            AppVolumeInput {
+                name: "Spotify".into(),
+                volume: 0.4,
+                muted: false,
+            },
+            AppVolumeInput {
+                name: "System sounds".into(),
+                volume: 1.0,
+                muted: true,
+            },
+        ];
+        let r = rows(QuickPage::Output, &i, Lang::En);
+        assert!(r
+            .iter()
+            .any(|x| matches!(x, Row::Header { text, .. } if text == "Volume mixer")));
+        assert!(r
+            .iter()
+            .any(|x| matches!(x, Row::Text(t) if t == "Spotify")));
+        assert_eq!(sliders(&r), vec![APP_VOLUME_BASE, APP_VOLUME_BASE + 1]);
+        let muted = r.iter().find_map(|x| match x {
+            Row::Slider { id, glyph, .. } if *id == APP_VOLUME_BASE + 1 => Some(*glyph),
+            _ => None,
+        });
+        assert_eq!(muted, Some(volume_glyph(1.0, true)));
+        assert_eq!(
+            action(QuickPage::Output, Part::Slider(APP_VOLUME_BASE + 1)),
+            Some(Action::AppVolume(1))
+        );
+        // No apps: no mixer.
+        let r = rows(QuickPage::Output, &laptop(), Lang::En);
+        assert!(!r
+            .iter()
+            .any(|x| matches!(x, Row::Header { text, .. } if text == "Volume mixer")));
     }
 
     #[test]

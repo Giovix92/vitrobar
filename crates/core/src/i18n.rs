@@ -175,6 +175,11 @@ pub enum Key {
     PowerModeLabel,
     EnergySaverShort,
     RecentOff,
+    VolumeMixer,
+    SystemSounds,
+    BatteryOnBar,
+    MusicArt,
+    WidgetColors,
 }
 
 pub const ALL_KEYS: &[Key] = &[
@@ -335,6 +340,11 @@ pub const ALL_KEYS: &[Key] = &[
     Key::PowerModeLabel,
     Key::EnergySaverShort,
     Key::RecentOff,
+    Key::VolumeMixer,
+    Key::SystemSounds,
+    Key::BatteryOnBar,
+    Key::MusicArt,
+    Key::WidgetColors,
 ];
 
 pub fn tr(lang: Lang, key: Key) -> &'static str {
@@ -579,6 +589,16 @@ pub fn tr(lang: Lang, key: Key) -> &'static str {
         (Lang::It, Key::EnergySaverShort) => "Risparmio",
         (Lang::En, Key::RecentOff) => "Recent files are off in Windows. Turn them on in Settings ›",
         (Lang::It, Key::RecentOff) => "I file recenti sono disattivati in Windows. Attivali in Impostazioni ›",
+        (Lang::En, Key::VolumeMixer) => "Volume mixer",
+        (Lang::It, Key::VolumeMixer) => "Mixer volume",
+        (Lang::En, Key::SystemSounds) => "System sounds",
+        (Lang::It, Key::SystemSounds) => "Suoni di sistema",
+        (Lang::En, Key::BatteryOnBar) => "Battery on the taskbar",
+        (Lang::It, Key::BatteryOnBar) => "Batteria sulla barra",
+        (Lang::En, Key::MusicArt) => "Album art in the music pill",
+        (Lang::It, Key::MusicArt) => "Copertina nella pillola musica",
+        (Lang::En, Key::WidgetColors) => "Colour widgets by app",
+        (Lang::It, Key::WidgetColors) => "Colora i widget in base all’app",
         (Lang::En, Key::BatterySaver) => "Energy saver",
         (Lang::It, Key::BatterySaver) => "Risparmio energia",
         (Lang::En, Key::PowerEfficiency) => "Efficiency",
@@ -689,7 +709,7 @@ mod tests {
             assert!(!tr(Lang::En, k).is_empty());
             assert!(!tr(Lang::It, k).is_empty());
         }
-        assert_eq!(ALL_KEYS.len(), 157);
+        assert_eq!(ALL_KEYS.len(), 162);
     }
     #[test]
     fn italian_differs_from_english() {

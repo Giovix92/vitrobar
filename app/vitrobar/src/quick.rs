@@ -16,9 +16,9 @@ use vitro_core::i18n::{tr, Key, Lang};
 use vitro_core::menu_model::NavKey;
 use vitro_core::panel_kit::{focus_step, Part, Row, PAD_DIP, SLIDER_GLYPH_W_DIP};
 use vitro_core::quick_model::{
-    self, action, next_mode, nudge, Action, AudioInputs, BtDev, BtInputs, DisplayInput, Notice,
-    PowerInputs, QuickInputs, QuickPage, QuickUi, WifiInputs, WifiNet, CUSTOM_PASSWORD,
-    SLIDER_VOLUME,
+    self, action, next_mode, nudge, Action, AppVolumeInput, AudioInputs, BtDev, BtInputs,
+    DisplayInput, Notice, PowerInputs, QuickInputs, QuickPage, QuickUi, WifiInputs, WifiNet,
+    APP_VOLUME_BASE, CUSTOM_PASSWORD, SLIDER_VOLUME,
 };
 use vitro_core::settings::{toggle_tile, Position, QuickTile};
 use vitro_core::style::{MaterialStyle, Rgba};
@@ -143,7 +143,8 @@ pub struct QuickPanel {
     hot: Option<Part>,
     pressed: Option<Part>,
     /// A press on the volume glyph (mute), which is not a panel part.
-    mute_pressed: bool,
+    /// The volume slider whose speaker glyph the button went down on.
+    mute_pressed: Option<u32>,
     focus: Option<Part>,
     tracking: bool,
     /// The Wi-Fi scan deadline the one-shot timer is armed for.
@@ -190,7 +191,7 @@ fn bt_inputs(s: &BtSnapshot) -> BtInputs {
 }
 
 /// `None` without a default playback device (nothing to set the volume of).
-fn audio_inputs(s: &AudioSnapshot, can_switch: bool) -> Option<AudioInputs> {
+fn audio_inputs(s: &AudioSnapshot, can_switch: bool, lang: Lang) -> Option<AudioInputs> {
     let default_id = s.default_id.as_deref()?;
     Some(AudioInputs {
         volume: s.volume,
@@ -198,6 +199,19 @@ fn audio_inputs(s: &AudioSnapshot, can_switch: bool) -> Option<AudioInputs> {
         devices: s.devices.iter().map(|d| d.name.clone()).collect(),
         default: s.devices.iter().position(|d| d.id == default_id),
         can_switch,
+        apps: s
+            .apps
+            .iter()
+            .map(|a| AppVolumeInput {
+                name: if a.system {
+                    tr(lang, Key::SystemSounds).to_string()
+                } else {
+                    a.name.clone()
+                },
+                volume: a.volume,
+                muted: a.muted,
+            })
+            .collect(),
     })
 }
 
@@ -311,9 +325,12 @@ struct Snaps<'a> {
 }
 
 fn inputs_of(s: Snaps, ui: &QuickUi, drag: Option<Drag>, lang: Lang) -> QuickInputs {
-    let mut audio = s.audio.and_then(|a| audio_inputs(a, s.can_switch));
+    let mut audio = s.audio.and_then(|a| audio_inputs(a, s.can_switch, lang));
     if let Some(a) = audio.as_mut() {
         a.volume = shown_value(drag, SLIDER_VOLUME, a.volume);
+        for (k, app) in a.apps.iter_mut().enumerate() {
+            app.volume = shown_value(drag, APP_VOLUME_BASE + k as u32, app.volume);
+        }
     }
     let mut displays = display_inputs(s.displays);
     for (k, d) in displays.iter_mut().enumerate() {
@@ -444,7 +461,7 @@ impl QuickPanel {
             connect_moved: false,
             hot: None,
             pressed: None,
-            mute_pressed: false,
+            mute_pressed: None,
             focus: None,
             tracking: false,
             scan_timer: None,
@@ -671,18 +688,24 @@ impl QuickPanel {
 
     /// Whether panel client `pt` (px) is on the volume slider's glyph, which toggles mute
     /// (the glyph column is not a panel part).
-    fn on_mute_glyph(&self, pt: (i32, i32)) -> bool {
+    /// The volume slider (main or an app's) whose speaker glyph is under `pt`.
+    fn on_mute_glyph(&self, pt: (i32, i32)) -> Option<u32> {
         let l = self.view.layout();
         let s = self.view.scale();
         let (x, y) = (pt.0 as f32 / s, pt.1 as f32 / s);
         if y < 0.0 || y >= l.size.1 {
-            return false;
+            return None;
         }
         let y = y + self.view.scroll();
-        l.parts.iter().any(|(p, r)| {
-            *p == Part::Slider(SLIDER_VOLUME)
-                && (PAD_DIP..PAD_DIP + SLIDER_GLYPH_W_DIP).contains(&x)
-                && (r.y..r.bottom()).contains(&y)
+        l.parts.iter().find_map(|(p, r)| match p {
+            Part::Slider(id)
+                if (*id == SLIDER_VOLUME || *id >= APP_VOLUME_BASE)
+                    && (PAD_DIP..PAD_DIP + SLIDER_GLYPH_W_DIP).contains(&x)
+                    && (r.y..r.bottom()).contains(&y) =>
+            {
+                Some(*id)
+            }
+            _ => None,
         })
     }
 
@@ -726,7 +749,7 @@ impl QuickPanel {
                     self.activate();
                 }
                 let part = self.view.hit_px(pt);
-                self.mute_pressed = part.is_none() && self.on_mute_glyph(pt);
+                self.mute_pressed = part.is_none().then(|| self.on_mute_glyph(pt)).flatten();
                 self.pressed = part;
                 if let Some(Part::Slider(id)) = part {
                     // SAFETY: our own window keeps the mouse while the button is down.
@@ -751,13 +774,19 @@ impl QuickPanel {
                     return self.set_slider(d.slider, v, false, g);
                 }
                 let pressed = self.pressed.take();
-                let mute = std::mem::take(&mut self.mute_pressed);
+                let mute = self.mute_pressed.take();
                 if let Outcome::Close = ok(self.view.set_pressed(None)) {
                     return Outcome::Close;
                 }
                 let part = self.view.hit_px(pt);
-                if mute && part.is_none() && self.on_mute_glyph(pt) {
-                    return self.toggle_mute(g);
+                if let Some(id) =
+                    mute.filter(|id| part.is_none() && self.on_mute_glyph(pt) == Some(*id))
+                {
+                    return if id == SLIDER_VOLUME {
+                        self.toggle_mute(g)
+                    } else {
+                        self.toggle_app_mute((id - APP_VOLUME_BASE) as usize, g)
+                    };
                 }
                 match pressed {
                     Some(p) if Some(p) == part => self.activate_part(p, g),
@@ -968,6 +997,7 @@ impl QuickPanel {
             Action::Back => self.go(QuickPage::Main, false, g),
             // Enter on the focused volume slider.
             Action::Volume => self.toggle_mute(g),
+            Action::AppVolume(k) => self.toggle_app_mute(k, g),
             Action::Brightness(_) => Outcome::None,
             Action::Network(i) => self.pick_network(i, g),
             Action::Device(i) => self.pick_device(i, g),
@@ -1007,10 +1037,29 @@ impl QuickPanel {
         self.render_or_close(g)
     }
 
+    fn toggle_app_mute(&mut self, k: usize, g: &Gfx) -> Outcome {
+        let (Some(a), Some(app)) = (
+            &self.services.audio,
+            self.audio.as_mut().and_then(|s| s.apps.get_mut(k)),
+        ) else {
+            return Outcome::None;
+        };
+        app.muted = !app.muted;
+        a.set_app_muted(&app.key, app.muted);
+        self.render_or_close(g)
+    }
+
     /// The service value of slider `id` (not the dragged one).
     fn slider_now(&self, id: u32) -> f32 {
         if id == SLIDER_VOLUME {
             return self.audio.as_ref().map_or(0.0, |a| a.volume);
+        }
+        if let Some(k) = id.checked_sub(APP_VOLUME_BASE) {
+            return self
+                .audio
+                .as_ref()
+                .and_then(|a| a.apps.get(k as usize))
+                .map_or(0.0, |a| a.volume);
         }
         id.checked_sub(quick_model::BRIGHTNESS_BASE)
             .and_then(|k| self.displays.get(k as usize))
@@ -1027,6 +1076,14 @@ impl QuickPanel {
                 a.set_volume(v);
                 s.volume = v;
             }
+        } else if let Some(k) = id.checked_sub(APP_VOLUME_BASE) {
+            if let (Some(a), Some(app)) = (
+                &self.services.audio,
+                self.audio.as_mut().and_then(|s| s.apps.get_mut(k as usize)),
+            ) {
+                a.set_app_volume(&app.key, v);
+                app.volume = v;
+            }
         } else if let Some(k) = id.checked_sub(quick_model::BRIGHTNESS_BASE) {
             if let (Some(b), Some(d)) =
                 (&self.services.brightness, self.displays.get_mut(k as usize))
@@ -1042,7 +1099,8 @@ impl QuickPanel {
         self.drag = dragging.then_some(d);
         // A brightness level set for good is shown until the worker reports it (a WMI
         // event read mid-write would otherwise make the thumb jump back for a moment).
-        self.hold = (!dragging && id != SLIDER_VOLUME).then_some((d, HOLD_ROUNDS));
+        let brightness = (quick_model::BRIGHTNESS_BASE..quick_model::ITEM_BASE).contains(&id);
+        self.hold = (!dragging && brightness).then_some((d, HOLD_ROUNDS));
         self.render_or_close(g)
     }
 
@@ -1400,8 +1458,9 @@ mod tests {
             muted: false,
             devices: Vec::new(),
             default_id: None,
+            apps: Vec::new(),
         };
-        assert_eq!(audio_inputs(&s, true), None);
+        assert_eq!(audio_inputs(&s, true, Lang::En), None);
         let s = AudioSnapshot {
             volume: 0.3,
             muted: true,
@@ -1416,11 +1475,30 @@ mod tests {
                 },
             ],
             default_id: Some("b".into()),
+            apps: vec![
+                audio::AppVolume {
+                    key: "c:\\spotify.exe".into(),
+                    name: "Spotify".into(),
+                    system: false,
+                    volume: 0.5,
+                    muted: false,
+                },
+                audio::AppVolume {
+                    key: "#system".into(),
+                    name: String::new(),
+                    system: true,
+                    volume: 1.0,
+                    muted: true,
+                },
+            ],
         };
-        let a = audio_inputs(&s, false).unwrap();
+        let a = audio_inputs(&s, false, Lang::It).unwrap();
         assert_eq!(a.default, Some(1));
         assert_eq!(a.devices, vec!["Speakers", "Headset"]);
         assert!(a.muted && !a.can_switch);
+        let names: Vec<_> = a.apps.iter().map(|x| x.name.as_str()).collect();
+        assert_eq!(names, ["Spotify", "Suoni di sistema"]);
+        assert!(a.apps[1].muted);
     }
 
     #[test]
