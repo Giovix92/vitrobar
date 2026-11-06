@@ -213,8 +213,7 @@ pub enum Action {
     ToggleWifi,
     ToggleBt,
     ToggleAirplane,
-    /// Battery saver on or off (on mains power Windows has no public switch: the app opens
-    /// its battery settings instead).
+    /// Energy saver on or off (the app opens its settings page if Windows refuses).
     BatterySaver,
     CyclePowerMode,
     ToggleMute,

@@ -914,16 +914,13 @@ impl QuickPanel {
             // Never shown (airplane = None, ruling S3-3).
             Action::ToggleAirplane => Outcome::None,
             Action::BatterySaver => {
-                // Windows has no public switch for saver on mains power: its page opens.
-                if self.power.on_ac {
-                    return Outcome::Open("ms-settings:batterysaver".into());
-                }
                 if !power_status::set_saver(!self.power.saver) {
-                    eprintln!("vitrobar: Windows did not change battery saver");
+                    eprintln!("vitrobar: Windows did not change energy saver");
                     return Outcome::Open("ms-settings:batterysaver".into());
                 }
-                // The status change also arrives as a power notification; show it now.
-                self.power = power_status::snapshot();
+                // Windows applies it a moment later (a power notification then refreshes
+                // the panel); the tile follows the click at once.
+                self.power.saver = !self.power.saver;
                 self.render_or_close(g)
             }
             Action::ToggleMute => self.toggle_mute(g),
