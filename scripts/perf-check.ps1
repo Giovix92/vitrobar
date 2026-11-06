@@ -48,6 +48,9 @@
     figures; see above.
 .PARAMETER MemoryReportOnly
     Report the memory but do not fail on it (CI: see .github/workflows/ci.yml).
+.PARAMETER CpuBudgetMs
+    The idle CPU budget in ms over the 30 s (default 50). CI passes a looser one: the
+    runner's desktop wakes the bar more than a real one, so 50 ms is only enforced locally.
 .PARAMETER Widgets
     Run with both widgets on (Music and Claude limits) in the temp settings file; the idle
     budgets stay the same (spec: < 40 MB idle with both widgets on). Turning them on this
@@ -59,6 +62,7 @@ param(
     [switch]$MeasureStartup,
     [switch]$StartPanel,
     [switch]$MemoryReportOnly,
+    [ValidateRange(1, 30000)][int]$CpuBudgetMs = 50,
     [switch]$Widgets
 )
 
@@ -66,7 +70,6 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $MemoryBudgetMB = 40
-$CpuBudgetMs = 50
 $ExeBudgetMB = 5
 $StartupBudgetMs = 300
 $SettleSeconds = 10

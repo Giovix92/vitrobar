@@ -39,7 +39,9 @@ jobs:
       # Explorer shell, so no stock taskbar, tray icons or File Explorer windows; other
       # Windows components loaded), so its figure is not comparable. The 40 MB budget is
       # enforced by local runs of the same script (docs/release-checklist.md,
-      # "Performance"). GPU use is checked by hand.
+      # "Performance"). GPU use is checked by hand. Idle CPU gets a looser budget here: since
+      # November 2026 the runner wakes the bar for ~100-170 ms in 30 s even with code
+      # that measured 0 before, so the 50 ms budget is likewise enforced by local runs.
       - name: Performance budget check
         shell: pwsh
-        run: ./scripts/perf-check.ps1 -Exe bin/vitrobar.exe -MemoryReportOnly
+        run: ./scripts/perf-check.ps1 -Exe bin/vitrobar.exe -MemoryReportOnly -CpuBudgetMs 250
