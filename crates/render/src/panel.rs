@@ -37,7 +37,7 @@ use crate::flyout::PxRect;
 use crate::material::backdrop_visual;
 
 /// How far a rising panel starts from its place, in DIP.
-const RISE_DIP: f32 = 12.0;
+const RISE_DIP: f32 = 16.0;
 
 /// How a panel appears and disappears.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -596,8 +596,8 @@ mod tests {
 
     #[test]
     fn rise_starts_on_the_bar_side() {
-        assert_eq!(rise_offset(Position::Bottom, 2.0), (0.0, 24.0));
-        assert_eq!(rise_offset(Position::Top, 2.0), (0.0, -24.0));
+        assert_eq!(rise_offset(Position::Bottom, 2.0), (0.0, 32.0));
+        assert_eq!(rise_offset(Position::Top, 2.0), (0.0, -32.0));
     }
 
     #[test]

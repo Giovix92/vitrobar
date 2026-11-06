@@ -80,6 +80,10 @@ pub fn animations() -> bool {
 /// The hover highlight's glide from one part to the next, and its fade.
 const GLIDE_MS: u32 = 140;
 const FADE_MS: u32 = 110;
+/// A tile blending to its new colour; a sub-page sliding in.
+const TILE_TWEEN_MS: u32 = 160;
+const SLIDE_MS: u32 = 220;
+const SLIDE_DIP: f32 = 28.0;
 
 /// What drawing a row needs.
 struct Ctx<'a> {
@@ -185,7 +189,24 @@ struct RowVis {
     slot: Option<(u32, ContainerVisual)>,
 }
 
-fn build_row(ctx: &Ctx, l: &PanelLayout, index: usize, row: &Row) -> Result<RowVis> {
+/// The fill of a tile: its tint, the accent when on, a faint plate when off.
+fn tile_fill(t: &panel_kit::Tile, ctx: &Ctx) -> Rgba {
+    match t.tint {
+        Some(c) => c,
+        None if t.on => ctx.accent,
+        None => alpha(ctx.text, TILE_ALPHA),
+    }
+}
+
+/// `prev` is the row this one replaces, if any: a tile that changed colour blends from
+/// its old fill instead of snapping.
+fn build_row(
+    ctx: &Ctx,
+    l: &PanelLayout,
+    index: usize,
+    row: &Row,
+    prev: Option<&Row>,
+) -> Result<RowVis> {
     let s = ctx.s;
     let band = l.rows[index];
     let (w, h) = (
@@ -252,13 +273,19 @@ fn build_row(ctx: &Ctx, l: &PanelLayout, index: usize, row: &Row) -> Result<RowV
                 // A tinted tile (the power mode) is always "filled", in its own colour.
                 let filled = t.on || t.tint.is_some();
                 let fg = if filled { WHITE } else { text };
-                let fill = match t.tint {
-                    Some(c) => c,
-                    None if t.on => ctx.accent,
-                    None => alpha(text, TILE_ALPHA),
-                };
+                let fill = tile_fill(t, ctx);
                 let wr = local(&whole, band.y, s);
-                plate(ctx, &container, wr, TILE_RADIUS_DIP * s, fill)?;
+                let rr = RoundRect::new(ctx.comp)?;
+                rr.set(wr, TILE_RADIUS_DIP * s, fill)?;
+                container.Children()?.InsertAtTop(&rr.visual)?;
+                let before = match prev {
+                    Some(Row::Tiles(old)) => old.iter().find(|o| o.id == t.id),
+                    _ => None,
+                }
+                .map(|o| tile_fill(o, ctx));
+                if let Some(from) = before.filter(|f| *f != fill && animations()) {
+                    let _ = rr.tween_from(from, TILE_TWEEN_MS);
+                }
                 // The label runs under both halves: the chevron sits in the icon row only, so
                 // "Bluetooth" is not cut short next to it.
                 let label_w = (wr.2 - wr.0) as f32 - 2.0 * PAD_DIP * s;
@@ -674,6 +701,38 @@ impl PanelView {
         r
     }
 
+    /// The rows now show another page: they slide in from the right (`forward`, going into
+    /// a sub-page) or the left (back), fading in, as the stock Quick Settings pages do.
+    pub fn slide_in(&self, forward: bool) -> Result<()> {
+        use windows::core::h;
+        if !animations() {
+            return Ok(());
+        }
+        let comp = &self.comp;
+        let ease =
+            comp.CreateCubicBezierEasingFunction(Vector2::new(0.1, 0.9), Vector2::new(0.2, 1.0))?;
+        let span = windows::Foundation::TimeSpan::from(std::time::Duration::from_millis(
+            u64::from(SLIDE_MS),
+        ));
+        let dx = SLIDE_DIP * self.scale * if forward { 1.0 } else { -1.0 };
+        let mv = comp.CreateVector3KeyFrameAnimation()?;
+        mv.InsertKeyFrame(0.0, Vector3::new(dx, 0.0, 0.0))?;
+        mv.InsertKeyFrameWithEasingFunction(1.0, Vector3::new(0.0, 0.0, 0.0), &ease)?;
+        mv.SetDuration(span)?;
+        let fade = comp.CreateScalarKeyFrameAnimation()?;
+        fade.InsertKeyFrame(0.0, 0.0)?;
+        fade.InsertKeyFrameWithEasingFunction(1.0, 1.0, &ease)?;
+        fade.SetDuration(span)?;
+        // The rows layer never sits anywhere but 0 (scrolling moves `content`).
+        self.rows_layer.StartAnimation(h!("Offset"), &mv)?;
+        if let Err(e) = self.rows_layer.StartAnimation(h!("Opacity"), &fade) {
+            let _ = self.rows_layer.StopAnimation(h!("Offset"));
+            let _ = self.rows_layer.SetOffset(Vector3::new(0.0, 0.0, 0.0));
+            return Err(e);
+        }
+        Ok(())
+    }
+
     /// The anchor moved (the bar was laid out anew): the panel follows it, same size.
     pub fn reanchor(&mut self, comp: &Comp, anchor_px: PxRect) -> Result<()> {
         if anchor_px == self.anchor {
@@ -747,7 +806,14 @@ impl PanelView {
                         ));
                     }
                     None => {
-                        let v = build_row(&ctx, &l, i, row)?;
+                        // The row it replaces: the old one in the same place, unless that
+                        // one stays (moved) elsewhere.
+                        let prev = self
+                            .rows
+                            .get(i)
+                            .filter(|o| !rows.contains(&o.row))
+                            .map(|o| &o.row);
+                        let v = build_row(&ctx, &l, i, row, prev)?;
                         layer.InsertAtTop(&v.container)?;
                         fresh.push((v, true));
                     }

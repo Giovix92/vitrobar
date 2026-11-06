@@ -185,7 +185,7 @@ const GRID_CLOSE_MS: u32 = 130;
 /// How long past its close animation a fading panel lives before the timer destroys it.
 const START_CLOSED_SLACK_MS: u32 = 30;
 /// The bar's flyouts (quick, calendar, music, Claude): a shorter rise than Start's.
-const FLYOUT_OPEN_MS: u32 = 150;
+const FLYOUT_OPEN_MS: u32 = 200;
 const FLYOUT_CLOSE_MS: u32 = 100;
 
 /// Debug hook for live tests of the Start panel's power menu: `1` makes every power action a

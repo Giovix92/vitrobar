@@ -117,6 +117,8 @@ pub struct QuickPanel {
     text: Rgba,
     accent: Rgba,
     page: QuickPage,
+    /// The page the view last drew (a change slides the new one in).
+    shown_page: QuickPage,
     // The snapshots the shown rows were built from: item indices refer to them.
     wifi: Option<WifiSnapshot>,
     bt: Option<BtSnapshot>,
@@ -424,6 +426,7 @@ impl QuickPanel {
             text: style.text,
             accent,
             page: QuickPage::Main,
+            shown_page: QuickPage::Main,
             wifi,
             bt,
             audio,
@@ -544,6 +547,11 @@ impl QuickPanel {
         if rows != self.rows {
             self.view.update(g.comp, g.painter, &rows)?;
             self.rows = rows;
+            if self.page != self.shown_page {
+                // Into a sub-page from the right, back to the main page from the left.
+                let _ = self.view.slide_in(self.page != QuickPage::Main);
+                self.shown_page = self.page;
+            }
             // Parts that went away lose their hover / focus.
             let has = |p: Option<Part>| {
                 p.filter(|p| self.view.layout().parts.iter().any(|(q, _)| q == p))

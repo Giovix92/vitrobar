@@ -115,6 +115,25 @@ impl RoundRect {
         self.brush.SetColor(color(c))
     }
 
+    /// Blends the fill from `from` to the colour it has now over `ms` (a tile switching on
+    /// or off).
+    pub(crate) fn tween_from(&self, from: Rgba, ms: u32) -> Result<()> {
+        use windows::core::h;
+        let comp = self.visual.Compositor()?;
+        let to = self.brush.Color()?;
+        let a = comp.CreateColorKeyFrameAnimation()?;
+        // Straight RGB: the default (HSL) swings through other hues on the way.
+        a.SetInterpolationColorSpace(windows::UI::Composition::CompositionColorSpace::Rgb)?;
+        a.InsertKeyFrame(0.0, color(from))?;
+        let ease =
+            comp.CreateCubicBezierEasingFunction(Vector2::new(0.1, 0.9), Vector2::new(0.2, 1.0))?;
+        a.InsertKeyFrameWithEasingFunction(1.0, to, &ease)?;
+        a.SetDuration(windows::Foundation::TimeSpan::from(
+            std::time::Duration::from_millis(u64::from(ms)),
+        ))?;
+        self.brush.StartAnimation(h!("Color"), &a)
+    }
+
     /// Fades the shape to `to` (0..=1) over `ms`.
     pub(crate) fn fade(&self, to: f32, ms: u32) -> Result<()> {
         use windows::core::h;
