@@ -1,0 +1,94 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <title>Vitrobar</title>
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="690" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0d1f3c"/>
+      <stop offset="0.45" stop-color="#244878"/>
+      <stop offset="0.78" stop-color="#9a6f88"/>
+      <stop offset="1" stop-color="#f6a35a"/>
+    </linearGradient>
+    <linearGradient id="lake" x1="0" y1="690" x2="0" y2="1024" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#3a5d86"/>
+      <stop offset="0.25" stop-color="#1b3657"/>
+      <stop offset="1" stop-color="#08121f"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="640" cy="560" r="494.0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffc56b" stop-opacity="0.85"/>
+      <stop offset="0.35" stop-color="#f4884e" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#f4884e" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="sun" cx="0.45" cy="0.35" r="0.75">
+      <stop offset="0" stop-color="#fff6dc"/>
+      <stop offset="0.4" stop-color="#ffd27f"/>
+      <stop offset="1" stop-color="#f08f45"/>
+    </radialGradient>
+    <linearGradient id="amber" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#ffd27f"/><stop offset="1" stop-color="#f0a04b"/>
+    </linearGradient>
+    <linearGradient id="app" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#dce8f4"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.6"/>
+      <stop offset="0.2" stop-color="#ffffff" stop-opacity="0.1"/>
+      <stop offset="0.8" stop-color="#ffffff" stop-opacity="0.04"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0.18"/>
+    </linearGradient>
+    <linearGradient id="glassfill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.30"/>
+      <stop offset="0.45" stop-color="#ffffff" stop-opacity="0.12"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0.06"/>
+    </linearGradient>
+    <linearGradient id="glassrim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.95"/>
+      <stop offset="0.45" stop-color="#ffffff" stop-opacity="0.2"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0.55"/>
+    </linearGradient>
+    <clipPath id="tile"><rect x="16" y="16" width="992" height="992" rx="208"/></clipPath>
+    <clipPath id="pill"><rect x="96" y="560" width="832" height="272" rx="136.0"/></clipPath>
+    <filter id="frost" x="-5%" y="-5%" width="110%" height="110%" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="30"/>
+      <feColorMatrix type="saturate" values="1.35"/>
+    </filter>
+    <filter id="soft" x="-30%" y="-30%" width="160%" height="180%">
+      <feGaussianBlur stdDeviation="8"/>
+    </filter>
+    <filter id="sunglow" x="-80%" y="-80%" width="260%" height="260%">
+      <feGaussianBlur stdDeviation="36"/>
+    </filter>
+    <filter id="ripple" x="-10%" y="-100%" width="120%" height="300%"><feGaussianBlur stdDeviation="2.2"/></filter>
+    <filter id="lift" x="-30%" y="-30%" width="160%" height="170%">
+      <feDropShadow dx="0" dy="6" stdDeviation="6" flood-color="#08121f" flood-opacity="0.35"/>
+    </filter>
+    <g id="scene">
+      <rect width="1024" height="690" fill="url(#sky)"/>
+      <rect y="690" width="1024" height="334" fill="url(#lake)"/>
+      <rect width="1024" height="1024" fill="url(#glow)"/>
+      <circle cx="640" cy="560" r="209.00000000000003" fill="#ffb457" opacity="0.6" filter="url(#sunglow)"/>
+      <circle cx="640" cy="560" r="190" fill="url(#sun)"/>
+      <!-- the lake hides the sun's lower half -->
+      <rect y="690" width="1024" height="334" fill="url(#lake)" opacity="0.92"/>
+      <rect x="0" y="688" width="1024" height="4" fill="#ffd9a0" opacity="0.5"/>
+      
+    </g>
+  </defs>
+
+  <rect x="16" y="22" width="992" height="992" rx="208"
+        fill="#040b16" opacity="0.25" filter="url(#soft)"/>
+  <g clip-path="url(#tile)">
+    <use href="#scene"/>
+    <!-- the glass bar: what is behind it, frosted -->
+    <rect x="106" y="572" width="812" height="272" rx="136.0"
+          fill="#030a14" opacity="0.5" filter="url(#soft)"/>
+    <g clip-path="url(#pill)">
+      <use href="#scene" filter="url(#frost)"/>
+      <rect x="96" y="560" width="832" height="272" fill="url(#glassfill)"/>
+    </g>
+    <rect x="98.5" y="562.5" width="827" height="267" rx="133.5"
+          fill="none" stroke="url(#glassrim)" stroke-width="22"/>
+    <rect x="214.0" y="596.0" width="172" height="172" rx="46.4" fill="url(#app)" filter="url(#lift)"/><rect x="426.0" y="596.0" width="172" height="172" rx="46.4" fill="url(#app)" filter="url(#lift)"/><rect x="638.0" y="596.0" width="172" height="172" rx="46.4" fill="url(#app)" filter="url(#lift)"/>
+    <rect x="452.0" y="782.0" width="120" height="34" rx="17.0" fill="url(#amber)"/>
+    <rect x="19" y="19" width="986" height="986" rx="205"
+          fill="none" stroke="url(#rim)" stroke-width="14"/>
+  </g>
+</svg>

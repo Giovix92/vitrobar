@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/logo.png" width="128" height="128" alt="Vitrobar logo"></p>
+
 # Vitrobar
 
 Vitrobar is a free, open-source replacement for the Windows 11 taskbar, with a glass look and a small resource footprint. It is written in Rust and licensed under GPL-3.0.
@@ -32,4 +34,4 @@ The manual checks to run before a release are in `docs/release-checklist.md`.
 
 ## Artwork
 
-`app/vitrobar/vitrobar.ico` (the app icon: a glass bar on a blue tile, in 16, 20, 24, 32, 40, 48, 64, 128 and 256 px) is original artwork made for this project: it was drawn programmatically with a short Pillow script, from plain shapes and colours, with no third-party images, fonts or logos. It is a placeholder until the project has a real logo, and like the rest of the project it is licensed under GPL-3.0.
+The logo is original artwork made for this project: a dusk lake on a rounded tile, where the sun sets behind a frosted glass bar holding three app tiles. Its vector sources are `assets/logo.svg` (48 px and up) and `assets/logo-small.svg` (a simplified drawing for 16 to 32 px), drawn from plain shapes and gradients, with no third-party images, fonts or logos. `app/vitrobar/vitrobar.ico` (16, 20, 24, 32, 40, 48, 64, 128 and 256 px), `assets/logo.png`, the website's `site/logo.svg`, `site/favicon.ico` and `site/apple-touch-icon.png` are rendered from them. Like the rest of the project, the logo is licensed under GPL-3.0.
