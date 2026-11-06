@@ -380,7 +380,9 @@ mod tests {
         eprintln!("snapshot: {:?}", m.snapshot());
         m.request_thumbnail(64);
         std::thread::sleep(std::time::Duration::from_secs(2));
-        if let Some(t) = m.take_thumbnail() {
+        let t = m.take_thumbnail();
+        eprintln!("thumbnail: {:?}", t.as_ref().map(|t| (t.width, t.height)));
+        if let Some(t) = t {
             assert_eq!((t.width, t.height), (64, 64));
             assert!(t.is_valid());
         }

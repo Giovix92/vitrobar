@@ -14,9 +14,9 @@ use vitro_core::settings::Position;
 use vitro_core::style::{MaterialStyle, Rgba};
 use vitro_core::widgets::{
     bar_fill, claude_pill_text, claude_rows, music_action, music_glyph, music_pill_text,
-    music_rows, next_pill_change, pill_width, ClaudeUsage, MusicAction, MusicView, ART_DIP,
-    CLAUDE_PILL_MAX_DIP, G_CLAUDE, ID_ART, ID_BAR_5H, ID_BAR_7D, MUSIC_PILL_MAX_CHARS,
-    MUSIC_PILL_MAX_DIP, PILL_FONT_DIP,
+    music_rows, next_pill_change, pill_width, player_tint, ClaudeUsage, MusicAction, MusicView,
+    ART_DIP, CLAUDE_PILL_MAX_DIP, CLAUDE_TINT, G_CLAUDE, ID_ART, ID_BAR_5H, ID_BAR_7D,
+    MUSIC_PILL_MAX_CHARS, MUSIC_PILL_MAX_DIP, PILL_ART_DIP, PILL_FONT_DIP,
 };
 use vitro_render::bar_visual::WidgetPill;
 use vitro_render::compositor::Comp;
@@ -72,6 +72,13 @@ pub struct Wake {
     pub thumbnail: bool,
 }
 
+/// Title, artist and player: what an artwork belongs to.
+type TrackKey = (String, String, String);
+
+fn track_key(v: &MusicView) -> TrackKey {
+    (v.title.clone(), v.artist.clone(), v.app.clone())
+}
+
 /// The music widget while it is enabled.
 pub struct Music {
     media: Media,
@@ -80,6 +87,13 @@ pub struct Music {
     pub pill: Option<WidgetPill>,
     /// DIP; 0 while hidden.
     pub width: f32,
+    /// The pill shows the artwork (setting) and takes the player's colour (setting).
+    art_on: bool,
+    tint_on: bool,
+    /// The current track's artwork, shared by the pill and the panel.
+    art: Option<std::sync::Arc<BgraImage>>,
+    /// The track the artwork was asked for.
+    art_for: Option<TrackKey>,
 }
 
 impl Music {
@@ -89,7 +103,51 @@ impl Music {
             view: None,
             pill: None,
             width: 0.0,
+            art_on: false,
+            tint_on: false,
+            art: None,
+            art_for: None,
         })
+    }
+
+    /// The pill's looks (the two widget settings); true if the pill changed.
+    pub fn set_looks(&mut self, art: bool, tint: bool, painter: &Painter) -> bool {
+        self.art_on = art;
+        self.tint_on = tint;
+        if !art {
+            self.art_for = None;
+        }
+        self.remeasure(painter)
+    }
+
+    /// The pill shows artwork (the setting is on): it keeps the artwork's width.
+    pub fn art_on(&self) -> bool {
+        self.art_on
+    }
+
+    /// True once per track while the pill shows artwork: the caller asks for it.
+    pub fn wants_art(&mut self) -> bool {
+        let Some(key) = self.view.as_ref().map(track_key) else {
+            return false;
+        };
+        if !self.art_on || self.art_for.as_ref() == Some(&key) {
+            return false;
+        }
+        self.art = None;
+        self.art_for = Some(key);
+        true
+    }
+
+    /// The artwork arrived (`None`: none yet, or the track has none); true if the pill
+    /// changed.
+    pub fn set_art(&mut self, art: Option<std::sync::Arc<BgraImage>>, painter: &Painter) -> bool {
+        if art.is_none() {
+            // Players often name the track before its artwork is ready: the next update
+            // of the session asks again.
+            self.art_for = None;
+        }
+        self.art = art;
+        self.remeasure(painter)
     }
 
     /// [`WM_APP_MEDIA`] arrived: reads what changed and re-measures the pill.
@@ -111,15 +169,26 @@ impl Music {
     /// Recomputes the pill from the current view; true if it changed.
     pub fn remeasure(&mut self, painter: &Painter) -> bool {
         let text = music_pill_text(self.view.as_ref(), MUSIC_PILL_MAX_CHARS);
+        let playing = self.view.as_ref().is_some_and(|v| v.playing);
         let pill = (!text.is_empty()).then(|| WidgetPill {
-            glyph: music_glyph(self.view.as_ref().is_some_and(|v| v.playing)),
+            glyph: music_glyph(playing),
             text: text.clone(),
+            art: self.art.clone().filter(|_| self.art_on),
+            // While playing the artwork shows plain; paused, the play glyph lies on it.
+            quiet_glyph: playing,
+            tint: self
+                .view
+                .as_ref()
+                .filter(|_| self.tint_on)
+                .and_then(|v| player_tint(&v.app)),
         });
         let text_w = painter
             .measure(&text, FontKind::Text, PILL_FONT_DIP)
             .map(|(w, _)| w.ceil())
             .unwrap_or(text.chars().count() as f32 * PILL_FONT_DIP * 0.6);
-        let width = pill_width(&text, text_w, MUSIC_PILL_MAX_DIP).round();
+        // Room for the artwork as soon as the setting is on: the pill does not jump when
+        // it arrives.
+        let width = pill_width(&text, text_w, MUSIC_PILL_MAX_DIP, self.art_on).round();
         let changed = pill != self.pill || width != self.width;
         self.pill = pill;
         self.width = width;
@@ -141,6 +210,16 @@ impl Music {
     pub fn take_thumbnail(&self) -> Option<BgraImage> {
         self.media.take_thumbnail()
     }
+
+    /// The colour the music panel takes (with the setting on and a known player).
+    pub fn tint(&self) -> Option<Rgba> {
+        self.pill.as_ref().and_then(|p| p.tint)
+    }
+}
+
+/// The pill's artwork size in px at `scale`.
+pub fn pill_art_px(scale: f32) -> u32 {
+    (PILL_ART_DIP * scale).round().max(1.0) as u32
 }
 
 // ---- the detail panel ---------------------------------------------------------------------
@@ -493,6 +572,8 @@ pub struct Claude {
     pub pill: Option<WidgetPill>,
     /// DIP.
     pub width: f32,
+    /// The pill and panel take Claude's colour (setting).
+    pub tint_on: bool,
 }
 
 impl Claude {
@@ -502,6 +583,7 @@ impl Claude {
             usage: claude_usage::read(),
             pill: None,
             width: 0.0,
+            tint_on: false,
         })
     }
 
@@ -521,8 +603,10 @@ impl Claude {
         let pill = Some(WidgetPill {
             glyph: G_CLAUDE,
             text: text.clone(),
+            tint: self.tint_on.then_some(CLAUDE_TINT),
+            ..WidgetPill::default()
         });
-        let width = pill_width(&text, text_w, CLAUDE_PILL_MAX_DIP).round();
+        let width = pill_width(&text, text_w, CLAUDE_PILL_MAX_DIP, false).round();
         let changed = pill != self.pill || width != self.width;
         self.pill = pill;
         self.width = width;

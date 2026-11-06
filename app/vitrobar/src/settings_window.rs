@@ -105,7 +105,10 @@ pub fn effect_of(id: ControlId, s: &Settings) -> Effect {
         | ControlId::ReserveFloating
         // The widget pills appear on or leave the bar.
         | ControlId::WidgetMusic
-        | ControlId::WidgetClaude => Effect::Relayout,
+        | ControlId::WidgetClaude
+        | ControlId::BatteryOnBar
+        | ControlId::MusicArt
+        | ControlId::WidgetColors => Effect::Relayout,
         // Read when the quick panel next opens.
         ControlId::QuickTile(_) | ControlId::QuickPanelHint => Effect::Saved,
         ControlId::WinKey => Effect::WinKey(s.win_key_opens_start),

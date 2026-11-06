@@ -67,6 +67,9 @@ pub struct LayoutInput {
     /// DIP width of the input-language indicator (0 = hidden); only with the tray area, just
     /// left of the quick-settings button.
     pub ime: f32,
+    /// DIP width of the battery indicator (0 = hidden); only with the tray area, between
+    /// the input-language indicator and the quick-settings button.
+    pub battery: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -85,6 +88,8 @@ pub struct BarLayout {
     pub widgets: [Option<Rect>; 2],
     /// The input-language indicator, `None` when hidden.
     pub ime: Option<Rect>,
+    /// The battery indicator, `None` when hidden.
+    pub battery: Option<Rect>,
     pub show_desktop: Rect,
     /// DIPs to reserve at the screen edge.
     pub reserved: f32,
@@ -157,7 +162,9 @@ pub fn compute_layout(i: &LayoutInput) -> BarLayout {
         .map(|k| widget_w(k) + GAP)
         .sum();
     let ime_w = if i.tray_area { i.ime.max(0.0) } else { 0.0 };
-    let right_w = widgets_w + m.slot * tray_count as f32 + ime_w + 2.0 * tray_slot + i.clock_w;
+    let battery_w = if i.tray_area { i.battery.max(0.0) } else { 0.0 };
+    let right_w =
+        widgets_w + m.slot * tray_count as f32 + ime_w + battery_w + 2.0 * tray_slot + i.clock_w;
     // right group with its inner padding on both sides, then the show-desktop strip
     let right_surface_w = PAD + right_w + PAD + SHOW_DESKTOP_W;
 
@@ -252,7 +259,9 @@ pub fn compute_layout(i: &LayoutInput) -> BarLayout {
         .collect();
     let ime_x = tray_x + tray_slot + tray_count as f32 * m.slot;
     let ime = (ime_w > 0.0).then(|| item(ime_x, ime_w));
-    let quick_x = ime_x + ime_w;
+    let battery_x = ime_x + ime_w;
+    let battery = (battery_w > 0.0).then(|| item(battery_x, battery_w));
+    let quick_x = battery_x + battery_w;
     let quick = item(quick_x, tray_slot);
     let clock = item(quick_x + tray_slot, i.clock_w);
 
@@ -284,6 +293,7 @@ pub fn compute_layout(i: &LayoutInput) -> BarLayout {
         clock,
         widgets,
         ime,
+        battery,
         show_desktop,
         reserved,
     }
@@ -338,6 +348,7 @@ mod tests {
             tray_area: true,
             widgets: [0.0; 2],
             ime: 0.0,
+            battery: 0.0,
         }
     }
     fn lay(shape: Shape, n: usize) -> BarLayout {
@@ -618,6 +629,22 @@ mod tests {
         // hidden widget: falls back to the quick button
         let l = lay(Shape::Pill, 5);
         assert_eq!(anchor_for(&l, AnchorTarget::Widget(0)), l.quick);
+    }
+
+    #[test]
+    fn the_battery_sits_between_the_ime_and_quick() {
+        let mut i = input(MON, Shape::Pill, Position::Bottom, 3, true);
+        i.ime = 30.0;
+        let before = compute_layout(&i);
+        assert!(before.battery.is_none());
+        i.battery = 56.0;
+        let l = compute_layout(&i);
+        let b = l.battery.expect("shown");
+        assert_eq!(b.x, l.ime.expect("ime").right());
+        assert_eq!(l.quick.x, b.right());
+        assert!((l.surfaces[0].w - before.surfaces[0].w - 56.0).abs() < 0.01);
+        i.tray_area = false;
+        assert!(compute_layout(&i).battery.is_none());
     }
 
     #[test]

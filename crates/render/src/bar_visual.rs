@@ -79,10 +79,31 @@ pub struct ChevronState {
 
 /// What a widget pill of the bar shows: a glyph (Segoe Fluent Icons) and one line of text.
 /// The widget tasks supply it and the width in `LayoutInput::widgets`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct WidgetPill {
     pub glyph: char,
     pub text: String,
+    /// Artwork in the glyph's place ([`vitro_core::widgets::PILL_ART_DIP`] square); the
+    /// glyph then shows over it, dimmed.
+    pub art: Option<Arc<BgraImage>>,
+    /// With artwork: the glyph shows only while the pointer is on the pill.
+    pub quiet_glyph: bool,
+    /// The pill's own colour: a soft plate of it lies under the pill.
+    pub tint: Option<Rgba>,
+}
+
+impl PartialEq for WidgetPill {
+    fn eq(&self, o: &Self) -> bool {
+        self.glyph == o.glyph
+            && self.text == o.text
+            && self.quiet_glyph == o.quiet_glyph
+            && self.tint == o.tint
+            && match (&self.art, &o.art) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            }
+    }
 }
 
 /// Inputs that change rarely (monitor DPI, accent colour, the Animation effects setting,
@@ -280,6 +301,12 @@ const CLOCK_FONT_DIP: f32 = 12.0;
 const WIDGET_FONT_DIP: f32 = vitro_core::widgets::PILL_FONT_DIP;
 const WIDGET_PAD_DIP: f32 = vitro_core::widgets::PILL_PAD_DIP;
 const WIDGET_GAP_DIP: f32 = vitro_core::widgets::PILL_GAP_DIP;
+/// The battery indicator's insets (narrower than a widget pill's).
+pub const BATTERY_PAD_DIP: f32 = 6.0;
+pub const BATTERY_GAP_DIP: f32 = 4.0;
+/// Alpha of a tinted pill's plate, and under the pointer.
+const TINT_ALPHA: u8 = 60;
+const TINT_HOVER_ALPHA: u8 = 96;
 const DOT_DIP: f32 = 4.0;
 const ACTIVE_DOT_DIP: f32 = 12.0;
 const DOT_GAP_DIP: f32 = 3.0;
@@ -318,10 +345,15 @@ enum Content {
     },
     /// Icon centred in the cell, `dy` px above centre.
     Icon { image: IconRef, dy: i32 },
-    /// A widget pill: the glyph, then one line of text cut with an ellipsis; `pad` px inside
-    /// the cell edges, `gap` px between the two.
+    /// A widget pill: the glyph (or artwork with the glyph over it), then one line of text
+    /// cut with an ellipsis; `pad` px inside the cell edges, `gap` px between the two.
     Pill {
         glyph: char,
+        /// Drawn `art_px` square in the glyph's place.
+        art: Option<IconRef>,
+        art_px: i32,
+        /// The glyph is drawn (always without artwork).
+        show_glyph: bool,
         text: String,
         size_px: i32,
         color: Rgba,
@@ -452,6 +484,8 @@ struct Cell {
     motion: ContainerVisual,
     placeholder: Shape,
     sprite: SpriteVisual,
+    /// A pill's artwork (under the text sprite), made on first use.
+    art: Option<SpriteVisual>,
     /// The drawn icon (the sweep streak is masked by it).
     icon_surface: Option<CompositionDrawingSurface>,
     streak: Option<SpriteVisual>,
@@ -483,6 +517,7 @@ impl Cell {
             motion,
             placeholder,
             sprite,
+            art: None,
             icon_surface: None,
             streak: None,
             dots,
@@ -766,6 +801,9 @@ impl Cell {
             }
             Content::Pill {
                 glyph,
+                art,
+                art_px,
+                show_glyph,
                 text,
                 size_px,
                 color: c,
@@ -775,23 +813,38 @@ impl Cell {
                 h,
             } => {
                 self.placeholder.visual.SetIsVisible(false)?;
+                let glyph_w = *size_px as f32 * 1.2;
+                let lead_w = if art.is_some() {
+                    *art_px as f32
+                } else {
+                    glyph_w
+                };
+                self.apply_art(
+                    comp,
+                    painter,
+                    art.as_ref(),
+                    *art_px,
+                    *pad,
+                    *h,
+                    *show_glyph,
+                    redraw,
+                )?;
                 if redraw {
                     let glyph = glyph.to_string();
-                    let glyph_w = *size_px as f32 * 1.2;
-                    let text_x = *pad as f32 + glyph_w + *gap as f32;
+                    let text_x = *pad as f32 + lead_w + *gap as f32;
                     let (fw, fh) = (*w as f32, *h as f32);
-                    let boxes = [
-                        (
+                    let mut boxes = vec![(
+                        text.as_str(),
+                        FontKind::Text,
+                        (text_x, 0.0, (fw - text_x - *pad as f32).max(1.0), fh),
+                    )];
+                    if *show_glyph {
+                        boxes.push((
                             glyph.as_str(),
                             FontKind::Glyph,
-                            (*pad as f32, 0.0, glyph_w, fh),
-                        ),
-                        (
-                            text.as_str(),
-                            FontKind::Text,
-                            (text_x, 0.0, (fw - text_x - *pad as f32).max(1.0), fh),
-                        ),
-                    ];
+                            (*pad as f32, 0.0, lead_w, fh),
+                        ));
+                    }
                     let surface =
                         painter.text_boxes(&boxes, *size_px as f32, *c, *w as u32, *h as u32)?;
                     self.sprite
@@ -821,6 +874,51 @@ impl Cell {
             }
         }
         Ok(drawn)
+    }
+
+    /// A pill's artwork: `art_px` square, `pad` px from the left, centred in `h`; dimmed
+    /// under a glyph drawn over it. Hidden without artwork.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_art(
+        &mut self,
+        comp: &Compositor,
+        painter: &Painter,
+        art: Option<&IconRef>,
+        art_px: i32,
+        pad: i32,
+        h: i32,
+        dimmed: bool,
+        redraw: bool,
+    ) -> Result<()> {
+        let Some(img) = art else {
+            if let Some(a) = &self.art {
+                a.SetIsVisible(false)?;
+            }
+            return Ok(());
+        };
+        let sprite = match &self.art {
+            Some(a) => a.clone(),
+            None => {
+                let a = comp.CreateSpriteVisual()?;
+                // Rounded like the artwork in the music panel.
+                let geom = comp.CreateRoundedRectangleGeometry()?;
+                let r = (art_px as f32 * 0.2).max(2.0);
+                geom.SetCornerRadius(Vector2::new(r, r))?;
+                geom.SetSize(Vector2::new(art_px as f32, art_px as f32))?;
+                a.SetClip(&comp.CreateGeometricClipWithGeometry(&geom)?)?;
+                self.motion.Children()?.InsertBelow(&a, &self.sprite)?;
+                self.art = Some(a.clone());
+                a
+            }
+        };
+        if redraw {
+            let surface = painter.image(&img.0)?;
+            sprite.SetBrush(&comp.CreateSurfaceBrushWithSurface(&surface)?)?;
+        }
+        sprite.SetSize(Vector2::new(art_px as f32, art_px as f32))?;
+        sprite.SetOffset(Vector3::new(pad as f32, ((h - art_px) / 2) as f32, 0.0))?;
+        sprite.SetOpacity(if dimmed { 0.35 } else { 1.0 })?;
+        sprite.SetIsVisible(true)
     }
 
     fn apply_dots(
@@ -977,6 +1075,10 @@ pub struct BarVisual {
     ime: Option<Cell>,
     ime_text: Option<String>,
     ime_hover: bool,
+    /// The battery indicator.
+    battery: Option<Cell>,
+    battery_pill: Option<WidgetPill>,
+    battery_hover: bool,
     /// Music and Claude pills.
     widget_cells: [Option<Cell>; 2],
     widget_pills: [Option<WidgetPill>; 2],
@@ -1023,6 +1125,9 @@ impl BarVisual {
             ime: None,
             ime_text: None,
             ime_hover: false,
+            battery: None,
+            battery_pill: None,
+            battery_hover: false,
             widget_cells: [None, None],
             widget_pills: [None, None],
             widget_hover: None,
@@ -1101,6 +1206,14 @@ impl BarVisual {
         self.ime_hover = hovered;
     }
 
+    /// The battery indicator (glyph and percentage; `None`: not shown) and whether the
+    /// cursor is on it; takes effect on the next [`BarVisual::update`] (it also needs
+    /// `layout.battery`).
+    pub fn set_battery(&mut self, pill: Option<WidgetPill>, hovered: bool) {
+        self.battery_pill = pill;
+        self.battery_hover = hovered;
+    }
+
     /// Whether the input-language indicator is in the tree (diagnostics and tests).
     pub fn ime_shown(&self) -> bool {
         self.ime.is_some()
@@ -1144,6 +1257,7 @@ impl BarVisual {
             &mut self.quick,
             &mut self.clock,
             &mut self.ime,
+            &mut self.battery,
         ]
         .into_iter()
         .chain(self.widget_cells.iter_mut())
@@ -1335,6 +1449,40 @@ impl BarVisual {
             _ => None,
         };
 
+        // Like the input-language indicator: the battery glyph and its percentage.
+        let battery_spec = match (&self.battery_pill, &layout.battery) {
+            (Some(b), Some(r)) if owns(&surface, r) => {
+                let rect = cell_rect(r);
+                Some(CellSpec {
+                    rect,
+                    content: Content::Pill {
+                        glyph: b.glyph,
+                        art: None,
+                        art_px: 0,
+                        show_glyph: true,
+                        text: b.text.clone(),
+                        size_px: px(WIDGET_FONT_DIP),
+                        color: text,
+                        pad: px(BATTERY_PAD_DIP),
+                        gap: px(BATTERY_GAP_DIP),
+                        w: rect.w,
+                        h: rect.h,
+                    },
+                    plate: if self.battery_hover {
+                        rgba_alpha(text, PLATE_HOVER_ALPHA)
+                    } else {
+                        Rgba(0, 0, 0, 0)
+                    },
+                    plate_inset,
+                    plate_radius,
+                    attention: false,
+                    dots: None,
+                    fx: None,
+                })
+            }
+            _ => None,
+        };
+
         // A pill is drawn only when the app gave it text and the layout a rect.
         let widget_specs: [Option<CellSpec>; 2] = [0, 1].map(|k| {
             let (pill, r) = (self.widget_pills[k].as_ref()?, layout.widgets[k].as_ref()?);
@@ -1351,10 +1499,14 @@ impl BarVisual {
                     sweep: false,
                     timing: hover_timing(hover),
                 };
+                let art = pill.art.clone().map(IconRef);
                 CellSpec {
                     rect,
                     content: Content::Pill {
                         glyph: pill.glyph,
+                        show_glyph: art.is_none() || !pill.quiet_glyph || on,
+                        art,
+                        art_px: px(vitro_core::widgets::PILL_ART_DIP),
                         text: pill.text.clone(),
                         size_px: px(WIDGET_FONT_DIP),
                         color: text,
@@ -1363,10 +1515,11 @@ impl BarVisual {
                         w: rect.w,
                         h: rect.h,
                     },
-                    plate: if on && !hover.plate {
-                        rgba_alpha(text, PLATE_HOVER_ALPHA)
-                    } else {
-                        Rgba(0, 0, 0, 0)
+                    plate: match pill.tint {
+                        // The app's colour, a little stronger under the pointer.
+                        Some(t) => rgba_alpha(t, if on { TINT_HOVER_ALPHA } else { TINT_ALPHA }),
+                        None if on && !hover.plate => rgba_alpha(text, PLATE_HOVER_ALPHA),
+                        None => Rgba(0, 0, 0, 0),
                     },
                     plate_inset,
                     plate_radius,
@@ -1467,6 +1620,14 @@ impl BarVisual {
         drawn += sync(&mut self.quick, quick, comp, painter, &parent, anim)?;
         drawn += sync(&mut self.clock, clock_spec, comp, painter, &parent, anim)?;
         drawn += sync(&mut self.ime, ime_spec, comp, painter, &parent, anim)?;
+        drawn += sync(
+            &mut self.battery,
+            battery_spec,
+            comp,
+            painter,
+            &parent,
+            anim,
+        )?;
         for (slot, spec) in self.widget_cells.iter_mut().zip(widget_specs) {
             drawn += sync(slot, spec, comp, painter, &parent, anim)?;
         }

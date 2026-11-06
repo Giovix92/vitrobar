@@ -517,6 +517,8 @@ pub enum Hit {
     Widget(usize),
     /// The input-language indicator.
     Ime,
+    /// The battery indicator (it opens the quick panel, as the stock one does).
+    Battery,
     ShowDesktop,
 }
 
@@ -553,6 +555,9 @@ pub fn hit_test(l: &BarLayout, x: f32, y: f32) -> Option<Hit> {
     }
     if l.ime.as_ref().is_some_and(|r| inside(r, x, y)) {
         return Some(Hit::Ime);
+    }
+    if l.battery.as_ref().is_some_and(|r| inside(r, x, y)) {
+        return Some(Hit::Battery);
     }
     if inside(&l.quick, x, y) {
         return Some(Hit::Quick);
@@ -600,6 +605,7 @@ mod tests {
             tray_area: true,
             widgets: [0.0; 2],
             ime: 0.0,
+            battery: 0.0,
         }
     }
 
@@ -645,6 +651,7 @@ mod tests {
         let l = compute_layout(&LayoutInput {
             widgets: [100.0, 80.0],
             ime: 0.0,
+            battery: 0.0,
             ..input(2)
         });
         for i in 0..2 {
@@ -657,6 +664,7 @@ mod tests {
     fn the_ime_indicator_is_hit() {
         let l = compute_layout(&LayoutInput {
             ime: 30.0,
+            battery: 0.0,
             ..input(2)
         });
         let (x, y) = centre(&l.ime.unwrap());

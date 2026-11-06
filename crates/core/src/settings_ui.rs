@@ -111,6 +111,9 @@ pub enum ControlId {
     WidgetClaude,
     ClaudeWidgetHint,
     QuickPanelHint,
+    BatteryOnBar,
+    MusicArt,
+    WidgetColors,
     /// Shows or hides that tile of the quick panel.
     QuickTile(QuickTile),
     Language,
@@ -351,6 +354,12 @@ pub fn build_page(s: &Settings, width_dip: f32, page: Option<Section>) -> Settin
             ControlKind::Toggle(s.quick_tiles.contains(&t)),
         );
     }
+    add(
+        ControlId::BatteryOnBar,
+        QuickPanel,
+        Key::BatteryOnBar,
+        ControlKind::Toggle(s.battery_on_bar),
+    );
 
     add(
         ControlId::WidgetMusic,
@@ -369,6 +378,18 @@ pub fn build_page(s: &Settings, width_dip: f32, page: Option<Section>) -> Settin
         Widgets,
         Key::ClaudeWidgetHint,
         ControlKind::Text(Key::ClaudeWidgetHint),
+    );
+    add(
+        ControlId::MusicArt,
+        Widgets,
+        Key::MusicArt,
+        ControlKind::Toggle(s.music_art),
+    );
+    add(
+        ControlId::WidgetColors,
+        Widgets,
+        Key::WidgetColors,
+        ControlKind::Toggle(s.widget_colors),
     );
 
     add(
@@ -448,6 +469,9 @@ pub fn apply(s: &mut Settings, id: ControlId, choice: usize) -> bool {
         ControlId::StockTaskbar => set(&mut s.stock_taskbar, &STOCKS, choice),
         ControlId::WidgetMusic => set_bool(&mut s.widget_music, choice),
         ControlId::WidgetClaude => set_bool(&mut s.widget_claude, choice),
+        ControlId::BatteryOnBar => set_bool(&mut s.battery_on_bar, choice),
+        ControlId::MusicArt => set_bool(&mut s.music_art, choice),
+        ControlId::WidgetColors => set_bool(&mut s.widget_colors, choice),
         ControlId::QuickTile(t) => {
             let on = choice != 0;
             if on == s.quick_tiles.contains(&t) {
@@ -704,9 +728,13 @@ mod tests {
     fn model_order_and_geometry() {
         let m = build_model(&Settings::default(), 600.0);
         let ids: Vec<_> = m.controls.iter().map(|c| c.id).collect();
-        assert_eq!(ids.len(), 29, "19 + the quick panel's note and 9 tiles");
+        assert_eq!(
+            ids.len(),
+            32,
+            "19 + the quick panel's note, 9 tiles and the battery, 2 widget looks"
+        );
         assert_eq!(ids[0], ControlId::Shape);
-        assert_eq!(ids[28], ControlId::AboutSource);
+        assert_eq!(ids[31], ControlId::AboutSource);
         assert_eq!(m.focus, 0);
         // 24 padding, then a 36 header, then 48 rows.
         assert_eq!(m.controls[0].rect.y, 24.0 + 36.0);

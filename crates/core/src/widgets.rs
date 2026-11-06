@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::panel_kit::{Button, Part, Row};
+use crate::style::Rgba;
 
 /// The pill's look, shared with the bar visual that draws it (DIPs).
 pub const PILL_FONT_DIP: f32 = 13.0;
@@ -13,6 +14,73 @@ pub const PILL_PAD_DIP: f32 = 10.0;
 pub const PILL_GAP_DIP: f32 = 6.0;
 /// The glyph's box: a little wider than the font size.
 pub const PILL_GLYPH_W_DIP: f32 = PILL_FONT_DIP * 1.2;
+/// The music pill's artwork, in the glyph's place (the glyph then shows over it).
+pub const PILL_ART_DIP: f32 = 20.0;
+
+/// Width of the pill's leading box: the artwork or the glyph.
+pub fn pill_lead_w(art: bool) -> f32 {
+    if art {
+        PILL_ART_DIP
+    } else {
+        PILL_GLYPH_W_DIP
+    }
+}
+
+/// The bar's battery glyph (Segoe Fluent Icons, the horizontal battery the stock taskbar
+/// shows): eleven fill levels, with a plug while charging or a leaf with energy saver on.
+pub fn battery_glyph(percent: u8, charging: bool, saver: bool) -> char {
+    const PLAIN: [u32; 11] = [
+        0xE850, 0xE851, 0xE852, 0xE853, 0xE854, 0xE855, 0xE856, 0xE857, 0xE858, 0xE859, 0xE83F,
+    ];
+    const CHARGING: [u32; 11] = [
+        0xE85A, 0xE85B, 0xE85C, 0xE85D, 0xE85E, 0xE85F, 0xE860, 0xE861, 0xE862, 0xE83E, 0xEA93,
+    ];
+    const SAVER: [u32; 11] = [
+        0xE863, 0xE864, 0xE865, 0xE866, 0xE867, 0xE868, 0xE869, 0xE86A, 0xE86B, 0xEA94, 0xEA95,
+    ];
+    let level = (usize::from(percent.min(100)) + 5) / 10;
+    let set = if charging {
+        &CHARGING
+    } else if saver {
+        &SAVER
+    } else {
+        &PLAIN
+    };
+    char::from_u32(set[level]).unwrap_or('\u{E83F}')
+}
+
+/// Claude's orange, for the Claude pill and panel when widgets take their app's colour.
+pub const CLAUDE_TINT: Rgba = Rgba(0xD9, 0x77, 0x57, 255);
+
+/// The colour of a music player, from the name Windows gives its media session (an AUMID
+/// or an executable); `None` for players without a colour of their own (browsers…).
+pub fn player_tint(app: &str) -> Option<Rgba> {
+    let a = app.to_ascii_lowercase();
+    let has = |k: &str| a.contains(k);
+    Some(if has("spotify") {
+        Rgba(0x1D, 0xB9, 0x54, 255)
+    } else if has("applemusic") || has("itunes") {
+        Rgba(0xFA, 0x24, 0x3C, 255)
+    } else if has("zunemusic") || has("mediaplayer") || has("wmplayer") {
+        Rgba(0x00, 0x78, 0xD4, 255)
+    } else if has("deezer") {
+        Rgba(0xA2, 0x38, 0xFF, 255)
+    } else if has("soundcloud") {
+        Rgba(0xFF, 0x55, 0x00, 255)
+    } else if has("tidal") {
+        Rgba(0x00, 0xCC, 0xD3, 255)
+    } else if has("amazonmusic") || has("amazon music") {
+        Rgba(0x25, 0xD1, 0xDA, 255)
+    } else if has("youtubemusic") || has("youtube music") {
+        Rgba(0xFF, 0x00, 0x33, 255)
+    } else if has("vlc") {
+        Rgba(0xFF, 0x88, 0x00, 255)
+    } else if has("foobar") || has("musicbee") || has("aimp") {
+        Rgba(0x3A, 0x8E, 0xE6, 255)
+    } else {
+        return None;
+    })
+}
 
 /// The music pill never grows past this; its text is cut with an ellipsis.
 pub const MUSIC_PILL_MAX_DIP: f32 = 180.0;
@@ -68,17 +136,17 @@ fn cluster_starts(s: &str) -> Vec<usize> {
 
 /// The pill's width for text `text` measuring `text_w_dip`, capped at `max_dip`; 0 for empty
 /// text, which makes the layout hide the slot.
-pub fn pill_width(text: &str, text_w_dip: f32, max_dip: f32) -> f32 {
+pub fn pill_width(text: &str, text_w_dip: f32, max_dip: f32, art: bool) -> f32 {
     if text.is_empty() {
         return 0.0;
     }
-    (2.0 * PILL_PAD_DIP + PILL_GLYPH_W_DIP + PILL_GAP_DIP + text_w_dip.max(0.0)).min(max_dip)
+    (2.0 * PILL_PAD_DIP + pill_lead_w(art) + PILL_GAP_DIP + text_w_dip.max(0.0)).min(max_dip)
 }
 
-/// Whether `x_dip` (from the pill's left edge) falls on the pill's glyph button rather than
-/// on its text.
-pub fn on_pill_glyph(x_dip: f32) -> bool {
-    x_dip < PILL_PAD_DIP + PILL_GLYPH_W_DIP + PILL_GAP_DIP / 2.0
+/// Whether `x_dip` (from the pill's left edge) falls on the pill's glyph button (or the
+/// artwork in its place) rather than on its text.
+pub fn on_pill_glyph(x_dip: f32, art: bool) -> bool {
+    x_dip < PILL_PAD_DIP + pill_lead_w(art) + PILL_GAP_DIP / 2.0
 }
 
 /// Segoe Fluent Icons: "Play", "Pause", "Previous", "Next".
@@ -761,7 +829,7 @@ mod tests {
     fn no_session_or_no_title_hides_the_pill() {
         assert_eq!(music_pill_text(None, 40), "");
         assert_eq!(music_pill_text(Some(&view("", "Someone")), 40), "");
-        assert_eq!(pill_width("", 0.0, MUSIC_PILL_MAX_DIP), 0.0);
+        assert_eq!(pill_width("", 0.0, MUSIC_PILL_MAX_DIP, true), 0.0);
     }
 
     #[test]
@@ -806,25 +874,60 @@ mod tests {
 
     #[test]
     fn pill_width_adds_the_glyph_and_padding_and_caps() {
-        let w = pill_width("Song", 40.0, MUSIC_PILL_MAX_DIP);
+        let w = pill_width("Song", 40.0, MUSIC_PILL_MAX_DIP, false);
         assert_eq!(
             w,
             2.0 * PILL_PAD_DIP + PILL_GLYPH_W_DIP + PILL_GAP_DIP + 40.0
         );
         assert_eq!(
-            pill_width("Long", 900.0, MUSIC_PILL_MAX_DIP),
+            pill_width("Song", 40.0, MUSIC_PILL_MAX_DIP, true),
+            2.0 * PILL_PAD_DIP + PILL_ART_DIP + PILL_GAP_DIP + 40.0
+        );
+        assert_eq!(
+            pill_width("Long", 900.0, MUSIC_PILL_MAX_DIP, false),
             MUSIC_PILL_MAX_DIP
         );
     }
 
     #[test]
     fn the_glyph_half_of_the_pill() {
-        assert!(on_pill_glyph(0.0));
-        assert!(on_pill_glyph(PILL_PAD_DIP + PILL_GLYPH_W_DIP));
+        assert!(on_pill_glyph(0.0, false));
+        assert!(on_pill_glyph(PILL_PAD_DIP + PILL_GLYPH_W_DIP, false));
         assert!(!on_pill_glyph(
-            PILL_PAD_DIP + PILL_GLYPH_W_DIP + PILL_GAP_DIP
+            PILL_PAD_DIP + PILL_GLYPH_W_DIP + PILL_GAP_DIP,
+            false
         ));
-        assert!(!on_pill_glyph(120.0));
+        assert!(on_pill_glyph(PILL_PAD_DIP + PILL_ART_DIP, true));
+        assert!(!on_pill_glyph(120.0, true));
+    }
+
+    #[test]
+    fn battery_glyph_levels_and_states() {
+        assert_eq!(battery_glyph(0, false, false), '\u{E850}');
+        assert_eq!(battery_glyph(100, false, false), '\u{E83F}');
+        assert_eq!(battery_glyph(44, false, false), '\u{E854}');
+        assert_eq!(battery_glyph(46, false, false), '\u{E855}');
+        assert_eq!(battery_glyph(100, true, false), '\u{EA93}');
+        assert_eq!(battery_glyph(17, false, true), '\u{E865}');
+        // Charging wins over the saver (as the stock icon).
+        assert_eq!(
+            battery_glyph(17, true, true),
+            battery_glyph(17, true, false)
+        );
+    }
+
+    #[test]
+    fn players_have_their_colours() {
+        assert_eq!(
+            player_tint("SpotifyAB.SpotifyMusic_zpdnekdrzrea0!Spotify"),
+            Some(Rgba(0x1D, 0xB9, 0x54, 255))
+        );
+        assert_eq!(player_tint("Spotify.exe"), player_tint("spotify"));
+        assert!(player_tint("AppleInc.AppleMusicWin_nzyj5cx40ttqa!App").is_some());
+        assert!(player_tint("Microsoft.ZuneMusic_8wekyb3d8bbwe!Microsoft.ZuneMusic").is_some());
+        // A browser plays anything: no colour of its own.
+        assert_eq!(player_tint("MSEdge"), None);
+        assert_eq!(player_tint("chrome.exe"), None);
     }
 
     #[test]

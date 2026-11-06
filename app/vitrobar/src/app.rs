@@ -47,13 +47,15 @@ use vitro_core::settings_ui::ControlId;
 use vitro_core::start_layout::{panel_layout, place_panel};
 use vitro_core::style::{hover_style, material_style, HoverStyle, MaterialStyle, Rgba, Theme};
 use vitro_core::tray_model::{split_promoted, TrayIcon};
-use vitro_core::widgets::{on_pill_glyph, MusicAction};
+use vitro_core::widgets::{
+    battery_glyph, on_pill_glyph, MusicAction, PILL_FONT_DIP, PILL_GLYPH_W_DIP,
+};
 use vitro_core::windows_model::{
     build_groups, click_action, AppGroup, ClickAction, GroupKey, Hwnd,
 };
 use vitro_render::bar_visual::{
     hover_timing, BarFocus, BarVisual, ChevronState, ItemState, TrayItemState, VisualEnv,
-    TRAY_ICON_DIP,
+    WidgetPill, BATTERY_GAP_DIP, BATTERY_PAD_DIP, TRAY_ICON_DIP,
 };
 use vitro_render::compositor::{init_compositor, Comp};
 use vitro_render::device::{create_gpu_device, GpuDevice};
@@ -262,6 +264,7 @@ fn empty_layout() -> BarLayout {
         tray_area: false,
         widgets: [0.0; 2],
         ime: 0.0,
+        battery: 0.0,
     })
 }
 
@@ -660,6 +663,11 @@ struct App {
     /// DIP width.
     ime_text: Option<String>,
     ime_w: f32,
+    /// The battery indicator (opt-in) and its DIP width (0 = hidden).
+    battery_pill: Option<WidgetPill>,
+    battery_w: f32,
+    /// Battery notifications while the indicator is on.
+    battery_reg: Option<vitro_win::power_status::PowerRegistration>,
     /// The open settings window (its visuals and window go before the compositor and GPU).
     settings_win: Option<SettingsWindow>,
     /// One per monitor, in [`current_monitors`] order: the first carries the tray area.
@@ -793,6 +801,9 @@ impl App {
             claude_failed: false,
             ime_text: None,
             ime_w: 0.0,
+            battery_pill: None,
+            battery_w: 0.0,
+            battery_reg: None,
             settings_win: None,
             monitors,
             tracker,
@@ -844,6 +855,7 @@ impl App {
         };
         app.tick_clock();
         app.read_ime();
+        app.read_battery();
         app.sync_music();
         app.sync_claude();
         // Show the bars before the (slower) first window enumeration.
@@ -947,6 +959,7 @@ impl App {
                 self.claude.as_ref().map_or(0.0, |c| c.width),
             ],
             ime: self.ime_w,
+            battery: self.battery_w,
         })
     }
 
@@ -1170,6 +1183,47 @@ impl App {
         }
     }
 
+    /// Reads the battery for the indicator (hidden unless turned on, and on a device without
+    /// a battery); true if what it shows or its width changed. Battery notifications are
+    /// subscribed while it is on.
+    fn read_battery(&mut self) -> bool {
+        let on = self.settings.battery_on_bar;
+        match (on, self.battery_reg.is_some()) {
+            (true, false) => {
+                self.battery_reg = vitro_win::power_status::register(self.notify.hwnd)
+                    .inspect_err(|e| eprintln!("vitrobar: no battery notifications: {e}"))
+                    .ok();
+            }
+            (false, true) => self.battery_reg = None,
+            _ => {}
+        }
+        let p = vitro_win::power_status::snapshot();
+        let pill = on
+            .then_some(p)
+            .filter(|p| p.has_battery)
+            .and_then(|p| p.percent)
+            .map(|pc| WidgetPill {
+                glyph: battery_glyph(pc, p.charging, p.saver),
+                text: format!("{pc}%"),
+                ..WidgetPill::default()
+            });
+        let w = match &pill {
+            Some(b) => {
+                let tw = self
+                    .painter
+                    .measure(&b.text, FontKind::Text, PILL_FONT_DIP)
+                    .map(|(w, _)| w.ceil())
+                    .unwrap_or(28.0);
+                (2.0 * BATTERY_PAD_DIP + PILL_GLYPH_W_DIP + BATTERY_GAP_DIP + tw).round()
+            }
+            None => 0.0,
+        };
+        let changed = pill != self.battery_pill || w != self.battery_w;
+        self.battery_pill = pill;
+        self.battery_w = w;
+        changed
+    }
+
     /// Reads the foreground window's input language for the indicator (hidden with a single
     /// keyboard layout); true if the text or width changed.
     fn read_ime(&mut self) -> bool {
@@ -1340,6 +1394,8 @@ impl App {
         ];
         let ime_hover = self.hover == Some(Hit::Ime) && self.monitors[k].id() == self.cur;
         let ime_text = self.ime_text.clone();
+        let battery_hover = self.hover == Some(Hit::Battery) && self.monitors[k].id() == self.cur;
+        let battery = self.battery_pill.clone();
         let pill_hover = match self.hover {
             Some(Hit::Widget(w)) if self.monitors[k].id() == self.cur => Some(w),
             _ => None,
@@ -1367,6 +1423,7 @@ impl App {
             bar.visual.set_focus(focus);
             bar.visual.set_widgets(pills.clone(), pill_hover);
             bar.visual.set_ime(ime_text.clone(), ime_hover);
+            bar.visual.set_battery(battery.clone(), battery_hover);
             if let Err(e) = bar.visual.update(
                 &layout,
                 &items,
@@ -2931,7 +2988,7 @@ impl App {
         if !matches!(hit, Hit::App(_)) {
             self.close_strip();
         }
-        if hit != Hit::Quick {
+        if !matches!(hit, Hit::Quick | Hit::Battery) {
             self.close_quick();
         }
         if hit != Hit::Clock {
@@ -2962,7 +3019,7 @@ impl App {
                 }
             }
             // Vitrobar's own panel; a second click closes it.
-            Hit::Quick => self.toggle_quick(dirty),
+            Hit::Quick | Hit::Battery => self.toggle_quick(dirty),
             Hit::Clock => self.toggle_calendar(dirty),
             Hit::App(i) => {
                 let Some(g) = self.cur_groups().get(i) else {
@@ -4062,11 +4119,32 @@ impl App {
     // -----------------------------------------------------------------------------------
 
     /// Opens the media service when the widget is on and drops it when it is off (P4).
+    /// The widget look settings changed: the pills follow (and the artwork is asked for).
+    fn widget_looks(&mut self) {
+        let lang = ui_lang(&self.settings);
+        if let Some(m) = self.music.as_mut() {
+            m.set_looks(
+                self.settings.music_art,
+                self.settings.widget_colors,
+                &self.painter,
+            );
+        }
+        self.pill_request_art();
+        if let Some(c) = self.claude.as_mut() {
+            c.tint_on = self.settings.widget_colors;
+            c.remeasure(&self.painter, lang);
+        }
+    }
+
     fn sync_music(&mut self) {
         match (self.settings.widget_music, self.music.is_some()) {
             (true, false) => match Music::open(self.notify.hwnd) {
                 Ok(mut m) => {
-                    m.remeasure(&self.painter);
+                    m.set_looks(
+                        self.settings.music_art,
+                        self.settings.widget_colors,
+                        &self.painter,
+                    );
                     self.music = Some(m);
                 }
                 Err(e) => eprintln!("vitrobar: the music widget could not start: {e}"),
@@ -4102,10 +4180,31 @@ impl App {
                     self.music_request_art();
                 }
             }
+            self.pill_request_art();
         }
         if wake.thumbnail {
             let art = self.music.as_ref().and_then(|m| m.take_thumbnail());
+            let shared = art.clone().map(std::sync::Arc::new);
+            if let Some(m) = self.music.as_mut().filter(|m| m.art_on()) {
+                if m.set_art(shared, &self.painter) {
+                    dirty.visuals = true;
+                }
+            }
             self.music_event(|p, g| p.set_art(g, art));
+        }
+    }
+
+    /// Asks for the new track's artwork for the pill (once per track, with the setting on).
+    fn pill_request_art(&mut self) {
+        let px = self
+            .tray_monitor()
+            .map_or(40, |mb| crate::widgets::pill_art_px(mb.scale()));
+        // The open panel's size wins: one image serves both.
+        let px = self.music_panel.as_ref().map_or(px, |p| p.art_px().max(px));
+        if let Some(m) = self.music.as_mut() {
+            if m.wants_art() {
+                m.request_thumbnail(px);
+            }
         }
     }
 
@@ -4117,7 +4216,8 @@ impl App {
         let Some(r) = mb.layout.widgets[0] else {
             return false;
         };
-        on_pill_glyph(self.msg_pt.0 as f32 / mb.scale() - r.x)
+        let art = self.music.as_ref().is_some_and(Music::art_on);
+        on_pill_glyph(self.msg_pt.0 as f32 / mb.scale() - r.x, art)
     }
 
     fn toggle_music_panel(&mut self, dirty: &mut Dirty) {
@@ -4148,6 +4248,8 @@ impl App {
         let (id, dpi) = (mb.id(), mb.info.dpi);
         dirty.bars.insert(id);
         let (accent, lang) = self.start_look();
+        // With "Colour widgets by app" the panel takes the player's colour.
+        let accent = self.music.as_ref().and_then(Music::tint).unwrap_or(accent);
         let fg = foreground().unwrap_or(0) as usize;
         let opened = MusicPanel::open(
             &Gfx {
@@ -4367,6 +4469,7 @@ impl App {
         match (self.settings.widget_claude, self.claude.is_some()) {
             (true, false) => match Claude::open(self.notify.hwnd) {
                 Ok(mut c) => {
+                    c.tint_on = self.settings.widget_colors;
                     c.remeasure(&self.painter, ui_lang(&self.settings));
                     self.claude = Some(c);
                     self.arm_claude_stale();
@@ -4462,6 +4565,11 @@ impl App {
         let (id, dpi) = (mb.id(), mb.info.dpi);
         dirty.bars.insert(id);
         let (accent, lang) = self.start_look();
+        let accent = if self.settings.widget_colors {
+            vitro_core::widgets::CLAUDE_TINT
+        } else {
+            accent
+        };
         let fg = foreground().unwrap_or(0) as usize;
         let opened = ClaudePanel::open(
             &Gfx {
@@ -5192,6 +5300,12 @@ impl App {
                 if id == ControlId::WidgetMusic {
                     self.sync_music();
                 }
+                if matches!(id, ControlId::MusicArt | ControlId::WidgetColors) {
+                    self.widget_looks();
+                }
+                if id == ControlId::BatteryOnBar {
+                    self.read_battery();
+                }
                 if id == ControlId::WidgetClaude {
                     self.claude_toggled();
                 }
@@ -5415,6 +5529,9 @@ impl App {
         }
         if inbox.power {
             self.quick_event(|q, g| q.on_power(g));
+            if self.read_battery() {
+                dirty.visuals = true;
+            }
         }
         dirty.theme |= inbox.theme;
         dirty.clock |= inbox.clock;

@@ -32,6 +32,7 @@ fn layout(shape: Shape, apps: usize) -> BarLayout {
         tray_area: true,
         widgets: [0.0; 2],
         ime: 0.0,
+        battery: 0.0,
     })
 }
 
@@ -328,6 +329,7 @@ fn tray_icons_and_chevron_draw_once() {
         tray_area: true,
         widgets: [0.0; 2],
         ime: 0.0,
+        battery: 0.0,
     };
     let l = compute_layout(&input);
     let img = Arc::new(icon(16));
@@ -397,6 +399,7 @@ fn bar_without_tray_area_draws_start_and_clock_only() {
         tray_area: false,
         widgets: [0.0; 2],
         ime: 0.0,
+        battery: 0.0,
     });
     // Even if the app handed tray items over, a bar without the tray area shows none.
     bar.set_tray(vec![TrayItemState::default(); 3], ChevronState::default());
@@ -460,6 +463,7 @@ fn focus_ring_follows_the_focused_item_without_redrawing() {
         tray_area: true,
         widgets: [0.0; 2],
         ime: 0.0,
+        battery: 0.0,
     };
     let l = compute_layout(&input);
     let items = icons(3);
@@ -536,6 +540,7 @@ fn widget_pills_draw_only_what_the_app_supplies() {
     let mut l = compute_layout(&LayoutInput {
         widgets: [120.0, 90.0],
         ime: 0.0,
+        battery: 0.0,
         ..input_for(Shape::Pill)
     });
     // Slots without content draw nothing: the bar looks as before.
@@ -546,6 +551,7 @@ fn widget_pills_draw_only_what_the_app_supplies() {
         Some(WidgetPill {
             glyph: '\u{E8D6}',
             text: t.to_string(),
+            ..WidgetPill::default()
         })
     };
     bar.set_widgets([pill("Song - Artist"), None], None);
@@ -580,6 +586,7 @@ fn input_for(shape: Shape) -> LayoutInput {
         tray_area: true,
         widgets: [0.0; 2],
         ime: 0.0,
+        battery: 0.0,
     }
 }
 
@@ -596,6 +603,7 @@ fn the_ime_indicator_draws_its_text_when_given_a_rect() {
     let hover = hover_style(HoverEffect::Plate);
     let mut l = compute_layout(&LayoutInput {
         ime: 32.0,
+        battery: 0.0,
         ..input_for(Shape::Pill)
     });
     bar.update(&l, &[], "12:34", &style, &hover).unwrap();

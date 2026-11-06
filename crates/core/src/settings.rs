@@ -162,6 +162,13 @@ pub struct Settings {
     pub claude_prev_statusline: Option<String>,
     /// The quick panel's tiles, in order (see [`QuickTile`]).
     pub quick_tiles: Vec<QuickTile>,
+    /// The battery (glyph and percentage) next to the quick button, on a device with one.
+    pub battery_on_bar: bool,
+    /// The music pill shows the track's artwork.
+    pub music_art: bool,
+    /// The widget pills and panels take the colour of their app (Spotify green, Claude
+    /// orange…).
+    pub widget_colors: bool,
 }
 
 impl Default for Settings {
@@ -192,6 +199,9 @@ impl Default for Settings {
             widget_claude: false,
             claude_prev_statusline: None,
             quick_tiles: QuickTile::DEFAULT.to_vec(),
+            battery_on_bar: false,
+            music_art: false,
+            widget_colors: false,
         }
     }
 }
@@ -294,6 +304,9 @@ fn from_table(t: &toml::Table) -> Settings {
         widget_music: get(t, "widget-music", d.widget_music),
         widget_claude: get(t, "widget-claude", d.widget_claude),
         claude_prev_statusline: get(t, "claude-prev-statusline", d.claude_prev_statusline),
+        battery_on_bar: get(t, "battery-on-bar", d.battery_on_bar),
+        music_art: get(t, "music-art", d.music_art),
+        widget_colors: get(t, "widget-colors", d.widget_colors),
         // Missing: the default set. Present: what the user picked, even nothing at all.
         quick_tiles: match t.get("quick-tiles") {
             None => d.quick_tiles,
@@ -454,6 +467,9 @@ mod tests {
             widget_claude: true,
             claude_prev_statusline: Some(r#"{"type":"command"}"#.into()),
             quick_tiles: vec![QuickTile::Lock, QuickTile::Wifi],
+            battery_on_bar: true,
+            music_art: true,
+            widget_colors: true,
         };
         let d0 = Settings::default();
         assert_ne!(original.hover, d0.hover);
