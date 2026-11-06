@@ -5,7 +5,10 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Vitrobar — a glass taskbar for Windows 11</title>
 <meta name="description" content="Vitrobar replaces the Windows 11 taskbar with a frosted-glass bar: your apps, a Start panel, quick settings, a calendar and optional widgets. Free and open source.">
-<link rel="icon" href="favicon.ico">
+<link rel="icon" href="logo.svg" type="image/svg+xml">
+<link rel="icon" href="favicon.ico" sizes="16x16 32x32 48x48">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<script>document.documentElement.classList.add("js");</script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -71,7 +74,12 @@
     padding: clamp(40px, 9vh, 112px) 0 32px;
   }
   .brand { display: flex; align-items: center; gap: 12px; font-weight: 600; font-size: 1.125rem; }
-  .brand img { width: 32px; height: 32px; }
+  .brand img {
+    width: 40px; height: 40px;
+    filter: drop-shadow(0 6px 14px rgba(232, 150, 75, 0.25));
+    transition: transform 400ms cubic-bezier(.2, .8, .2, 1.4);
+  }
+  .brand:hover img { transform: rotate(-6deg) scale(1.08); }
   h1 {
     margin: clamp(32px, 7vh, 80px) 0 20px;
     font-size: clamp(2.6rem, 7.2vw, 5.6rem);
@@ -203,24 +211,135 @@
   @media (max-width: 480px) {
     .bar[data-shape="islands"] .apps-wrap { display: none; }
   }
-  @media (prefers-reduced-motion: reduce) { .bar { transition: none; } }
+  /* ---- motion ---------------------------------------------------------------------------- */
+  :root { --ease-out: cubic-bezier(.16, 1, .3, 1); --ease-spring: cubic-bezier(.3, 1.4, .5, 1); }
+  .desktop { isolation: isolate; }
+
+  /* The sun of the logo: it rises behind the far shore, then breathes. */
+  .sun {
+    position: absolute;
+    z-index: -1;
+    left: 72%;
+    top: 14%;
+    width: clamp(90px, 12vw, 180px);
+    aspect-ratio: 1;
+    border-radius: 50%;
+    background: radial-gradient(circle at 42% 36%, #fff6dc 0%, #ffd27f 40%, #f08f45 100%);
+    box-shadow: 0 0 80px 30px rgba(255, 180, 87, 0.35), 0 0 200px 90px rgba(240, 143, 69, 0.18);
+    pointer-events: none;
+    animation: sunrise 2200ms var(--ease-out) 150ms both, breathe 9s ease-in-out 2400ms infinite;
+  }
+  @keyframes sunrise {
+    from { transform: translateY(70vh) scale(0.85); opacity: 0; }
+    30% { opacity: 1; }
+    to { transform: none; opacity: 1; }
+  }
+  @keyframes breathe {
+    50% { box-shadow: 0 0 110px 44px rgba(255, 180, 87, 0.42), 0 0 240px 110px rgba(240, 143, 69, 0.22); }
+  }
+  /* A slow drift of the wallpaper's light. */
+  .desktop > .drift {
+    position: absolute;
+    inset: -20%;
+    z-index: -2;
+    pointer-events: none;
+    background:
+      radial-gradient(30% 25% at 30% 30%, rgba(95, 134, 184, 0.35), transparent 70%),
+      radial-gradient(25% 20% at 70% 60%, rgba(232, 150, 75, 0.18), transparent 70%);
+    animation: drift 28s ease-in-out infinite alternate;
+  }
+  @keyframes drift {
+    to { transform: translate(6%, -4%) rotate(4deg); }
+  }
+
+  /* The intro comes in line by line; the bar rises into place like the real one. */
+  .js .intro > *, .js .tweak, .js .caption {
+    animation: rise 900ms var(--ease-out) both;
+    animation-delay: calc(200ms + var(--i, 0) * 110ms);
+  }
+  .js .bar:not(.ready) { animation: barup 1100ms var(--ease-out) 650ms both; }
+  .js .bar:not(.ready) :is(.item, .pillw, .clock) { animation: pop 600ms var(--ease-spring) both; animation-delay: calc(950ms + var(--n, 0) * 45ms); }
+  @keyframes rise { from { opacity: 0; transform: translateY(18px); filter: blur(6px); } }
+  @keyframes barup { from { opacity: 0; transform: translateY(80px) scale(0.96); } }
+  @keyframes pop { from { opacity: 0; transform: translateY(10px) scale(0.6); } }
+
+  /* The headline's last words catch the light. */
+  h1 .glint {
+    background: linear-gradient(100deg, var(--frost) 0%, var(--frost) 40%, #ffd27f 50%, var(--frost) 60%, var(--frost) 100%);
+    background-size: 250% 100%;
+    background-position: 100% 0;
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    animation: glint 3.2s var(--ease-out) 1.4s both;
+  }
+  @keyframes glint { to { background-position: 0 0; } }
+
+  /* Buttons. */
+  .btn { transition: transform 220ms var(--ease-out), background-color 220ms, box-shadow 220ms; position: relative; overflow: hidden; }
+  .btn:hover { transform: translateY(-2px); }
+  .btn:active { transform: translateY(0) scale(0.98); }
+  .btn.primary:hover { box-shadow: 0 10px 28px rgba(232, 176, 75, 0.35); }
+  .btn.primary::after {
+    content: ""; position: absolute; inset: 0;
+    background: linear-gradient(110deg, transparent 30%, rgba(255, 255, 255, 0.55) 50%, transparent 70%);
+    transform: translateX(-120%);
+  }
+  .btn.primary:hover::after { transform: translateX(120%); transition: transform 700ms var(--ease-out); }
+  .tweak button { transition: background-color 200ms, color 200ms, border-color 200ms, transform 200ms var(--ease-spring); }
+  .tweak button:active { transform: scale(0.94); }
+
+  /* The bar itself: the material fades, apps lift on hover, the active line slides. */
+  .bar[data-shape="pill"], .bar[data-shape="full"], .bar[data-shape="islands"] .group {
+    transition: background-color 400ms, border-color 400ms, box-shadow 400ms;
+  }
+  .item { transition: transform 260ms var(--ease-spring), background-color 160ms; cursor: default; }
+  .item:hover { transform: translateY(-3px); }
+  .item:active { transform: translateY(-1px) scale(0.92); }
+  .app { cursor: pointer; }
+  .app::after { transition: width 320ms var(--ease-spring), background-color 320ms; }
+  .app::before { transition: transform 260ms var(--ease-spring); }
+  .app:hover::before { transform: scale(1.08); }
+  .app.bounce::before { animation: launch 700ms var(--ease-out); }
+  @keyframes launch { 25% { transform: translateY(-9px); } 50% { transform: translateY(0); } 70% { transform: translateY(-4px); } }
+  /* The music widget plays: a small equaliser. */
+  .eq { display: inline-flex; align-items: flex-end; gap: 2px; height: 12px; }
+  .eq i { width: 3px; height: 100%; border-radius: 1px; background: currentColor; transform-origin: bottom; animation: eq 1s ease-in-out infinite; }
+  .eq i:nth-child(2) { animation-duration: 0.8s; animation-delay: -0.3s; }
+  .eq i:nth-child(3) { animation-duration: 1.2s; animation-delay: -0.6s; }
+  @keyframes eq { 0%, 100% { transform: scaleY(0.3); } 50% { transform: scaleY(1); } }
+  ::view-transition-group(*) { animation-duration: 420ms; animation-timing-function: var(--ease-out); }
+
+  /* The page below fades up as it scrolls into view. */
+  .js .reveal { opacity: 0; transform: translateY(24px); transition: opacity 800ms var(--ease-out), transform 800ms var(--ease-out); transition-delay: calc(var(--d, 0) * 80ms); }
+  .js .reveal.in { opacity: 1; transform: none; }
+  ol li::marker { transition: color 300ms; }
+
+  @media (max-width: 760px) { .sun { left: auto; right: 6%; top: 4%; width: 72px; } }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after, ::view-transition-group(*) { animation: none !important; transition: none !important; }
+    .js .reveal { opacity: 1; transform: none; }
+    h1 .glint { color: var(--frost); background: none; }
+  }
 </style>
 </head>
 <body>
 
 <div class="desktop">
+  <div class="drift" aria-hidden="true"></div>
+  <div class="sun" aria-hidden="true"></div>
   <header class="intro">
-    <div class="brand"><img src="favicon.ico" alt=""> Vitrobar</div>
-    <h1>A glass taskbar for Windows&nbsp;11.</h1>
-    <p class="lede">Vitrobar replaces the stock taskbar with a frosted bar of its own: your apps, a Start panel, quick settings, a calendar and a few optional widgets. Free, open source, and it gives the Windows taskbar back the moment you quit.</p>
-    <div class="actions">
+    <div class="brand" style="--i:0"><img src="logo.svg" alt="" width="40" height="40"> Vitrobar</div>
+    <h1 style="--i:1">A glass taskbar for <span class="glint">Windows&nbsp;11.</span></h1>
+    <p class="lede" style="--i:2">Vitrobar replaces the stock taskbar with a frosted bar of its own: your apps, a Start panel, quick settings, a calendar and a few optional widgets. Free, open source, and it gives the Windows taskbar back the moment you quit.</p>
+    <div class="actions" style="--i:3">
       <a class="btn primary" href="https://github.com/Giovix92/vitrobar/releases/latest">Download for Windows</a>
       <a class="btn" href="https://github.com/Giovix92/vitrobar">Source on GitHub</a>
     </div>
-    <p class="note">x64 and ARM64. Early preview: the builds are not signed yet, so Windows SmartScreen asks before the first run.</p>
+    <p class="note" style="--i:4">x64 and ARM64. Early preview: the builds are not signed yet, so Windows SmartScreen asks before the first run.</p>
   </header>
 
-  <form class="tweak" aria-label="Try the bar's look" onsubmit="return false">
+  <form class="tweak" style="--i:5" aria-label="Try the bar's look" onsubmit="return false">
     <fieldset data-set="shape">
       <legend>Shape</legend>
       <button type="button" value="pill" aria-pressed="true">Pill</button>
@@ -254,7 +373,7 @@
       <span class="spacer" aria-hidden="true"></span>
       <div class="group tray-wrap">
         <span class="pillw" aria-hidden="true">
-          <svg viewBox="0 0 18 18" width="14" height="14" fill="currentColor"><rect x="4" y="3" width="3" height="12" rx="1"/><rect x="11" y="3" width="3" height="12" rx="1"/></svg>
+          <span class="eq"><i></i><i></i><i></i></span>
           Night Drive — Lake Room
         </span>
         <span class="item tray-icon" aria-hidden="true">
@@ -266,7 +385,7 @@
         <span class="clock" aria-hidden="true"><span id="time">12:34</span><br><span id="date">04/11/2026</span></span>
       </div>
     </div>
-    <p class="caption">An illustration of the bar. Try the shapes and materials above.</p>
+    <p class="caption" style="--i:7">An illustration of the bar. Try the shapes and materials above.</p>
   </div>
 </div>
 
@@ -317,14 +436,39 @@
 </footer>
 
 <script>
-  // The look controls: one choice per group, applied to the bar.
   const bar = document.getElementById("bar");
+  const calm = matchMedia("(prefers-reduced-motion: reduce)");
+
+  // The bar's parts pop in one after another; once in, they belong to hover and clicks.
+  const parts = bar.querySelectorAll(".item, .pillw, .clock");
+  parts.forEach((el, i) => {
+    el.style.setProperty("--n", i);
+    // Each part glides to its new place when the shape changes.
+    el.style.viewTransitionName = `bar-part-${i}`;
+  });
+  bar.style.viewTransitionName = "bar";
+  const last = parts[parts.length - 1];
+  const ready = () => bar.classList.add("ready");
+  last.addEventListener("animationend", ready, { once: true });
+  setTimeout(ready, 3000);
+
+  // The look controls: one choice per group, applied to the bar (morphing where the
+  // browser can).
+  function choose(set, b, animate) {
+    const apply = () => {
+      set.querySelectorAll("button").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
+      bar.dataset[set.dataset.set] = b.value;
+    };
+    if (animate && document.startViewTransition && !calm.matches && bar.dataset[set.dataset.set] !== b.value) {
+      document.startViewTransition(apply);
+    } else {
+      apply();
+    }
+  }
   document.querySelectorAll(".tweak fieldset").forEach((set) => {
     set.addEventListener("click", (e) => {
       const b = e.target.closest("button");
-      if (!b) return;
-      set.querySelectorAll("button").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
-      bar.dataset[set.dataset.set] = b.value;
+      if (b) choose(set, b, true);
     });
   });
   // ?shape=islands&material=smoked opens the page with that look.
@@ -332,8 +476,41 @@
   document.querySelectorAll(".tweak fieldset").forEach((set) => {
     const want = params.get(set.dataset.set);
     const b = want && set.querySelector(`button[value="${CSS.escape(want)}"]`);
-    if (b) b.click();
+    if (b) choose(set, b, false);
   });
+
+  // Clicking an app "opens" it: it bounces and takes the active line.
+  bar.querySelectorAll(".app").forEach((app) => {
+    app.addEventListener("click", () => {
+      bar.querySelectorAll(".app.active").forEach((a) => a.classList.remove("active"));
+      app.classList.add("open", "active");
+      app.classList.remove("bounce");
+      void app.offsetWidth;
+      app.classList.add("bounce");
+    });
+    app.addEventListener("animationend", () => app.classList.remove("bounce"));
+  });
+
+  // The page below fades up as it scrolls into view.
+  const reveal = document.querySelectorAll("main section, main dl > div, main ol li, footer");
+  reveal.forEach((el) => {
+    el.classList.add("reveal");
+    const sib = el.parentElement ? [...el.parentElement.children].indexOf(el) : 0;
+    if (el.matches("dl > div, ol li")) el.style.setProperty("--d", sib + 1);
+  });
+  if ("IntersectionObserver" in window) {
+    const io = new IntersectionObserver((entries) => {
+      entries.forEach((e) => {
+        if (e.isIntersecting) {
+          e.target.classList.add("in");
+          io.unobserve(e.target);
+        }
+      });
+    }, { threshold: 0 });
+    reveal.forEach((el) => io.observe(el));
+  } else {
+    reveal.forEach((el) => el.classList.add("in"));
+  }
   // The clock shows the visitor's own time and date, in their format.
   function tick() {
     const now = new Date();
