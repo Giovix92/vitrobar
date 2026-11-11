@@ -59,7 +59,8 @@ impl From<std::io::Error> for SetupError {
 pub enum Wrap {
     /// The bridge is in place; this was the user's command before (to store and restore).
     Wrapped(Option<String>),
-    /// The bridge was already there: nothing changed (keep the stored previous command).
+    /// The bridge was already there (keep the stored previous command). A bridge that ran
+    /// another path is pointed at this one.
     AlreadyOurs,
 }
 
@@ -204,7 +205,9 @@ pub fn is_bridge(cmd: &str) -> bool {
 }
 
 /// Points Claude Code's `statusLine` at the bridge in the settings file `path` (missing file:
-/// created), keeping every other key and the other keys of `statusLine`; 2-space JSON.
+/// created), keeping every other key and the other keys of `statusLine`; 2-space JSON. A
+/// bridge already there but running another exe (moved, renamed, another copy) is switched
+/// to `bridge`: a missing exe would leave the widget's data frozen without a word.
 pub fn wrap_statusline_at(path: &Path, bridge: &str) -> Result<Wrap, SetupError> {
     let mut root = read_settings(path)?;
     let line = root.get("statusLine").and_then(Value::as_object);
@@ -213,6 +216,7 @@ pub fn wrap_statusline_at(path: &Path, bridge: &str) -> Result<Wrap, SetupError>
         .and_then(Value::as_str)
         .map(str::to_string);
     if prev.as_deref().is_some_and(is_bridge) {
+        repoint(path, &mut root, bridge)?;
         return Ok(Wrap::AlreadyOurs);
     }
     let mut line = line.cloned().unwrap_or_default();
@@ -221,6 +225,35 @@ pub fn wrap_statusline_at(path: &Path, bridge: &str) -> Result<Wrap, SetupError>
     root.insert("statusLine".into(), Value::Object(line));
     write_settings(path, &root)?;
     Ok(Wrap::Wrapped(prev))
+}
+
+/// At start-up with the widget on: a bridge in the settings file `path` that runs another exe
+/// is switched to `bridge`. Any other command (the user's own, or none) is left alone, as is
+/// the file when nothing changes. True if the file was rewritten.
+pub fn repoint_statusline_at(path: &Path, bridge: &str) -> Result<bool, SetupError> {
+    let mut root = read_settings(path)?;
+    let cmd = root
+        .get("statusLine")
+        .and_then(|l| l.get("command"))
+        .and_then(Value::as_str);
+    if !cmd.is_some_and(is_bridge) {
+        return Ok(false);
+    }
+    repoint(path, &mut root, bridge)
+}
+
+/// Writes `bridge` as the status-line command of `root` (whose command is a bridge) unless
+/// it already is.
+fn repoint(path: &Path, root: &mut Map<String, Value>, bridge: &str) -> Result<bool, SetupError> {
+    let Some(Value::Object(line)) = root.get_mut("statusLine") else {
+        return Ok(false);
+    };
+    if line.get("command").and_then(Value::as_str) == Some(bridge) {
+        return Ok(false);
+    }
+    line.insert("command".into(), Value::String(bridge.to_string()));
+    write_settings(path, root)?;
+    Ok(true)
 }
 
 /// Puts `prev` back as the `statusLine` command (or removes `statusLine` when there was none)
@@ -271,6 +304,11 @@ fn write_settings(path: &Path, root: &Map<String, Value>) -> Result<(), SetupErr
 pub fn wrap_statusline(exe: &Path) -> Result<Wrap, SetupError> {
     let path = claude_settings_path().ok_or(SetupError::Malformed)?;
     wrap_statusline_at(&path, &bridge_command(exe, &status_shell()))
+}
+
+pub fn repoint_statusline(exe: &Path) -> Result<bool, SetupError> {
+    let path = claude_settings_path().ok_or(SetupError::Malformed)?;
+    repoint_statusline_at(&path, &bridge_command(exe, &status_shell()))
 }
 
 pub fn unwrap_statusline(prev: Option<&str>) -> Result<(), SetupError> {
@@ -602,6 +640,47 @@ mod tests {
         let once = std::fs::read_to_string(&p).unwrap();
         assert_eq!(wrap_statusline_at(&p, &ours()).unwrap(), Wrap::AlreadyOurs);
         assert_eq!(std::fs::read_to_string(&p).unwrap(), once);
+    }
+
+    #[test]
+    fn a_bridge_at_an_old_path_moves_to_the_new_one() {
+        // The exe moved (folder renamed, another copy started): a status line that still
+        // runs the old path runs nothing, and the widget's data would stop updating.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("settings.json");
+        std::fs::write(
+            &p,
+            r#"{"a":1,"statusLine":{"type":"command","command":"\"C:/old/vitrobar.exe\" --claude-statusline","padding":0}}"#,
+        )
+        .unwrap();
+        assert_eq!(wrap_statusline_at(&p, &ours()).unwrap(), Wrap::AlreadyOurs);
+        assert_eq!(
+            json(&p),
+            serde_json::json!({"a": 1, "statusLine": {"type": "command", "command": ours(), "padding": 0}})
+        );
+    }
+
+    #[test]
+    fn repoint_moves_an_old_bridge_and_leaves_the_rest_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("settings.json");
+        let old = r#"{"statusLine":{"type":"command","command":"\"C:/old/vitrobar.exe\" --claude-statusline"}}"#;
+        std::fs::write(&p, old).unwrap();
+        assert!(repoint_statusline_at(&p, &ours()).unwrap());
+        assert_eq!(json(&p)["statusLine"]["command"], ours());
+        // Already right: the file is not written again.
+        let once = std::fs::read_to_string(&p).unwrap();
+        assert!(!repoint_statusline_at(&p, &ours()).unwrap());
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), once);
+        // The user's own command, or none: untouched.
+        for theirs in [
+            r#"{"statusLine":{"type":"command","command":"their-own"}}"#,
+            r#"{"a":1}"#,
+        ] {
+            std::fs::write(&p, theirs).unwrap();
+            assert!(!repoint_statusline_at(&p, &ours()).unwrap());
+            assert_eq!(std::fs::read_to_string(&p).unwrap(), theirs);
+        }
     }
 
     #[test]

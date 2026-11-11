@@ -875,6 +875,7 @@ impl App {
         app.read_ime();
         app.read_battery();
         app.sync_music();
+        app.repoint_claude();
         app.sync_claude();
         // Show the bars before the (slower) first window enumeration.
         app.refresh()?;
@@ -4527,6 +4528,21 @@ impl App {
         }
         self.save_settings();
         self.sync_claude();
+    }
+
+    /// At start-up with the widget on: Claude Code's status line runs this exe, wherever it
+    /// now is. A bridge left pointing at an old path (the folder moved, another copy) runs
+    /// nothing, and the widget would show older and older data.
+    fn repoint_claude(&self) {
+        if !self.settings.widget_claude {
+            return;
+        }
+        let moved = std::env::current_exe()
+            .map_err(|e| e.to_string())
+            .and_then(|exe| claude_usage::repoint_statusline(&exe).map_err(|e| e.to_string()));
+        if let Err(e) = moved {
+            eprintln!("vitrobar: could not point Claude Code's status line at this exe: {e}");
+        }
     }
 
     /// Opens the folder watch when the widget is on and drops it when it is off (P4).
