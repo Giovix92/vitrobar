@@ -23,6 +23,10 @@
   <a href="CONTRIBUTING.md">Contribute</a>
 </p>
 
+<p align="center">
+  <img src="docs/screenshots/hero.png" alt="Vitrobar's frosted glass taskbar over a colourful wallpaper" width="900">
+</p>
+
 ---
 
 ## ✨ Why Vitrobar
@@ -32,6 +36,10 @@ A free, open-source replacement for the stock Windows 11 taskbar. Frosted glass,
 > **Status:** pre-alpha. Expect rough edges, and please report them.
 
 ## 🚀 Highlights
+
+<p align="center">
+  <img src="docs/screenshots/taskbar.png" alt="Vitrobar: Start, pinned apps, Claude limits widget, tray, battery, quick settings and clock" width="900">
+</p>
 
 | | |
 |---|---|
