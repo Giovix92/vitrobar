@@ -260,6 +260,20 @@ pub struct ClaudeUsage {
     pub at: i64,
 }
 
+impl ClaudeUsage {
+    /// Claude Code leaves a window out of its status JSON while it has none (the 5 h window
+    /// is gone from the moment it ends until the next message opens a new one). A window this
+    /// data lacks is taken from `prev`, the data saved before: once its reset time has passed
+    /// it reads 0 %, which is what it is, instead of vanishing from the pill.
+    pub fn keeping_missing_from(self, prev: Option<&ClaudeUsage>) -> ClaudeUsage {
+        ClaudeUsage {
+            five_hour: self.five_hour.or(prev.and_then(|p| p.five_hour)),
+            seven_day: self.seven_day.or(prev.and_then(|p| p.seven_day)),
+            at: self.at,
+        }
+    }
+}
+
 /// Saved data older than this shows its age on the pill ("· 3 h ago"): the limits are shared
 /// with claude.ai and the Claude apps, and only a running Claude Code brings new numbers.
 pub const STALE_AFTER_S: i64 = 3600;
@@ -596,6 +610,27 @@ mod claude_tests {
         let u = parse_statusline(json, NOW).unwrap();
         assert_eq!(u.five_hour, None);
         assert_eq!(u.seven_day, Some(win(7.0, None)));
+    }
+
+    #[test]
+    fn a_window_the_new_data_lacks_comes_from_the_old() {
+        let old = ClaudeUsage {
+            five_hour: Some(win(26.0, Some(NOW - 7200))),
+            seven_day: Some(win(5.0, Some(NOW + 86_400))),
+            at: NOW - 7200,
+        };
+        let new = ClaudeUsage {
+            five_hour: None,
+            seven_day: Some(win(6.0, Some(NOW + 86_400))),
+            at: NOW,
+        };
+        let kept = new.keeping_missing_from(Some(&old));
+        assert_eq!(kept.five_hour, old.five_hour);
+        assert_eq!(kept.seven_day, new.seven_day, "what is there wins");
+        assert_eq!(kept.at, NOW);
+        // The old 5 h window is over: it reads 0 %, it does not vanish.
+        assert_eq!(claude_pill_text(Some(&kept), NOW, Lang::En), "5h 0% · 7d 6%");
+        assert_eq!(new.keeping_missing_from(None), new);
     }
 
     #[test]

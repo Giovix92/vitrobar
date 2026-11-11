@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use vitro_core::widgets::parse_statusline;
-use vitro_win::claude_usage::{data_dir, data_path, save_at, status_shell, StatusShell};
+use vitro_win::claude_usage::{data_dir, data_path, read_at, save_at, status_shell, StatusShell};
 use windows::Win32::Foundation::{
     CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAGS, HANDLE_FLAG_INHERIT,
 };
@@ -42,6 +42,8 @@ pub fn run() -> ExitCode {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64);
     if let (Some(u), Some(path)) = (parse_statusline(&json, now), data_path()) {
+        // A window Claude Code leaves out (no 5 h window between two) keeps its last data.
+        let u = u.keeping_missing_from(read_at(&path).as_ref());
         if let Err(e) = save_at(&path, &u) {
             eprintln!("vitrobar: could not save the Claude limits: {e}");
         }
