@@ -29,7 +29,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TR
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW, GetWindowRect, IsWindow,
     LoadCursorW, PostQuitMessage, RegisterClassExW, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    GWLP_USERDATA, HWND_TOPMOST, IDC_ARROW, MA_NOACTIVATE, SWP_NOACTIVATE, SW_HIDE,
+    GWLP_USERDATA, HWND_TOPMOST, IDC_ARROW, MA_NOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE,
     SW_SHOWNOACTIVATE, WM_DESTROY, WM_DPICHANGED, WM_MOUSEACTIVATE, WM_NCHITTEST, WNDCLASSEXW,
     WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
@@ -199,7 +199,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_VITRO_APPBAR => {
-            // Each monitor's main bar window is an appbar; its notifications go to the inbox.
+            // Older bars were appbars themselves (now `AppbarHost`); kept for any late notice.
             crate::notify::record_appbar(wparam.0 as u32);
             LRESULT(0)
         }
@@ -287,6 +287,13 @@ pub fn create_bar_window(comp: &Comp, rect_px: PxRect, margin: (i32, i32)) -> Re
 }
 
 impl BarWindow {
+    /// Fades the bar out in place, above the bar window replacing it (energy saver
+    /// changed: see `App::glass_gen`). The owner drops it once the fade has run.
+    pub fn fade_out(&self, ms: u32) -> Result<()> {
+        vitro_render::panel::raise_topmost(self.hwnd);
+        vitro_render::panel::fade_out(&self.root, ms)
+    }
+
     /// Replaces everything drawn in the window with `visual`.
     pub fn set_content(&self, visual: &impl Interface) -> Result<()> {
         let children = self.content.Children()?;
@@ -496,6 +503,106 @@ impl Drop for BarWindow {
                 let _ = DestroyWindow(self.hwnd);
                 DROPPING.set(false);
             }
+        }
+    }
+}
+
+/// Window class of the appbar hosts.
+const APPBAR_HOST_CLASS: &str = "VitrobarAppbarHost";
+
+/// A hidden window that holds one monitor's appbar (the reserved strip of the screen) in
+/// place of the bar window. Bar windows can then be replaced (energy saver changed: DWM
+/// gives a window its glass only when it is made) without giving the strip back, which
+/// would make maximized windows jump. Never shown; it sits on the strip so the shell
+/// places it on the right monitor.
+pub struct AppbarHost {
+    pub hwnd: HWND,
+}
+
+unsafe extern "system" fn host_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == WM_VITRO_APPBAR {
+        crate::notify::record_appbar(wparam.0 as u32);
+        return LRESULT(0);
+    }
+    // SAFETY: default handling with the arguments we were given.
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+fn register_host_class() -> Result<()> {
+    static DONE: Mutex<bool> = Mutex::new(false);
+    let mut done = DONE.lock().unwrap_or_else(|e| e.into_inner());
+    if *done {
+        return Ok(());
+    }
+    let class = HSTRING::from(APPBAR_HOST_CLASS);
+    // SAFETY: plain class registration with a static window procedure.
+    unsafe {
+        let wc = WNDCLASSEXW {
+            cbSize: size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(host_wndproc),
+            hInstance: GetModuleHandleW(None)?.into(),
+            lpszClassName: PCWSTR(class.as_ptr()),
+            ..Default::default()
+        };
+        if RegisterClassExW(&wc) == 0 {
+            return Err(Error::from_thread());
+        }
+    }
+    *done = true;
+    Ok(())
+}
+
+impl AppbarHost {
+    pub fn new() -> Result<Self> {
+        register_host_class()?;
+        let class = HSTRING::from(APPBAR_HOST_CLASS);
+        // SAFETY: a hidden top-level window of our own class.
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                PCWSTR(class.as_ptr()),
+                w!("Vitrobar appbar"),
+                WS_POPUP,
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                Some(GetModuleHandleW(None)?.into()),
+                None,
+            )?
+        };
+        Ok(Self { hwnd })
+    }
+
+    /// Moves the (hidden) window onto the strip it reserves.
+    pub fn place(&self, r: PxRect) {
+        // SAFETY: plain call on our own window; it stays hidden.
+        unsafe {
+            let _ = SetWindowPos(
+                self.hwnd,
+                None,
+                r.0,
+                r.1,
+                r.2 - r.0,
+                r.3 - r.1,
+                SWP_NOACTIVATE | SWP_NOZORDER,
+            );
+        }
+    }
+}
+
+impl Drop for AppbarHost {
+    fn drop(&mut self) {
+        // SAFETY: destroying our own window.
+        unsafe {
+            let _ = DestroyWindow(self.hwnd);
         }
     }
 }

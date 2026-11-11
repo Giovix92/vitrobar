@@ -22,9 +22,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowRect, IsIconic, IsWindow, LoadCursorW, LoadIconW, RegisterClassExW,
     SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
     GWLP_USERDATA, HTCAPTION, HTCLIENT, HWND_TOPMOST, IDC_ARROW, MA_ACTIVATE, SWP_NOACTIVATE,
-    SWP_NOZORDER, SW_RESTORE, SW_SHOW, WA_INACTIVE, WM_ACTIVATE, WM_CLOSE, WM_DPICHANGED,
-    WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEACTIVATE, WM_NCHITTEST, WM_RBUTTONDOWN, WNDCLASSEXW,
-    WS_EX_APPWINDOW, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_RESTORE, SW_SHOW, WA_INACTIVE, WM_ACTIVATE, WM_CLOSE,
+    WM_DPICHANGED, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEACTIVATE, WM_NCHITTEST, WM_RBUTTONDOWN,
+    WNDCLASSEXW, WS_EX_APPWINDOW, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP,
 };
 use windows::UI::Composition::Desktop::DesktopWindowTarget;
 use windows::UI::Composition::{
@@ -477,6 +478,37 @@ pub fn animate_open(root: &ContainerVisual, scale: f32, ms: u32, motion: Motion)
         },
         || show_static(root),
     )
+}
+
+/// Fades `root` out over `ms`, in place (no motion): a window handing over to a new one at
+/// the same spot (energy saver changed, see the app). Runs on the compositor; the owner
+/// keeps the window for `ms`, then drops it.
+pub fn fade_out(root: &ContainerVisual, ms: u32) -> Result<()> {
+    let comp = root.Compositor()?;
+    let ease =
+        comp.CreateCubicBezierEasingFunction(Vector2::new(0.4, 0.0), Vector2::new(0.2, 1.0))?;
+    let fade = comp.CreateScalarKeyFrameAnimation()?;
+    fade.InsertKeyFrame(0.0, root.Opacity()?)?;
+    fade.InsertKeyFrameWithEasingFunction(1.0, 0.0, &ease)?;
+    fade.SetDuration(duration(ms))?;
+    root.StartAnimation(h!("Opacity"), &fade)
+}
+
+/// Puts `hwnd` (topmost) above every other topmost window, without activating it: the old
+/// window of a hand-over stays on top of the new one while it fades.
+pub fn raise_topmost(hwnd: HWND) {
+    // SAFETY: plain call on one of our windows.
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+    }
 }
 
 /// The reverse of [`animate_open`]: fades `root` out over `ms` while it slides back /

@@ -943,6 +943,11 @@ impl PanelView {
         self.flyout.animate_close(ms, from)
     }
 
+    /// Fades the panel out in place, above the window replacing it.
+    pub fn fade_out(&self, ms: u32) -> Result<()> {
+        self.flyout.fade_out(ms)
+    }
+
     /// Highlights `p` (hover); only the plate moves.
     pub fn set_hot(&mut self, p: Option<Part>) -> Result<()> {
         if p == self.hot {

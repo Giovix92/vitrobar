@@ -438,6 +438,13 @@ impl Flyout {
         )
     }
 
+    /// Fades the flyout out in place and keeps it above the new window taking its place
+    /// (see [`crate::panel::fade_out`]).
+    pub fn fade_out(&self, ms: u32) -> Result<()> {
+        crate::panel::raise_topmost(self.hwnd);
+        crate::panel::fade_out(&self.root, ms)
+    }
+
     /// Makes the flyout the foreground window (it then hears keys, and a click elsewhere
     /// deactivates it: see [`take_deactivated`]). Only allowed right after the user clicked
     /// one of our windows; false if Windows refused.

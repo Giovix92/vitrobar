@@ -335,7 +335,21 @@ pub fn set_saver(on: bool) -> bool {
     )
     .is_some();
     if ok {
-        SAVER_ON.store(i8::from(on), Ordering::Release);
+        let before = SAVER_ON.swap(i8::from(on), Ordering::AcqRel);
+        let w = WATCHER.load(Ordering::Acquire);
+        if before != i8::from(on) && w != 0 {
+            // The bars rebuild their glass on a saver change; this is the one change the
+            // effective-mode callback will not report (it finds the value already stored).
+            // SAFETY: posting to a window of this process; a stale handle just fails.
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(w as *mut c_void)),
+                    WM_POWERBROADCAST,
+                    WPARAM(PBT_APMPOWERSTATUSCHANGE as usize),
+                    LPARAM(0),
+                );
+            }
+        }
     }
     ok
 }

@@ -486,6 +486,43 @@ impl QuickPanel {
         self.view.hwnd()
     }
 
+    /// Energy saver changed: DWM gives a window its glass only when the window is made, so
+    /// the panel moves into a new window at the same place. Page, rows, hover, focus,
+    /// services and timers stay; the new window takes the foreground if the panel had it.
+    /// Hands back the old view for the caller to fade out and drop.
+    pub fn regrow(
+        &mut self,
+        g: &Gfx,
+        style: &MaterialStyle,
+        dpi: u32,
+        anchor_px: PxRect,
+        position: Position,
+    ) -> Result<PanelView> {
+        let view = PanelView::show(
+            g.comp,
+            g.painter,
+            style,
+            dpi,
+            anchor_px,
+            position,
+            self.accent,
+            &self.rows,
+        )?;
+        let old = std::mem::replace(&mut self.view, view);
+        // The password visuals lived in the old window.
+        self.pw_slot = None;
+        self.shown_page = self.page;
+        self.view.set_hot(self.hot)?;
+        self.view.set_focus(self.focus)?;
+        self.view.set_pressed(self.pressed)?;
+        self.draw_password(g)?;
+        if self.activated && self.view.activate() {
+            // The old window just lost the foreground to its successor: not a close.
+            let _ = vitro_render::flyout::take_deactivated_of(old.hwnd());
+        }
+        Ok(old)
+    }
+
     pub fn rect_px(&self) -> PxRect {
         self.view.rect_px()
     }

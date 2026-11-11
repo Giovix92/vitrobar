@@ -16,7 +16,7 @@
 //!
 //! Every monitor has its own bar ([`MonitorBar`]): its windows, layout, scale (the monitor's
 //! DPI / 96), app groups (pins, then the windows on that monitor and the current virtual
-//! desktop) and appbar (the main bar window reserves the bar's strip of that monitor). A bar
+//! desktop) and appbar (a hidden window reserves the bar's strip of that monitor). A bar
 //! hides while a full-screen app covers its monitor. Only the primary monitor's bar has the
 //! tray area (chevron, tray icons, quick settings); the others show Start, their apps and
 //! the clock. Display, DPI, work-area and session changes re-read the monitors; bars are
@@ -106,7 +106,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::bar_window::{
-    create_bar_window, hit_test, mouse_pos, track_leave, BarWindow, Hit, MarginMode, PxRect,
+    create_bar_window, hit_test, mouse_pos, track_leave, AppbarHost, BarWindow, Hit, MarginMode,
+    PxRect,
 };
 use crate::calendar_panel::{CalendarPanel, Outcome as CalOutcome};
 use crate::icon_loader::{IconLoader, IconSrc, Lookup, TrayImage, MAX_ICON_PX};
@@ -538,10 +539,13 @@ struct Bar {
 
 /// One monitor's bar.
 struct MonitorBar {
-    // Field order = drop order: the appbar is unregistered before its window goes; each
+    // Field order = drop order: the appbar is unregistered before its host window goes; each
     // bar's visual tree goes before its window. Dropping the bar windows never ends the app
     // (`BarWindow`'s drop marks the destruction as ours).
     appbar: Option<AppBar>,
+    /// The hidden window the appbar is registered on (made with the first appbar, kept
+    /// while the bar windows come and go).
+    appbar_host: Option<AppbarHost>,
     bars: Vec<Bar>,
     info: MonitorInfo,
     groups: Vec<AppGroup>,
@@ -550,18 +554,22 @@ struct MonitorBar {
     fullscreen: bool,
     /// Carries the tray area (the first bar, the primary monitor's).
     tray: bool,
+    /// The `App::glass_gen` these windows were made under.
+    glass_gen: u32,
 }
 
 impl MonitorBar {
     fn new(info: MonitorInfo, tray: bool) -> Self {
         Self {
             appbar: None,
+            appbar_host: None,
             bars: Vec::new(),
             info,
             groups: Vec::new(),
             layout: empty_layout(),
             fullscreen: false,
             tray,
+            glass_gen: 0,
         }
     }
 
@@ -665,6 +673,13 @@ struct App {
     ime_w: f32,
     /// The battery indicator (opt-in) and its DIP width (0 = hidden).
     battery_pill: Option<WidgetPill>,
+    /// Energy saver as last seen, to rebuild the bars' glass when it changes.
+    saver_seen: Option<bool>,
+    /// Bumped when the bar windows must be made again (see `saver_seen`).
+    glass_gen: u32,
+    /// The quick panel was open when energy saver changed: it moves into a new window, as
+    /// its glass only comes out right when its window is made.
+    quick_regrow: bool,
     battery_w: f32,
     /// Battery notifications while the indicator is on.
     battery_reg: Option<vitro_win::power_status::PowerRegistration>,
@@ -802,6 +817,9 @@ impl App {
             ime_text: None,
             ime_w: 0.0,
             battery_pill: None,
+            saver_seen: None,
+            glass_gen: 0,
+            quick_regrow: false,
             battery_w: 0.0,
             battery_reg: None,
             settings_win: None,
@@ -1187,6 +1205,7 @@ impl App {
     /// a battery); true if what it shows or its width changed. Battery notifications are
     /// subscribed while it is on.
     fn read_battery(&mut self) -> bool {
+        let mut changed_glass = false;
         let on = self.settings.battery_on_bar;
         match (on, self.battery_reg.is_some()) {
             (true, false) => {
@@ -1198,6 +1217,13 @@ impl App {
             _ => {}
         }
         let p = vitro_win::power_status::snapshot();
+        if self.saver_seen.is_some_and(|s| s != p.saver) {
+            // DWM judges the glass when a window is made: the bars are made again.
+            self.glass_gen = self.glass_gen.wrapping_add(1);
+            self.quick_regrow |= self.quick.is_some();
+            changed_glass = true;
+        }
+        self.saver_seen = Some(p.saver);
         let pill = on
             .then_some(p)
             .filter(|p| p.has_battery)
@@ -1218,7 +1244,7 @@ impl App {
             }
             None => 0.0,
         };
-        let changed = pill != self.battery_pill || w != self.battery_w;
+        let changed = changed_glass || pill != self.battery_pill || w != self.battery_w;
         self.battery_pill = pill;
         self.battery_w = w;
         changed
@@ -1400,7 +1426,16 @@ impl App {
             Some(Hit::Widget(w)) if self.monitors[k].id() == self.cur => Some(w),
             _ => None,
         };
+        let glass_gen = self.glass_gen;
         let mb = &mut self.monitors[k];
+        // Energy saver changed: new windows (with the right glass) are made and shown, the
+        // old ones fade out above them once that is done (see `retire_bars`).
+        let retiring = if mb.glass_gen != glass_gen {
+            mb.glass_gen = glass_gen;
+            std::mem::take(&mut mb.bars)
+        } else {
+            Vec::new()
+        };
         let mut raised = layout.surfaces != mb.layout.surfaces;
         while mb.bars.len() > layout.surfaces.len() {
             mb.bars.pop();
@@ -1443,6 +1478,7 @@ impl App {
         let tray = mb.tray;
         mb.layout = layout;
         self.sync_appbar(k);
+        self.retire_bars(retiring);
         if tray {
             // The pill grows and shrinks as apps come and go: the panel follows its button.
             self.quick_reanchor();
@@ -1456,8 +1492,8 @@ impl App {
         Ok(raised)
     }
 
-    /// Keeps bar `k`'s main window registered as the appbar reserving its strip of its
-    /// monitor.
+    /// Keeps bar `k`'s hidden appbar host registered as the appbar reserving its strip of
+    /// its monitor (dropped while the monitor shows no bar).
     fn sync_appbar(&mut self, k: usize) {
         if !self.shell_ready {
             // Reserved only once the stock taskbar no longer reserves its own strip.
@@ -1465,13 +1501,24 @@ impl App {
         }
         let edge = self.settings.position;
         let mb = &mut self.monitors[k];
-        let Some(bar) = mb.bars.first() else {
+        if mb.bars.is_empty() {
             mb.drop_appbar();
             return;
-        };
-        let hwnd = bar.window.hwnd;
+        }
+        if mb.appbar_host.is_none() {
+            match AppbarHost::new() {
+                Ok(h) => mb.appbar_host = Some(h),
+                Err(e) => {
+                    eprintln!("vitrobar: could not reserve the bar's space: {e}");
+                    return;
+                }
+            }
+        }
+        let Some(host) = &mb.appbar_host else { return };
+        let hwnd = host.hwnd;
         let reserved = (mb.layout.reserved * mb.scale()).round() as i32;
         let mon = mb.info.rect_px;
+        host.place(reserved_rect(edge, mon, reserved));
         match &mut mb.appbar {
             // A new edge registers afresh, so the shell drops the old strip entirely.
             Some(ab) if ab.hwnd() == hwnd && ab.edge() == edge => ab.update(edge, mon, reserved),
@@ -3570,6 +3617,24 @@ impl App {
         true
     }
 
+    /// Bar windows replaced by new ones (energy saver changed): they fade out above their
+    /// successors, then go with the other fading windows. Without animations they go now.
+    fn retire_bars(&mut self, old: Vec<Bar>) {
+        if old.is_empty() {
+            return;
+        }
+        if !self.sys.animations {
+            return;
+        }
+        let mut fading = false;
+        for b in old.iter().filter(|b| b.shown) {
+            fading |= b.window.fade_out(FLYOUT_CLOSE_MS).is_ok();
+        }
+        if fading {
+            self.keep_fading(Box::new(old));
+        }
+    }
+
     /// Keeps a closed flyout until its fade-out has run.
     fn keep_fading(&mut self, panel: Box<dyn std::any::Any>) {
         self.fading.push(panel);
@@ -4963,6 +5028,37 @@ impl App {
         }
     }
 
+    /// Energy saver changed while the quick panel is open: the panel moves into a new window
+    /// (same page and state) and the old one fades out above it.
+    fn quick_regrow(&mut self) {
+        let Some(mb) = self.tray_monitor() else {
+            return;
+        };
+        let (dpi, anchor) = (mb.info.dpi, quick_anchor(&mb.layout, mb.scale()));
+        let Some(anchor) = anchor else {
+            return;
+        };
+        let position = self.settings.position;
+        let Some(q) = self.quick.as_mut() else {
+            return;
+        };
+        let g = Gfx {
+            comp: &self.comp,
+            painter: &self.painter,
+        };
+        match q.regrow(&g, &self.style, dpi, anchor, position) {
+            Ok(old) => {
+                if self.sys.animations && old.fade_out(FLYOUT_CLOSE_MS).is_ok() {
+                    self.keep_fading(Box::new(old));
+                }
+            }
+            Err(e) => {
+                eprintln!("vitrobar: the quick panel could not move to a new window: {e}");
+                self.close_quick_now();
+            }
+        }
+    }
+
     fn quick_restyle(&mut self) {
         let (accent, _) = self.start_look();
         let Some(q) = self.quick.as_mut() else {
@@ -5531,6 +5627,9 @@ impl App {
             self.quick_event(|q, g| q.on_power(g));
             if self.read_battery() {
                 dirty.visuals = true;
+            }
+            if std::mem::take(&mut self.quick_regrow) {
+                self.quick_regrow();
             }
         }
         dirty.theme |= inbox.theme;
