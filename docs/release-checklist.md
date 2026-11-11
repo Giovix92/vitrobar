@@ -416,6 +416,12 @@ change your Wi-Fi, Bluetooth, volume and brightness.
    monitor with DDC/CI it changes the monitor; without either the row is hidden.
 7. Power: the battery label matches Windows (desktop PC: no battery row); the power mode
    changes as in Settings > System > Power.
+8. Energy saver and the glass (0.1.2): turn energy saver on, then start Vitrobar: the bar is
+   flat, as Windows' own surfaces are. Turn it off from the quick panel (on the main page,
+   then again from a sub-page): the bar and the open panel fade over to frosted glass within
+   a moment, the panel stays on its page, and maximized windows do not move. Turn it on
+   again, also from Settings > System > Power & battery with the panel closed: back to flat
+   the same way. With animation effects off the change is instant, with no blank frame.
 
 ## Calendar
 
